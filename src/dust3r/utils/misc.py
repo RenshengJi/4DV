@@ -5,6 +5,17 @@
 # modified from DUSt3R
 
 import torch
+from contextlib import contextmanager
+
+
+@contextmanager
+def tf32_off():
+    original = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False  # disable tf32 temporarily
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = original # restore original setting
 
 
 def fill_default_args(kwargs, func):

@@ -6,6 +6,7 @@
 
 import torch
 import torch.nn.functional as F
+from einops import rearrange
 
 
 def postprocess(out, depth_mode, conf_mode, pos_z=False):
@@ -100,6 +101,13 @@ def postprocess_desc(out, depth_mode, conf_mode, desc_dim, double_channel=False)
     assert start + desc_dim + 1 == fmap.shape[-1]
 
     return res
+
+
+def postprocess_gaussian(out, mode):
+    fmap = rearrange(out, "b c h w -> b (h w) c")  # B,(H W),C
+    means, other_params = fmap.split([3, fmap.shape[-1] - 3], dim=-1)
+    means = reg_dense_depth(means, mode=mode)
+    return torch.cat([means, other_params], dim=-1)
 
 
 def reg_desc(desc, mode="norm"):

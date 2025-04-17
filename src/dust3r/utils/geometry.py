@@ -7,6 +7,7 @@
 import torch
 import numpy as np
 from scipy.spatial import cKDTree as KDTree
+from einops import einsum, rearrange, reduce, repeat
 
 from dust3r.utils.misc import invalid_to_zeros, invalid_to_nans
 from dust3r.utils.device import to_numpy
@@ -553,3 +554,126 @@ def weighted_procrustes(A, B, w, use_weights=True, eps=1e-16, return_T=False):
         T[:, :3, 3] = t.squeeze()
         return T
     return R, t.squeeze()
+
+
+def homogenize_points(points):
+    """Convert batched points (xyz) to (xyz1)."""
+    return torch.cat([points, torch.ones_like(points[..., :1])], dim=-1)
+
+
+def homogenize_vectors(vectors):
+    """Convert batched vectors (xyz) to (xyz0)."""
+    return torch.cat([vectors, torch.zeros_like(vectors[..., :1])], dim=-1)
+
+
+def transform_rigid(homogeneous_coordinates, transformation):
+    """Apply a rigid-body transformation to points or vectors."""
+    return einsum(transformation, homogeneous_coordinates, "... i j, ... j -> ... i")
+
+
+def transform_cam2world(homogeneous_coordinates, extrinsics):
+    """Transform points from 3D camera coordinates to 3D world coordinates."""
+    return transform_rigid(homogeneous_coordinates, extrinsics)
+
+
+def unproject(coordinates, z, intrinsics):
+    """
+    Unproject 2D camera coordinates with the given Z values.
+    Args:
+        coordinates: 2D pixel coordinates in camera space.
+            Shape: (*#batch, 2).
+        z: Depth values for each pixel.
+            Shape: (*#batch).
+        intrinsics: Camera intrinsics matrix.
+            Shape: (*#batch, 3, 3).
+    Returns:
+        Ray directions in camera coordinates.
+            Shape: (*#batch, 3).
+    """
+
+    # Apply the inverse intrinsics to the coordinates.
+    coordinates = homogenize_points(coordinates)
+    ray_directions = einsum(
+        intrinsics.inverse(), coordinates, "... i j, ... j -> ... i"
+    )
+
+    # Apply the supplied depth values.
+    return ray_directions * z[..., None]
+
+
+def get_world_rays(coordinates, extrinsics, intrinsics):
+    """
+    Get the ray origins and directions in world coordinates.
+    Args:
+        coordinates: 2D pixel coordinates in camera space.
+            Shape: (*#batch, 2).
+        extrinsics: Camera-to-world transformation matrix.
+            Shape: (*#batch, 4, 4).
+        intrinsics: Camera intrinsics matrix.
+            Shape: (*#batch, 3, 3).
+    Returns:
+        origins: Ray origins in world coordinates.
+            Shape: (*#batch, 3).
+        directions: Ray directions in world coordinates.
+            Shape: (*#batch, 3).
+    """
+    # Get camera-space ray directions.
+    directions = unproject(
+        coordinates,
+        torch.ones_like(coordinates[..., 0]),
+        intrinsics,
+    )
+    directions = directions / directions.norm(dim=-1, keepdim=True)
+
+    # Transform ray directions to world coordinates.
+    directions = homogenize_vectors(directions)
+    directions = transform_cam2world(directions, extrinsics)[..., :-1]
+
+    # Tile the ray origins to have the same shape as the ray directions.
+    origins = extrinsics[..., :-1, -1].broadcast_to(directions.shape)
+
+    return origins, directions
+
+
+def get_fov(intrinsics, shapes):
+    """
+    Calculate the field of view (FOV) from the camera intrinsics.
+    Args:
+        intrinsics: Camera intrinsics matrix.
+            Shape: (*#batch, 3, 3).
+        shapes: List of shapes for each image in the batch.
+            Shape: (*#batch, 2).
+    Returns:
+        fov: Field of view in radians.
+            Shape: (*#batch, 2).
+    """
+    intrinsics_inv = intrinsics.inverse()
+
+    def process_vector(vector):
+        vector = torch.tensor(vector, dtype=torch.float32, device=intrinsics.device)
+        vector = einsum(intrinsics_inv, vector, "b i j, b j -> b i")
+        return vector / vector.norm(dim=-1, keepdim=True)
+
+    left = process_vector(
+        torch.cat(
+            [torch.zeros_like(shapes[:, 1]), shapes[:, 0] / 2 - 0.5, torch.ones_like(shapes[:, 0])]
+        )
+    )
+    right = process_vector(
+        torch.cat(
+            [shapes[:, 1] - 1, shapes[:, 0] / 2 - 0.5, torch.ones_like(shapes[:, 0])]
+        )
+    )
+    top = process_vector(
+        torch.cat(
+            [shapes[:, 1] / 2 - 0.5, torch.zeros_like(shapes[:, 0]), torch.ones_like(shapes[:, 0])]
+        )
+    )
+    bottom = process_vector(
+        torch.cat(
+            [shapes[:, 1] / 2 - 0.5, shapes[:, 0] - 1, torch.ones_like(shapes[:, 0])]
+        )
+    )
+    fov_x = (left * right).sum(dim=-1).acos()
+    fov_y = (top * bottom).sum(dim=-1).acos()
+    return torch.stack((fov_x, fov_y), dim=-1)

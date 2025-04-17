@@ -14,12 +14,14 @@ from dust3r.heads.postprocess import (
     postprocess_rgb,
     postprocess_pose_conf,
     postprocess_pose,
+    postprocess_gaussian,
     reg_dense_conf,
 )
 import dust3r.utils.path_to_croco  # noqa: F401
-from models.dpt_block import DPTOutputAdapter  # noqa
+from models.dpt_block import DPTOutputAdapter, Interpolate  # noqa
 from dust3r.utils.camera import pose_encoding_to_camera, PoseDecoder
 from dust3r.blocks import ConditionModulationBlock
+from dust3r.gaussians.adapter import UnifiedGaussianAdapter
 from torch.utils.checkpoint import checkpoint
 
 
@@ -37,7 +39,14 @@ class DPTOutputAdapter_fix(DPTOutputAdapter):
         del self.act_3_postprocess
         del self.act_4_postprocess
 
-    def forward(self, encoder_tokens: List[torch.Tensor], image_size=None):
+        if self.head_type == "gs_params":
+            self.feat_up = Interpolate(scale_factor=2, mode="bilinear", align_corners=True)
+            self.input_merger = nn.Sequential(
+                nn.Conv2d(3, 256, 7, 1, 3),
+                nn.ReLU(),
+            )
+
+    def forward(self, encoder_tokens: List[torch.Tensor], image_size=None, images=None):
         assert (
             self.dim_tokens_enc is not None
         ), "Need to call init(dim_tokens_enc) function first"
@@ -66,6 +75,11 @@ class DPTOutputAdapter_fix(DPTOutputAdapter):
         path_3 = self.scratch.refinenet3(path_4, layers[2])
         path_2 = self.scratch.refinenet2(path_3, layers[1])
         path_1 = self.scratch.refinenet1(path_2, layers[0])
+
+        if images is not None:
+            direct_img_feat = self.input_merger(images)
+            path_1 = self.feat_up(path_1)
+            path_1 = path_1 + direct_img_feat
 
         out = self.head(path_1)
 
@@ -214,7 +228,7 @@ class DPTPts3dPose(nn.Module):
         if self.has_pose:
             pose_token = x[-1][:, 0].clone()
             token = x[-1][:, 1:]
-            with torch.cuda.amp.autocast(enabled=False):
+            with torch.amp.autocast("cuda", enabled=False):
                 pose = self.pose_head(pose_token)
 
             token_cross = token.clone()
@@ -223,7 +237,7 @@ class DPTPts3dPose(nn.Module):
             x = x[:-1] + [token]
             x_cross = x[:-1] + [token_cross]
 
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             self_out = checkpoint(
                 self.dpt_self,
                 x,
@@ -257,4 +271,112 @@ class DPTPts3dPose(nn.Module):
                 tmp = postprocess(cross_out, self.depth_mode, self.conf_mode)
                 final_output["pts3d_in_other_view"] = tmp.pop("pts3d")
                 final_output["conf"] = tmp.pop("conf")
+        return final_output
+
+
+class DPTGSPose(DPTPts3dPose):
+    def __init__(self, net, has_conf=False, ):
+        super(DPTGSPose, self).__init__(
+            net,
+            has_conf=has_conf,
+            has_rgb=True,
+            has_pose=True,
+        )
+        self.gaussian_adapter = UnifiedGaussianAdapter(net.gaussian_adapter_cfg)
+        gs_channels = self.gaussian_adapter.d_in
+        feature_dim = 256
+        last_dim = feature_dim // 2
+        ed = net.enc_embed_dim
+        dd = net.dec_embed_dim
+        hooks_idx = [0, 1, 2, 3]
+        dim_tokens = [ed, dd, dd, dd]
+        head_type = "gs_params"
+        output_width_ratio = 1
+
+        gs_dpt_args = dict(
+            output_width_ratio=output_width_ratio,
+            num_channels=gs_channels,
+            feature_dim=feature_dim,
+            last_dim=last_dim,
+            dim_tokens=dim_tokens,
+            hooks=hooks_idx,
+            head_type=head_type,
+        )
+        self.dpt_gs_self = DPTOutputAdapter_fix(**gs_dpt_args)
+        dpt_init_args = {} if dim_tokens is None else {"dim_tokens_enc": dim_tokens}
+        self.dpt_gs_self.init(**dpt_init_args)
+        self.dpt_gs_cross = DPTOutputAdapter_fix(**gs_dpt_args)
+        dpt_init_args = {} if dim_tokens is None else {"dim_tokens_enc": dim_tokens}
+        self.dpt_gs_cross.init(**dpt_init_args)
+
+    def forward(self, x, img_info, **kwargs):
+        pose_token = x[-1][:, 0].clone()
+        token = x[-1][:, 1:]
+        with torch.amp.autocast("cuda", enabled=False):
+            pose = self.pose_head(pose_token)
+
+        token_cross = token.clone()
+        for blk in self.final_transform:
+            token_cross = blk(token_cross, pose_token, kwargs.get("pos"))
+        x = x[:-1] + [token]
+        x_cross = x[:-1] + [token_cross]
+
+        with torch.amp.autocast("cuda", enabled=False):
+            self_out = checkpoint(
+                self.dpt_self,
+                x,
+                image_size=(img_info[0], img_info[1]),
+                use_reentrant=False,
+            )
+
+            final_output = postprocess(self_out, self.depth_mode, self.conf_mode)
+            final_output["pts3d_in_self_view"] = final_output.pop("pts3d")
+            final_output["conf_self"] = final_output.pop("conf")
+
+            self_gs_out = checkpoint(
+                self.dpt_gs_self,
+                x,
+                image_size=(img_info[0], img_info[1]),
+                images=kwargs.get("img"),
+                use_reentrant=False,
+            )
+            self_gs_out = postprocess_gaussian(self_gs_out, self.depth_mode)
+            final_output["gaussian_in_self_view"] = self.gaussian_adapter.forward(
+                rearrange(final_output["pts3d_in_self_view"], "b h w c -> b (h w) c"),
+                self_gs_out,
+            )
+
+            rgb_out = checkpoint(
+                self.dpt_rgb,
+                x,
+                image_size=(img_info[0], img_info[1]),
+                use_reentrant=False,
+            )
+            rgb_output = postprocess_rgb(rgb_out)
+            final_output.update(rgb_output)
+
+            pose = postprocess_pose(pose, self.pose_mode)
+            final_output["camera_pose"] = pose  # B,7
+            cross_out = checkpoint(
+                self.dpt_cross,
+                x_cross,
+                image_size=(img_info[0], img_info[1]),
+                use_reentrant=False,
+            )
+            tmp = postprocess(cross_out, self.depth_mode, self.conf_mode)
+            final_output["pts3d_in_other_view"] = tmp.pop("pts3d")
+            final_output["conf"] = tmp.pop("conf")
+
+            cross_gs_out = checkpoint(
+                self.dpt_gs_cross,
+                x_cross,
+                image_size=(img_info[0], img_info[1]),
+                images=kwargs.get("img"),
+                use_reentrant=False,
+            )
+            cross_gs_out = postprocess_gaussian(cross_gs_out, self.depth_mode)
+            final_output["gaussian_in_other_view"] = self.gaussian_adapter.forward(
+                rearrange(final_output["pts3d_in_other_view"], "b h w c -> b (h w) c"),
+                cross_gs_out,
+            )
         return final_output

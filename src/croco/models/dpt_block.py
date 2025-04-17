@@ -371,6 +371,15 @@ class DPTOutputAdapter(nn.Module):
                 nn.Conv2d(feature_dim, self.num_channels, kernel_size=1),
                 Interpolate(scale_factor=2, mode="bilinear", align_corners=True),
             )
+        elif self.head_type == 'gs_params':
+            # The "DPTGSPose" head
+            self.head = nn.Sequential(
+                nn.Conv2d(feature_dim, feature_dim, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(feature_dim) if use_bn else nn.Identity(),
+                nn.ReLU(True),
+                nn.Dropout(0.1, False),
+                nn.Conv2d(feature_dim, self.num_channels, kernel_size=1),
+            )
         else:
             raise ValueError('DPT head_type must be "regression" or "semseg".')
 

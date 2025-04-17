@@ -5,7 +5,7 @@
 # modified from DUSt3R
 
 from .linear_head import LinearPts3d, LinearPts3d_Desc, LinearPts3dPose
-from .dpt_head import DPTPts3dPose
+from .dpt_head import DPTPts3dPose, DPTGSPose
 
 
 def head_factory(
@@ -31,5 +31,7 @@ def head_factory(
         return create_dpt_head(net, has_conf=has_conf)
     elif head_type == "dpt" and output_mode == "pts3d+pose":
         return DPTPts3dPose(net, has_conf, has_rgb, has_pose)
+    elif head_type == "dpt" and output_mode == "gaussian":
+        return DPTGSPose(net, has_conf)
     else:
         raise NotImplementedError(f"unexpected {head_type=} and {output_mode=}")

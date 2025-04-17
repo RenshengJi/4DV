@@ -12,8 +12,9 @@ from dust3r.utils.image import imread_cv2
 class Waymo_Multi(BaseMultiViewDataset):
     """Dataset of outdoor street scenes, 5 images each time"""
 
-    def __init__(self, *args, ROOT, **kwargs):
+    def __init__(self, *args, ROOT, img_ray_mask_p=[0.85, 0.10, 0.05], **kwargs):
         self.ROOT = ROOT
+        self.img_ray_mask_p = img_ray_mask_p
         self.max_interval = 8
         self.video = True
         self.is_metric = True
@@ -151,7 +152,7 @@ class Waymo_Multi(BaseMultiViewDataset):
 
             # generate img mask and raymap mask
             img_mask, ray_mask = self.get_img_and_ray_masks(
-                self.is_metric, v, rng, p=[0.85, 0.10, 0.05]
+                self.is_metric, v, rng, p=self.img_ray_mask_p
             )
 
             views.append(

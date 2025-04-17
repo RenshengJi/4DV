@@ -22,7 +22,9 @@ from dust3r.utils.misc import (
     is_symmetrized,
     interleave,
     transpose_to_landscape,
+    tf32_off,
 )
+from dust3r.gaussians import get_decoder
 from dust3r.heads import head_factory
 from dust3r.utils.camera import PoseEncoder
 from dust3r.patch_embed import get_patch_embed
@@ -114,6 +116,8 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         rgb_head=False,
         pose_conf_head=False,
         pose_head=False,
+        gaussian_adapter_cfg=None,
+        gaussian_decoder_cfg=None,
         **croco_kwargs,
     ):
         super().__init__()
@@ -135,6 +139,8 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         self.pose_conf_head = pose_conf_head
         self.pose_head = pose_head
         self.croco_kwargs = croco_kwargs
+        self.gaussian_adapter_cfg = gaussian_adapter_cfg
+        self.gaussian_decoder_cfg = gaussian_decoder_cfg
 
 
 class LocalMemory(nn.Module):
@@ -236,6 +242,8 @@ class ARCroco3DStereo(CroCoNet):
         self.config = config
         self.patch_embed_cls = config.patch_embed_cls
         self.croco_args = config.croco_kwargs
+        self.gaussian_adapter_cfg = config.gaussian_adapter_cfg
+        self.gaussian_decoder_cfg = config.gaussian_decoder_cfg
         croco_cfg = CrocoConfig(**self.croco_args)
         super().__init__(croco_cfg)
         self.enc_blocks_ray_map = nn.ModuleList(
@@ -278,6 +286,8 @@ class ARCroco3DStereo(CroCoNet):
         self.masked_ray_map_token = nn.Parameter(
             torch.randn(1, self.enc_embed_dim) * 0.02, requires_grad=True
         )
+        if self.gaussian_decoder_cfg is not None:
+            self.gaussian_decoder = get_decoder(self.gaussian_decoder_cfg)
         self._set_state_decoder(
             self.enc_embed_dim,
             self.dec_embed_dim,
@@ -468,6 +478,30 @@ class ARCroco3DStereo(CroCoNet):
                 self.pose_retriever,
                 self.pose_token,
             ],
+            "cut3r": [
+                self.patch_embed,
+                self.patch_embed_ray_map,
+                self.masked_img_token,
+                self.masked_ray_map_token,
+                self.enc_blocks,
+                self.enc_blocks_ray_map,
+                self.enc_norm,
+                self.enc_norm_ray_map,
+                self.dec_blocks,
+                self.dec_blocks_state,
+                self.pose_retriever,
+                self.pose_token,
+                self.register_tokens,
+                self.decoder_embed_state,
+                self.decoder_embed,
+                self.dec_norm,
+                self.dec_norm_state,
+                self.downstream_head.dpt_self,
+                self.downstream_head.final_transform,
+                self.downstream_head.dpt_cross,
+                self.downstream_head.dpt_rgb,
+                self.downstream_head.pose_head,
+            ]
         }
         freeze_all_params(to_be_frozen[freeze])
 
@@ -794,7 +828,27 @@ class ARCroco3DStereo(CroCoNet):
             dec[self.dec_depth * 3 // 4][:, 1:].float(),
             dec[self.dec_depth].float(),
         ]
-        res = self._downstream_head(head_input, shape_i, pos=pos_i)
+        res = self._downstream_head(head_input, shape_i, pos=pos_i, img=views[i]["img"])
+
+        if "gaussian" in self.output_mode:
+            with tf32_off(), torch.amp.autocast("cuda", enabled=False):
+                rendered_output = self.gaussian_decoder.forward(
+                    [res["gaussian_in_self_view"], res["gaussian_in_other_view"]],
+                    extrinsics=[
+                        res["camera_pose"].new_tensor([[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]]).expand(
+                            res["camera_pose"].shape[0], -1),
+                        res["camera_pose"]
+                    ],
+                    intrinsics=[views[i]["camera_intrinsics"], views[i]["camera_intrinsics"]],
+                    image_shape=[shape_i, shape_i],
+                )
+            rendered_self, rendered_other = rendered_output.color.chunk(2, dim=0)
+            res["render_in_self_view"] = rendered_self
+            res["render_in_other_view"] = rendered_other
+            rendered_self_depth, rendered_other_depth = rendered_output.depth.chunk(2, dim=0)
+            res["render_depth_in_self_view"] = rendered_self_depth
+            res["render_depth_in_other_view"] = rendered_other_depth
+
         img_mask = views[i]["img_mask"]
         update = views[i].get("update", None)
         if update is not None:

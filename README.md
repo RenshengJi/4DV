@@ -61,7 +61,8 @@ cd CUT3R
 ```bash
 conda create -n cut3r python=3.11 cmake=3.14.0
 conda activate cut3r
-conda install pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia  # use the correct version of cuda for your system
+# conda install pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia  # use the correct version of cuda for your system
+pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
 pip install -r requirements.txt
 # issues with pytorch dataloader, see https://github.com/pytorch/pytorch/issues/99625
 conda install 'llvm-openmp<16'
@@ -94,7 +95,7 @@ To download the weights, run the following commands:
 ```bash
 cd src
 # for 224 linear ckpt
-gdown --fuzzy https://drive.google.com/file/d/11dAgFkWHpaOHsR6iuitlB_v4NFFBrWjy/view?usp=drive_link 
+gdown --fuzzy https://drive.google.com/file/d/11dAgFkWHpaOHsR6iuitlB_v4NFFBrWjy/view?usp=drive_link
 # for 512 dpt ckpt
 gdown --fuzzy https://drive.google.com/file/d/1Asz-ZB3FfpzZYwunhQvNPZEUA8XUNAYD/view?usp=drive_link
 cd ..
@@ -123,17 +124,17 @@ Output results will be saved to `output_dir`.
 ## Datasets
 Our training data includes 32 datasets listed below. We provide processing scripts for all of them. Please download the datasets from their official sources, and refer to [preprocess.md](docs/preprocess.md) for processing scripts and more information about the datasets.
 
-  - [ARKitScenes](https://github.com/apple/ARKitScenes) 
+  - [ARKitScenes](https://github.com/apple/ARKitScenes)
   - [BlendedMVS](https://github.com/YoYo000/BlendedMVS)
   - [CO3Dv2](https://github.com/facebookresearch/co3d)
   - [MegaDepth](https://www.cs.cornell.edu/projects/megadepth/)
-  - [ScanNet++](https://kaldir.vc.in.tum.de/scannetpp/) 
+  - [ScanNet++](https://kaldir.vc.in.tum.de/scannetpp/)
   - [ScanNet](http://www.scan-net.org/ScanNet/)
   - [WayMo Open dataset](https://github.com/waymo-research/waymo-open-dataset)
   - [WildRGB-D](https://github.com/wildrgbd/wildrgbd/)
   - [Map-free](https://research.nianticlabs.com/mapfree-reloc-benchmark/dataset)
   - [TartanAir](https://theairlab.org/tartanair-dataset/)
-  - [UnrealStereo4K](https://github.com/fabiotosi92/SMD-Nets) 
+  - [UnrealStereo4K](https://github.com/fabiotosi92/SMD-Nets)
   - [Virtual KITTI 2](https://europe.naverlabs.com/research/computer-vision/proxy-virtual-worlds-vkitti-2/)
   - [3D Ken Burns](https://github.com/sniklaus/3d-ken-burns.git)
   - [BEDLAM](https://bedlam.is.tue.mpg.de/)
