@@ -194,6 +194,20 @@ class SSIM(nn.Module):
         return torch.clamp((1 - SSIM_n / SSIM_d) / 2, 0, 1)
 
 
+class LPIPSLoss(BaseCriterion):
+    """Layer to compute the LPIPS loss between a pair of images"""
+
+    def __init__(self, net="vgg"):
+        super(LPIPSLoss, self).__init__()
+        self.net = lpips.LPIPS(net=net)
+
+    def forward(self, x, y):
+        return self.net(x, y, normalize=True).mean()
+
+
+LPIPS = LPIPSLoss()
+
+
 class RGBLoss(Criterion, MultiLoss):
     def __init__(self, criterion):
         super().__init__(criterion)
@@ -216,6 +230,49 @@ class RGBLoss(Criterion, MultiLoss):
             details[f"pred_rgb_{i+1}"] = pred_rgbs[i]
         rgb_loss = sum(ls) / len(ls)
         return rgb_loss, details
+
+
+class RenderLoss(Criterion, MultiLoss):
+    def __init__(self, criterion, shape="BHWC"):
+        super().__init__(criterion)
+        self.shape = shape
+
+    def get_name(self):
+        return f"{type(self).__name__}({type(self.criterion).__name__})"
+
+    def img_loss(self, a, b):
+        return self.criterion(a, b)
+
+    def compute_loss(self, gts, preds, **kw):
+        if self.shape == "BHWC":
+            gt_rgbs = [gt["img"].permute(0, 2, 3, 1) * 0.5 + 0.5 for gt in gts]
+            pred_rgbs_in_self_view = [pred["render_in_self_view"].permute(0, 2, 3, 1) for pred in preds]
+            pred_rgbs_in_other_view = [pred["render_in_other_view"].permute(0, 2, 3, 1) for pred in preds]
+        elif self.shape == "BCHW":
+            gt_rgbs = [gt["img"] * 0.5 + 0.5 for gt in gts]
+            pred_rgbs_in_self_view = [pred["render_in_self_view"] for pred in preds]
+            pred_rgbs_in_other_view = [pred["render_in_other_view"] for pred in preds]
+        else:
+            raise ValueError(f"Unknown shape {self.shape}")
+
+        ls = [
+            self.img_loss(pred_rgb, gt_rgb)
+            for pred_rgb, gt_rgb in zip(pred_rgbs_in_self_view, gt_rgbs)
+        ]
+        ls_other_view = [
+            self.img_loss(pred_rgb, gt_rgb)
+            for pred_rgb, gt_rgb in zip(pred_rgbs_in_other_view, gt_rgbs)
+        ]
+        details = {}
+        self_name = self.get_name()
+        for i, l in enumerate(ls):
+            details[self_name + f"_rgb_in_self_view/{i+1}"] = float(l)
+            details[f"pred_rgb_in_self_view_{i+1}"] = pred_rgbs_in_self_view[i] if self.shape == "BHWC" else pred_rgbs_in_self_view[i].permute(0, 2, 3, 1)
+        for i, l in enumerate(ls_other_view):
+            details[self_name + f"_rgb_in_other_view/{i+1}"] = float(l)
+            details[f"pred_rgb_in_other_view_{i+1}"] = pred_rgbs_in_other_view[i] if self.shape == "BHWC" else pred_rgbs_in_other_view[i].permute(0, 2, 3, 1)
+        render_loss = (sum(ls) + sum(ls_other_view)) / (len(ls) + len(ls_other_view))
+        return render_loss, details
 
 
 class DepthScaleShiftInvLoss(BaseCriterion):

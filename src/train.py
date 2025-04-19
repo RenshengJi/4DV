@@ -283,26 +283,26 @@ def train(args):
 
         # Test on multiple datasets
         new_best = False
-        if epoch > 0 and args.eval_freq > 0 and epoch % args.eval_freq == 0:
-            test_stats = {}
-            for test_name, testset in data_loader_test.items():
-                stats = test_one_epoch(
-                    model,
-                    test_criterion,
-                    testset,
-                    accelerator,
-                    device,
-                    epoch,
-                    log_writer=log_writer,
-                    args=args,
-                    prefix=test_name,
-                )
-                test_stats[test_name] = stats
+        # if epoch > 0 and args.eval_freq > 0 and epoch % args.eval_freq == 0:
+        #     test_stats = {}
+        #     for test_name, testset in data_loader_test.items():
+        #         stats = test_one_epoch(
+        #             model,
+        #             test_criterion,
+        #             testset,
+        #             accelerator,
+        #             device,
+        #             epoch,
+        #             log_writer=log_writer,
+        #             args=args,
+        #             prefix=test_name,
+        #         )
+        #         test_stats[test_name] = stats
 
-                # Save best of all
-                if stats["loss_med"] < best_so_far:
-                    best_so_far = stats["loss_med"]
-                    new_best = True
+        #         # Save best of all
+        #         if stats["loss_med"] < best_so_far:
+        #             best_so_far = stats["loss_med"]
+        #             new_best = True
         # Save more stuff
         write_log_stats(epoch, train_stats, test_stats)
 
@@ -508,35 +508,35 @@ def train_one_epoch(
             if tb_vis_img:
                 if log_writer is None:
                     continue
-                with torch.no_grad():
-                    depths_self, gt_depths_self = get_render_results(
-                        batch, result["pred"], self_view=True
-                    )
-                    depths_cross, gt_depths_cross = get_render_results(
-                        batch, result["pred"], self_view=False
-                    )
-                    for k in range(len(batch)):
-                        loss_details[f"self_pred_depth_{k+1}"] = (
-                            depths_self[k].detach().cpu()
-                        )
-                        loss_details[f"self_gt_depth_{k+1}"] = (
-                            gt_depths_self[k].detach().cpu()
-                        )
-                        loss_details[f"pred_depth_{k+1}"] = (
-                            depths_cross[k].detach().cpu()
-                        )
-                        loss_details[f"gt_depth_{k+1}"] = (
-                            gt_depths_cross[k].detach().cpu()
-                        )
+                # with torch.no_grad():
+                #     depths_self, gt_depths_self = get_render_results(
+                #         batch, result["pred"], self_view=True
+                #     )
+                #     depths_cross, gt_depths_cross = get_render_results(
+                #         batch, result["pred"], self_view=False
+                #     )
+                #     for k in range(len(batch)):
+                #         loss_details[f"self_pred_depth_{k+1}"] = (
+                #             depths_self[k].detach().cpu()
+                #         )
+                #         loss_details[f"self_gt_depth_{k+1}"] = (
+                #             gt_depths_self[k].detach().cpu()
+                #         )
+                #         loss_details[f"pred_depth_{k+1}"] = (
+                #             depths_cross[k].detach().cpu()
+                #         )
+                #         loss_details[f"gt_depth_{k+1}"] = (
+                #             gt_depths_cross[k].detach().cpu()
+                #         )
 
-                imgs_stacked_dict = get_vis_imgs_new(
-                    loss_details, args.num_imgs_vis, curr_num_view, is_metric=is_metric
-                )
-                for name, imgs_stacked in imgs_stacked_dict.items():
-                    log_writer.add_images(
-                        "train" + "/" + name, imgs_stacked, step, dataformats="HWC"
-                    )
-                del batch
+                # imgs_stacked_dict = get_vis_imgs_new(
+                #     loss_details, args.num_imgs_vis, curr_num_view, is_metric=is_metric
+                # )
+                # for name, imgs_stacked in imgs_stacked_dict.items():
+                #     log_writer.add_images(
+                #         "train" + "/" + name, imgs_stacked, step, dataformats="HWC"
+                #     )
+                # del batch
 
         if (
             data_iter_step % int(args.save_freq * len(data_loader)) == 0
@@ -544,7 +544,7 @@ def train_one_epoch(
             and data_iter_step != len(data_loader) - 1
         ):
             print("saving at step", data_iter_step)
-            save_model(epoch - 1, "last", float("inf"))
+            save_model(epoch - 1, f"latest_{data_iter_step}", float("inf"))
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes(accelerator)

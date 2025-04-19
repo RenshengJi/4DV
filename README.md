@@ -65,7 +65,7 @@ conda activate cut3r
 pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
 pip install -r requirements.txt
 # issues with pytorch dataloader, see https://github.com/pytorch/pytorch/issues/99625
-conda install 'llvm-openmp<16'
+# conda install 'llvm-openmp<16'
 # for training logging
 pip install git+https://github.com/nerfstudio-project/gsplat.git
 # for evaluation

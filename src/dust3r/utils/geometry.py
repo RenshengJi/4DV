@@ -650,28 +650,27 @@ def get_fov(intrinsics, shapes):
     intrinsics_inv = intrinsics.inverse()
 
     def process_vector(vector):
-        vector = torch.tensor(vector, dtype=torch.float32, device=intrinsics.device)
         vector = einsum(intrinsics_inv, vector, "b i j, b j -> b i")
         return vector / vector.norm(dim=-1, keepdim=True)
 
     left = process_vector(
         torch.cat(
-            [torch.zeros_like(shapes[:, 1]), shapes[:, 0] / 2 - 0.5, torch.ones_like(shapes[:, 0])]
+            [torch.zeros_like(shapes[:, 1:2]), shapes[:, 0:1] / 2 - 0.5, torch.ones_like(shapes[:, 0:1])], dim=-1
         )
     )
     right = process_vector(
         torch.cat(
-            [shapes[:, 1] - 1, shapes[:, 0] / 2 - 0.5, torch.ones_like(shapes[:, 0])]
+            [shapes[:, 1:2] - 1, shapes[:, 0:1] / 2 - 0.5, torch.ones_like(shapes[:, 0:1])], dim=-1
         )
     )
     top = process_vector(
         torch.cat(
-            [shapes[:, 1] / 2 - 0.5, torch.zeros_like(shapes[:, 0]), torch.ones_like(shapes[:, 0])]
+            [shapes[:, 1:2] / 2 - 0.5, torch.zeros_like(shapes[:, 0:1]), torch.ones_like(shapes[:, 0:1])], dim=-1
         )
     )
     bottom = process_vector(
         torch.cat(
-            [shapes[:, 1] / 2 - 0.5, shapes[:, 0] - 1, torch.ones_like(shapes[:, 0])]
+            [shapes[:, 1:2] / 2 - 0.5, shapes[:, 0:1] - 1, torch.ones_like(shapes[:, 0:1])], dim=-1
         )
     )
     fov_x = (left * right).sum(dim=-1).acos()

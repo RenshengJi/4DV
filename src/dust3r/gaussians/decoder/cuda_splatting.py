@@ -77,7 +77,7 @@ def render_cuda(
 
     b, _, _ = extrinsics.shape
 
-    fov_x, fov_y = get_fov(intrinsics).unbind(dim=-1)
+    fov_x, fov_y = get_fov(intrinsics, image_shape).unbind(dim=-1)
     tan_fov_x = (0.5 * fov_x).tan()
     tan_fov_y = (0.5 * fov_y).tan()
 

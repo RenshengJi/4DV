@@ -25,6 +25,7 @@ from dust3r.utils.misc import (
     tf32_off,
 )
 from dust3r.gaussians import get_decoder
+from dust3r.post_process import estimate_focal_knowing_depth
 from dust3r.heads import head_factory
 from dust3r.utils.camera import PoseEncoder
 from dust3r.patch_embed import get_patch_embed
@@ -831,15 +832,27 @@ class ARCroco3DStereo(CroCoNet):
         res = self._downstream_head(head_input, shape_i, pos=pos_i, img=views[i]["img"])
 
         if "gaussian" in self.output_mode:
+            pts3ds_self = res["pts3d_in_self_view"]
+            B, H, W, _ = pts3ds_self.shape
+            pp = torch.tensor([W // 2, H // 2], device=pts3ds_self.device).float().repeat(B, 1)
+            focal = estimate_focal_knowing_depth(pts3ds_self.detach(), pp, focal_mode="weiszfeld")
+            intrinsics = torch.eye(3, device=pts3ds_self.device).unsqueeze(0).repeat(B, 1, 1)
+            intrinsics[:, 0, 0] = focal
+            intrinsics[:, 1, 1] = focal
+            intrinsics[:, 0, 2] = pp[:, 0]
+            intrinsics[:, 1, 2] = pp[:, 1]
+
             with tf32_off(), torch.amp.autocast("cuda", enabled=False):
+                gasussian_in_self_view = res.pop("gaussian_in_self_view")
+                gaussian_in_other_view = res.pop("gaussian_in_other_view")
                 rendered_output = self.gaussian_decoder.forward(
-                    [res["gaussian_in_self_view"], res["gaussian_in_other_view"]],
+                    [gasussian_in_self_view, gaussian_in_other_view],
                     extrinsics=[
                         res["camera_pose"].new_tensor([[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]]).expand(
                             res["camera_pose"].shape[0], -1),
                         res["camera_pose"]
                     ],
-                    intrinsics=[views[i]["camera_intrinsics"], views[i]["camera_intrinsics"]],
+                    intrinsics=[intrinsics, intrinsics],
                     image_shape=[shape_i, shape_i],
                 )
             rendered_self, rendered_other = rendered_output.color.chunk(2, dim=0)
@@ -914,7 +927,39 @@ class ARCroco3DStereo(CroCoNet):
                 dec[self.dec_depth * 3 // 4][:, 1:].float(),
                 dec[self.dec_depth].float(),
             ]
-            res = self._downstream_head(head_input, shape[i], pos=pos_i)
+            res = self._downstream_head(head_input, shape[i], pos=pos_i, img=views[i]["img"])
+
+            if "gaussian" in self.output_mode:
+                pts3ds_self = res["pts3d_in_self_view"]
+                B, H, W, _ = pts3ds_self.shape
+                pp = torch.tensor([W // 2, H // 2], device=pts3ds_self.device).float().repeat(B, 1)
+                focal = estimate_focal_knowing_depth(pts3ds_self.detach(), pp, focal_mode="weiszfeld")
+                intrinsics = torch.eye(3, device=pts3ds_self.device).unsqueeze(0).repeat(B, 1, 1)
+                intrinsics[:, 0, 0] = focal
+                intrinsics[:, 1, 1] = focal
+                intrinsics[:, 0, 2] = pp[:, 0]
+                intrinsics[:, 1, 2] = pp[:, 1]
+
+                with tf32_off(), torch.amp.autocast("cuda", enabled=False):
+                    gasussian_in_self_view = res.pop("gaussian_in_self_view")
+                    gaussian_in_other_view = res.pop("gaussian_in_other_view")
+                    rendered_output = self.gaussian_decoder.forward(
+                        [gasussian_in_self_view, gaussian_in_other_view],
+                        extrinsics=[
+                            res["camera_pose"].new_tensor([[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]]).expand(
+                                res["camera_pose"].shape[0], -1),
+                            res["camera_pose"]
+                        ],
+                        intrinsics=[intrinsics, intrinsics],
+                        image_shape=[shape[i], shape[i]],
+                    )
+                rendered_self, rendered_other = rendered_output.color.chunk(2, dim=0)
+                res["render_in_self_view"] = rendered_self
+                res["render_in_other_view"] = rendered_other
+                rendered_self_depth, rendered_other_depth = rendered_output.depth.chunk(2, dim=0)
+                res["render_depth_in_self_view"] = rendered_self_depth
+                res["render_depth_in_other_view"] = rendered_other_depth
+
             ress.append(res)
             img_mask = views[i]["img_mask"]
             update = views[i].get("update", None)
@@ -1011,7 +1056,39 @@ class ARCroco3DStereo(CroCoNet):
             dec[self.dec_depth * 3 // 4][:, 1:].float(),
             dec[self.dec_depth].float(),
         ]
-        res = self._downstream_head(head_input, shape, pos=pos_i)
+        res = self._downstream_head(head_input, shape, pos=pos_i, img=view["img"])
+
+        if "gaussian" in self.output_mode:
+            pts3ds_self = res["pts3d_in_self_view"]
+            B, H, W, _ = pts3ds_self.shape
+            pp = torch.tensor([W // 2, H // 2], device=pts3ds_self.device).float().repeat(B, 1)
+            focal = estimate_focal_knowing_depth(pts3ds_self.detach(), pp, focal_mode="weiszfeld")
+            intrinsics = torch.eye(3, device=pts3ds_self.device).unsqueeze(0).repeat(B, 1, 1)
+            intrinsics[:, 0, 0] = focal
+            intrinsics[:, 1, 1] = focal
+            intrinsics[:, 0, 2] = pp[:, 0]
+            intrinsics[:, 1, 2] = pp[:, 1]
+
+            with tf32_off(), torch.amp.autocast("cuda", enabled=False):
+                gasussian_in_self_view = res.pop("gaussian_in_self_view")
+                gaussian_in_other_view = res.pop("gaussian_in_other_view")
+                rendered_output = self.gaussian_decoder.forward(
+                    [gasussian_in_self_view, gaussian_in_other_view],
+                    extrinsics=[
+                        res["camera_pose"].new_tensor([[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]]).expand(
+                            res["camera_pose"].shape[0], -1),
+                        res["camera_pose"]
+                    ],
+                    intrinsics=[intrinsics, intrinsics],
+                    image_shape=[shape, shape],
+                )
+            rendered_self, rendered_other = rendered_output.color.chunk(2, dim=0)
+            res["render_in_self_view"] = rendered_self
+            res["render_in_other_view"] = rendered_other
+            rendered_self_depth, rendered_other_depth = rendered_output.depth.chunk(2, dim=0)
+            res["render_depth_in_self_view"] = rendered_self_depth
+            res["render_depth_in_other_view"] = rendered_other_depth
+
         return res, view
 
     def forward_recurrent(self, views, device, ret_state=False):
@@ -1122,7 +1199,39 @@ class ARCroco3DStereo(CroCoNet):
                 dec[self.dec_depth * 3 // 4][:, 1:].float(),
                 dec[self.dec_depth].float(),
             ]
-            res = self._downstream_head(head_input, shape, pos=pos_i)
+            res = self._downstream_head(head_input, shape, pos=pos_i, img=view["img"])
+
+            if "gaussian" in self.output_mode:
+                pts3ds_self = res["pts3d_in_self_view"]
+                B, H, W, _ = pts3ds_self.shape
+                pp = torch.tensor([W // 2, H // 2], device=pts3ds_self.device).float().repeat(B, 1)
+                focal = estimate_focal_knowing_depth(pts3ds_self.detach(), pp, focal_mode="weiszfeld")
+                intrinsics = torch.eye(3, device=pts3ds_self.device).unsqueeze(0).repeat(B, 1, 1)
+                intrinsics[:, 0, 0] = focal
+                intrinsics[:, 1, 1] = focal
+                intrinsics[:, 0, 2] = pp[:, 0]
+                intrinsics[:, 1, 2] = pp[:, 1]
+
+                with tf32_off(), torch.amp.autocast("cuda", enabled=False):
+                    gasussian_in_self_view = res.pop("gaussian_in_self_view")
+                    gaussian_in_other_view = res.pop("gaussian_in_other_view")
+                    rendered_output = self.gaussian_decoder.forward(
+                        [gasussian_in_self_view, gaussian_in_other_view],
+                        extrinsics=[
+                            res["camera_pose"].new_tensor([[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]]).expand(
+                                res["camera_pose"].shape[0], -1),
+                            res["camera_pose"]
+                        ],
+                        intrinsics=[intrinsics, intrinsics],
+                        image_shape=[shape, shape],
+                    )
+                rendered_self, rendered_other = rendered_output.color.chunk(2, dim=0)
+                res["render_in_self_view"] = rendered_self
+                res["render_in_other_view"] = rendered_other
+                rendered_self_depth, rendered_other_depth = rendered_output.depth.chunk(2, dim=0)
+                res["render_depth_in_self_view"] = rendered_self_depth
+                res["render_depth_in_other_view"] = rendered_other_depth
+
             ress.append(res)
             img_mask = view["img_mask"]
             update = view.get("update", None)
