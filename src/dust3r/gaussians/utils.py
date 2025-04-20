@@ -2,6 +2,13 @@ import torch
 from einops import rearrange
 
 
+C0 = 0.28209479177387814
+
+
+def RGB2SH(rgb):
+    return (rgb - 0.5) / C0
+
+
 def quaternion_to_matrix(quaternions):
     r, i, j, k = torch.unbind(quaternions, dim=-1)
     two_s = 2 / (quaternions * quaternions).sum(dim=-1)

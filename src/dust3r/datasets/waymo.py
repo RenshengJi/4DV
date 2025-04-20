@@ -12,12 +12,13 @@ from dust3r.utils.image import imread_cv2
 class Waymo_Multi(BaseMultiViewDataset):
     """Dataset of outdoor street scenes, 5 images each time"""
 
-    def __init__(self, *args, ROOT, img_ray_mask_p=[0.85, 0.10, 0.05], **kwargs):
+    def __init__(self, *args, ROOT, img_ray_mask_p=[0.85, 0.10, 0.05], valid_camera_id_list=["1", "2", "3"], **kwargs):
         self.ROOT = ROOT
         self.img_ray_mask_p = img_ray_mask_p
         self.max_interval = 8
         self.video = True
         self.is_metric = True
+        self.valid_camera_id_list = valid_camera_id_list
         super().__init__(*args, **kwargs)
         assert self.split is None
         self._load_data()
@@ -63,7 +64,7 @@ class Waymo_Multi(BaseMultiViewDataset):
                 basename = f[:-4]
                 frame_id = basename.split("_")[0]
                 seq_id = basename.split("_")[1]
-                if seq_id == "5":
+                if seq_id not in self.valid_camera_id_list:
                     continue
                 if (seq_id, frame_id) in invalid_pairs:
                     continue  # Skip invalid files

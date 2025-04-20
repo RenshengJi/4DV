@@ -8,7 +8,7 @@ from jaxtyping import Float
 from torch import Tensor, nn
 
 from ..utils.geometry import get_world_rays
-from .utils import build_covariance
+from .utils import build_covariance, RGB2SH
 
 
 @dataclass
@@ -17,6 +17,8 @@ class Gaussians:
     covariances: Float[Tensor, "*batch 3 3"]
     harmonics: Float[Tensor, "*batch 3 _"]
     opacities: Float[Tensor, " *batch"]
+    scales: Optional[Float[Tensor, "*batch 3"]] = None
+    rotations: Optional[Float[Tensor, "*batch 4"]] = None
 
 
 @dataclass
@@ -24,6 +26,8 @@ class GaussianAdapterCfg:
     gaussian_scale_min: float
     gaussian_scale_max: float
     sh_degree: int
+    only_rest: bool = False
+    scale_factor: float = 0.01
 
 
 class GaussianAdapter(nn.Module):
@@ -118,18 +122,28 @@ class UnifiedGaussianAdapter(GaussianAdapter):
         self,
         means: Float[Tensor, "*#batch 3"],
         raw_gaussians: Float[Tensor, "*#batch _"],
+        rgbs: Float[Tensor, "*#batch 3"] = None,
         eps: float = 1e-8,
     ) -> Gaussians:
         mean_offsets, opacities, scales, rotations, sh = raw_gaussians.split((3, 1, 3, 4, 3 * self.d_sh), dim=-1)
 
         opacities = opacities.sigmoid()
-        scales = 0.01 * F.softplus(scales)
+        scales = self.cfg.scale_factor * F.softplus(scales)
         scales = scales.clamp_max(0.3)
 
         # Normalize the quaternion features to yield a valid quaternion.
         rotations = rotations / (rotations.norm(dim=-1, keepdim=True) + eps)
 
         sh = rearrange(sh, "... (xyz d_sh) -> ... xyz d_sh", xyz=3) * self.sh_mask
+
+        if self.cfg.only_rest and rgbs is not None:
+            sh = torch.cat(
+                (
+                    RGB2SH(rgbs * 0.5 + 0.5).unsqueeze(-1),
+                    sh[..., 1:],
+                ),
+                dim=-1,
+            )
 
         covariances = build_covariance(scales, rotations)
 
@@ -138,4 +152,6 @@ class UnifiedGaussianAdapter(GaussianAdapter):
             covariances=covariances,
             harmonics=sh,
             opacities=opacities,
+            scales=scales,
+            rotations=rotations,
         )

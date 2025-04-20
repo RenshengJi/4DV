@@ -333,6 +333,15 @@ class DPTGSPose(DPTPts3dPose):
             final_output["pts3d_in_self_view"] = final_output.pop("pts3d")
             final_output["conf_self"] = final_output.pop("conf")
 
+            rgb_out = checkpoint(
+                self.dpt_rgb,
+                x,
+                image_size=(img_info[0], img_info[1]),
+                use_reentrant=False,
+            )
+            rgb_output = postprocess_rgb(rgb_out)
+            final_output.update(rgb_output)
+
             self_gs_out = checkpoint(
                 self.dpt_gs_self,
                 x,
@@ -344,16 +353,8 @@ class DPTGSPose(DPTPts3dPose):
             final_output["gaussian_in_self_view"] = self.gaussian_adapter.forward(
                 rearrange(final_output["pts3d_in_self_view"], "b h w c -> b (h w) c"),
                 self_gs_out,
+                rearrange(final_output["rgb"], "b h w c -> b (h w) c"),
             )
-
-            rgb_out = checkpoint(
-                self.dpt_rgb,
-                x,
-                image_size=(img_info[0], img_info[1]),
-                use_reentrant=False,
-            )
-            rgb_output = postprocess_rgb(rgb_out)
-            final_output.update(rgb_output)
 
             pose = postprocess_pose(pose, self.pose_mode)
             final_output["camera_pose"] = pose  # B,7
@@ -378,5 +379,6 @@ class DPTGSPose(DPTPts3dPose):
             final_output["gaussian_in_other_view"] = self.gaussian_adapter.forward(
                 rearrange(final_output["pts3d_in_other_view"], "b h w c -> b (h w) c"),
                 cross_gs_out,
+                rearrange(final_output["rgb"], "b h w c -> b (h w) c"),
             )
         return final_output

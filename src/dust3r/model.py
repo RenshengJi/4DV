@@ -24,7 +24,7 @@ from dust3r.utils.misc import (
     transpose_to_landscape,
     tf32_off,
 )
-from dust3r.gaussians import get_decoder
+from dust3r.gaussians import get_decoder, GaussianAdapterCfg, DecoderSplattingCUDACfg
 from dust3r.post_process import estimate_focal_knowing_depth
 from dust3r.heads import head_factory
 from dust3r.utils.camera import PoseEncoder
@@ -502,6 +502,29 @@ class ARCroco3DStereo(CroCoNet):
                 self.downstream_head.dpt_cross,
                 self.downstream_head.dpt_rgb,
                 self.downstream_head.pose_head,
+            ],
+            "cut3r_wo_rgb": [
+                self.patch_embed,
+                self.patch_embed_ray_map,
+                self.masked_img_token,
+                self.masked_ray_map_token,
+                self.enc_blocks,
+                self.enc_blocks_ray_map,
+                self.enc_norm,
+                self.enc_norm_ray_map,
+                self.dec_blocks,
+                self.dec_blocks_state,
+                self.pose_retriever,
+                self.pose_token,
+                self.register_tokens,
+                self.decoder_embed_state,
+                self.decoder_embed,
+                self.dec_norm,
+                self.dec_norm_state,
+                self.downstream_head.dpt_self,
+                self.downstream_head.final_transform,
+                self.downstream_head.dpt_cross,
+                self.downstream_head.pose_head,
             ]
         }
         freeze_all_params(to_be_frozen[freeze])
@@ -844,7 +867,10 @@ class ARCroco3DStereo(CroCoNet):
 
             with tf32_off(), torch.amp.autocast("cuda", enabled=False):
                 gasussian_in_self_view = res.pop("gaussian_in_self_view")
-                gaussian_in_other_view = res.pop("gaussian_in_other_view")
+                if self.training:
+                    gaussian_in_other_view = res.pop("gaussian_in_other_view")
+                else:
+                    gaussian_in_other_view = res["gaussian_in_other_view"]
                 rendered_output = self.gaussian_decoder.forward(
                     [gasussian_in_self_view, gaussian_in_other_view],
                     extrinsics=[
@@ -942,7 +968,10 @@ class ARCroco3DStereo(CroCoNet):
 
                 with tf32_off(), torch.amp.autocast("cuda", enabled=False):
                     gasussian_in_self_view = res.pop("gaussian_in_self_view")
-                    gaussian_in_other_view = res.pop("gaussian_in_other_view")
+                    if self.training:
+                        gaussian_in_other_view = res.pop("gaussian_in_other_view")
+                    else:
+                        gaussian_in_other_view = res["gaussian_in_other_view"]
                     rendered_output = self.gaussian_decoder.forward(
                         [gasussian_in_self_view, gaussian_in_other_view],
                         extrinsics=[
@@ -1071,7 +1100,10 @@ class ARCroco3DStereo(CroCoNet):
 
             with tf32_off(), torch.amp.autocast("cuda", enabled=False):
                 gasussian_in_self_view = res.pop("gaussian_in_self_view")
-                gaussian_in_other_view = res.pop("gaussian_in_other_view")
+                if self.training:
+                    gaussian_in_other_view = res.pop("gaussian_in_other_view")
+                else:
+                    gaussian_in_other_view = res["gaussian_in_other_view"]
                 rendered_output = self.gaussian_decoder.forward(
                     [gasussian_in_self_view, gaussian_in_other_view],
                     extrinsics=[
@@ -1214,7 +1246,10 @@ class ARCroco3DStereo(CroCoNet):
 
                 with tf32_off(), torch.amp.autocast("cuda", enabled=False):
                     gasussian_in_self_view = res.pop("gaussian_in_self_view")
-                    gaussian_in_other_view = res.pop("gaussian_in_other_view")
+                    if self.training:
+                        gaussian_in_other_view = res.pop("gaussian_in_other_view")
+                    else:
+                        gaussian_in_other_view = res["gaussian_in_other_view"]
                     rendered_output = self.gaussian_decoder.forward(
                         [gasussian_in_self_view, gaussian_in_other_view],
                         extrinsics=[
