@@ -55,3 +55,6 @@ docs/_build/
 data
 src/checkpoints
 /tmp
+/examples
+/config/debug
+debug_*.png

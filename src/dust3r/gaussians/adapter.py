@@ -23,11 +23,12 @@ class Gaussians:
 
 @dataclass
 class GaussianAdapterCfg:
-    gaussian_scale_min: float
-    gaussian_scale_max: float
     sh_degree: int
+    gaussian_scale_min: float = 1e-6
+    gaussian_scale_max: float = 0.3
     only_rest: bool = False
     scale_factor: float = 0.01
+    scale_activation: str = "softplus"
 
 
 class GaussianAdapter(nn.Module):
@@ -128,8 +129,17 @@ class UnifiedGaussianAdapter(GaussianAdapter):
         mean_offsets, opacities, scales, rotations, sh = raw_gaussians.split((3, 1, 3, 4, 3 * self.d_sh), dim=-1)
 
         opacities = opacities.sigmoid()
-        scales = self.cfg.scale_factor * F.softplus(scales)
-        scales = scales.clamp_max(0.3)
+
+        if self.cfg.scale_activation == "softplus":
+            scales = self.cfg.scale_factor * F.softplus(scales)
+            scales = scales.clamp_max(self.cfg.gaussian_scale_max)
+        elif self.cfg.scale_activation == "sigmoid":
+            scales = self.cfg.gaussian_scale_min + (self.cfg.gaussian_scale_max - self.cfg.gaussian_scale_min) * scales.sigmoid()
+        elif self.cfg.scale_activation == "exp":
+            scales = self.cfg.scale_factor * torch.exp(scales)
+            scales = scales.clamp_max(self.cfg.gaussian_scale_max)
+        else:
+            raise ValueError(f"Unknown scale activation: {self.cfg.scale_activation}")
 
         # Normalize the quaternion features to yield a valid quaternion.
         rotations = rotations / (rotations.norm(dim=-1, keepdim=True) + eps)

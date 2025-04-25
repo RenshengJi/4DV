@@ -31,6 +31,7 @@ import shutil
 from copy import deepcopy
 from add_ckpt_path import add_path_to_dust3r
 import imageio.v2 as iio
+import json
 
 # Set random seed for reproducibility.
 random.seed(42)
@@ -347,6 +348,7 @@ def run_inference(args):
     from src.dust3r.inference import inference, inference_recurrent
     from src.dust3r.model import ARCroco3DStereo
     from src.dust3r.utils.ply_export import export_ply
+    from src.dust3r.utils.metrics import compute_lpips, compute_psnr, compute_ssim
     from viser_utils import PointCloudViewer
 
     # Prepare image file paths.
@@ -395,8 +397,11 @@ def run_inference(args):
     # pts3ds_to_vis = [p.cpu().numpy() for p in pts3ds_other]
     # colors_to_vis = [c.cpu().numpy() for c in colors]
     # edge_colors = [None] * len(pts3ds_to_vis)
-    output_path = os.path.join(args.output_dir, os.path.basename(args.model_path).split(".")[0])
+    # get the relative path
+    relative_path = os.path.relpath(args.model_path, "src/checkpoints")
+    output_path = os.path.join(args.output_dir, relative_path.replace(".pth", ""))
     os.makedirs(output_path, exist_ok=True)
+    metrics = []
     for i in range(len(outputs["pred"])):
         # export_ply(
         #     outputs["pred"][i]["gaussian_in_other_view"].means[0],
@@ -418,7 +423,32 @@ def run_inference(args):
             outputs['views'][i]['img'] * 0.5 + 0.5,
             os.path.join(output_path, f"gt_{i:06d}.png"),
         )
+        metrics.append(
+            {
+                "image_path": img_paths[i],
+                "psnr": compute_psnr(
+                    outputs['views'][i]['img'] * 0.5 + 0.5,
+                    outputs["pred"][i]["render_in_other_view"],
+                ).item(),
+                "ssim": compute_ssim(
+                    outputs['views'][i]['img'] * 0.5 + 0.5,
+                    outputs["pred"][i]["render_in_other_view"],
+                ).item(),
+                "lpips": compute_lpips(
+                    outputs['views'][i]['img'] * 0.5 + 0.5,
+                    outputs["pred"][i]["render_in_other_view"],
+                ).item(),
+            }
+        )
         # print("Exported PLY file:", os.path.join(args.output_dir, "ply", f"{i:06d}.ply"))
+    summary = {
+        "average_psnr": np.mean([m["psnr"] for m in metrics]),
+        "average_ssim": np.mean([m["ssim"] for m in metrics]),
+        "average_lpips": np.mean([m["lpips"] for m in metrics]),
+        "metrics": metrics,
+    }
+    with open(os.path.join(output_path, "metrics.json"), "w") as f:
+        json.dump(summary, f, indent=4)
 
 
 def main():
