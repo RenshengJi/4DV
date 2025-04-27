@@ -103,11 +103,14 @@ def postprocess_desc(out, depth_mode, conf_mode, desc_dim, double_channel=False)
     return res
 
 
-def postprocess_gaussian(out, mode):
+def postprocess_gaussian(out, mode, predict_offset=True):
     fmap = rearrange(out, "b c h w -> b (h w) c")  # B,(H W),C
-    means, other_params = fmap.split([3, fmap.shape[-1] - 3], dim=-1)
-    means = reg_dense_depth(means, mode=mode)
-    return torch.cat([means, other_params], dim=-1)
+    if predict_offset:
+        means, other_params = fmap.split([3, fmap.shape[-1] - 3], dim=-1)
+        means = reg_dense_depth(means, mode=mode)
+        return torch.cat([means, other_params], dim=-1)
+    else:
+        return fmap
 
 
 def reg_desc(desc, mode="norm"):

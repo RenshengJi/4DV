@@ -9,7 +9,7 @@ from torch import Tensor
 from ..adapter import Gaussians
 from .cuda_splatting import DepthRenderingMode, render_cuda
 from .decoder import Decoder, DecoderOutput
-from ..utils import pose_encoding_to_camera
+from ..utils import pose_encoding_to_camera, build_covariance
 
 
 @dataclass
@@ -51,7 +51,8 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
         if isinstance(gaussians, List):
             gaussians = Gaussians(
                 means=torch.cat([g.means for g in gaussians], dim=0),
-                covariances=torch.cat([g.covariances for g in gaussians], dim=0),
+                scales=torch.cat([g.scales for g in gaussians], dim=0),
+                rotations=torch.cat([g.rotations for g in gaussians], dim=0),
                 harmonics=torch.cat([g.harmonics for g in gaussians], dim=0),
                 opacities=torch.cat([g.opacities for g in gaussians], dim=0),
             )
@@ -69,6 +70,10 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
 
         b, _, _ = intrinsics.shape
         extrinsics = pose_encoding_to_camera(extrinsics)
+        gaussians.covariances = build_covariance(
+            gaussians.scales,
+            gaussians.rotations
+        )
 
         if near is None:
             near = torch.full((b,), self.cfg.near, dtype=extrinsics.dtype, device=extrinsics.device)

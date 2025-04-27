@@ -871,10 +871,7 @@ class ARCroco3DStereo(CroCoNet):
 
             with tf32_off(), torch.amp.autocast("cuda", enabled=False):
                 gasussian_in_self_view = res.pop("gaussian_in_self_view")
-                if self.training:
-                    gaussian_in_other_view = res.pop("gaussian_in_other_view")
-                else:
-                    gaussian_in_other_view = res["gaussian_in_other_view"]
+                gaussian_in_other_view = res["gaussian_in_other_view"]
                 rendered_output = self.gaussian_decoder.forward(
                     [gasussian_in_self_view, gaussian_in_other_view],
                     extrinsics=[
@@ -972,10 +969,7 @@ class ARCroco3DStereo(CroCoNet):
 
                 with tf32_off(), torch.amp.autocast("cuda", enabled=False):
                     gasussian_in_self_view = res.pop("gaussian_in_self_view")
-                    if self.training:
-                        gaussian_in_other_view = res.pop("gaussian_in_other_view")
-                    else:
-                        gaussian_in_other_view = res["gaussian_in_other_view"]
+                    gaussian_in_other_view = res["gaussian_in_other_view"]
                     rendered_output = self.gaussian_decoder.forward(
                         [gasussian_in_self_view, gaussian_in_other_view],
                         extrinsics=[
@@ -1104,10 +1098,7 @@ class ARCroco3DStereo(CroCoNet):
 
             with tf32_off(), torch.amp.autocast("cuda", enabled=False):
                 gasussian_in_self_view = res.pop("gaussian_in_self_view")
-                if self.training:
-                    gaussian_in_other_view = res.pop("gaussian_in_other_view")
-                else:
-                    gaussian_in_other_view = res["gaussian_in_other_view"]
+                gaussian_in_other_view = res["gaussian_in_other_view"]
                 rendered_output = self.gaussian_decoder.forward(
                     [gasussian_in_self_view, gaussian_in_other_view],
                     extrinsics=[
@@ -1250,10 +1241,7 @@ class ARCroco3DStereo(CroCoNet):
 
                 with tf32_off(), torch.amp.autocast("cuda", enabled=False):
                     gasussian_in_self_view = res.pop("gaussian_in_self_view")
-                    if self.training:
-                        gaussian_in_other_view = res.pop("gaussian_in_other_view")
-                    else:
-                        gaussian_in_other_view = res["gaussian_in_other_view"]
+                    gaussian_in_other_view = res["gaussian_in_other_view"]
                     rendered_output = self.gaussian_decoder.forward(
                         [gasussian_in_self_view, gaussian_in_other_view],
                         extrinsics=[

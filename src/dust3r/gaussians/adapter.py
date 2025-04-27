@@ -14,11 +14,12 @@ from .utils import build_covariance, RGB2SH
 @dataclass
 class Gaussians:
     means: Float[Tensor, "*batch 3"]
-    covariances: Float[Tensor, "*batch 3 3"]
     harmonics: Float[Tensor, "*batch 3 _"]
     opacities: Float[Tensor, " *batch"]
+    covariances: Optional[Float[Tensor, "*batch 3 3"]] = None
     scales: Optional[Float[Tensor, "*batch 3"]] = None
     rotations: Optional[Float[Tensor, "*batch 4"]] = None
+    velocities: Optional[Float[Tensor, "*batch 3"]] = None
 
 
 @dataclass
@@ -29,6 +30,8 @@ class GaussianAdapterCfg:
     only_rest: bool = False
     scale_factor: float = 0.01
     scale_activation: str = "softplus"
+    predict_offset: bool = True
+    predict_velocity: bool = False
 
 
 class GaussianAdapter(nn.Module):
@@ -37,6 +40,8 @@ class GaussianAdapter(nn.Module):
     def __init__(self, cfg: GaussianAdapterCfg):
         super().__init__()
         self.cfg = cfg
+        self.predict_offset = cfg.predict_offset
+        self.predict_velocity = cfg.predict_velocity
 
         # Create a mask for the spherical harmonics coefficients. This ensures that at
         # initialization, the coefficients are biased towards having a large DC
@@ -114,8 +119,13 @@ class GaussianAdapter(nn.Module):
 
     @property
     def d_in(self) -> int:
-        # 3 for means_offset, 1 for opacity, 3 for scales, 4 for rotations, and 3 * d_sh for spherical harmonics
-        return 3 + 1 + 7 + 3 * self.d_sh
+        # 1 for opacity, 3 for scales, 4 for rotations, and 3 * d_sh for spherical harmonics
+        attrib_num = 1 + 7 + 3 * self.d_sh
+        if self.predict_offset:
+            attrib_num += 3
+        if self.predict_velocity:
+            attrib_num += 3
+        return attrib_num
 
 
 class UnifiedGaussianAdapter(GaussianAdapter):
@@ -126,7 +136,29 @@ class UnifiedGaussianAdapter(GaussianAdapter):
         rgbs: Float[Tensor, "*#batch 3"] = None,
         eps: float = 1e-8,
     ) -> Gaussians:
-        mean_offsets, opacities, scales, rotations, sh = raw_gaussians.split((3, 1, 3, 4, 3 * self.d_sh), dim=-1)
+        if self.predict_offset:
+            if self.predict_velocity:
+                mean_offsets, velocities, opacities, scales, rotations, sh = raw_gaussians.split(
+                    (3, 3, 1, 3, 4, 3 * self.d_sh), dim=-1
+                )
+            else:
+                mean_offsets, opacities, scales, rotations, sh = raw_gaussians.split(
+                    (3, 1, 3, 4, 3 * self.d_sh), dim=-1
+                )
+                velocities = None
+        else:
+            if self.predict_velocity:
+                velocities, opacities, scales, rotations, sh = raw_gaussians.split(
+                    (3, 1, 3, 4, 3 * self.d_sh), dim=-1
+                )
+                mean_offsets = None
+            else:
+                opacities, scales, rotations, sh = raw_gaussians.split(
+                    (1, 3, 4, 3 * self.d_sh), dim=-1
+                )
+                mean_offsets = None
+                velocities = None
+
 
         opacities = opacities.sigmoid()
 
@@ -155,13 +187,11 @@ class UnifiedGaussianAdapter(GaussianAdapter):
                 dim=-1,
             )
 
-        covariances = build_covariance(scales, rotations)
-
         return Gaussians(
-            means=means+mean_offsets,
-            covariances=covariances,
+            means=means + mean_offsets if mean_offsets is not None else means,
             harmonics=sh,
             opacities=opacities,
             scales=scales,
             rotations=rotations,
+            velocities=velocities,
         )

@@ -349,7 +349,7 @@ class DPTGSPose(DPTPts3dPose):
                 images=kwargs.get("img"),
                 use_reentrant=False,
             )
-            self_gs_out = postprocess_gaussian(self_gs_out, self.depth_mode)
+            self_gs_out = postprocess_gaussian(self_gs_out, self.depth_mode, predict_offset=self.gaussian_adapter.predict_offset)
             final_output["gaussian_in_self_view"] = self.gaussian_adapter.forward(
                 rearrange(final_output["pts3d_in_self_view"], "b h w c -> b (h w) c"),
                 self_gs_out,
@@ -375,7 +375,7 @@ class DPTGSPose(DPTPts3dPose):
                 images=kwargs.get("img"),
                 use_reentrant=False,
             )
-            cross_gs_out = postprocess_gaussian(cross_gs_out, self.depth_mode)
+            cross_gs_out = postprocess_gaussian(cross_gs_out, self.depth_mode, predict_offset=self.gaussian_adapter.predict_offset)
             final_output["gaussian_in_other_view"] = self.gaussian_adapter.forward(
                 rearrange(final_output["pts3d_in_other_view"], "b h w c -> b (h w) c"),
                 cross_gs_out,

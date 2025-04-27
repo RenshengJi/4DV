@@ -153,7 +153,7 @@ def loss_of_one_batch_tbptt(
                             mem=mem,
                         )
                         preds.append(res)
-                        all_preds.append({k: v.detach() for k, v in res.items()})
+                        all_preds.append({k: v.detach() for k, v in res.items() if isinstance(v, torch.Tensor)})
                         chunk.append(batch[i])
                 with torch.amp.autocast("cuda", enabled=False):
                     loss, loss_details = (
@@ -186,7 +186,7 @@ def loss_of_one_batch_tbptt(
                         mem=mem,
                     )
                     preds.append(res)
-                    all_preds.append({k: v.detach() for k, v in res.items()})
+                    all_preds.append({k: v.detach() for k, v in res.items() if isinstance(v, torch.Tensor)})
                     chunk.append(batch[i])
                 with torch.amp.autocast("cuda", enabled=False):
                     loss, loss_details = (
