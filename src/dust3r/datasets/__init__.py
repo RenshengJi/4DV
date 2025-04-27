@@ -12,6 +12,7 @@ from .eden import EDEN_Multi
 from .hypersim import HyperSim_Multi
 from .hoi4d import HOI4D_Multi
 from .irs import IRS
+from .koala import Koala_Multi
 from .mapfree import MapFree_Multi
 from .megadepth import MegaDepth_Multi  # noqa
 from .mp3d import MP3D_Multi

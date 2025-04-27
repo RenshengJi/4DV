@@ -352,7 +352,15 @@ class BaseMultiViewDataset(EasyDataset):
         resolution = self._resolutions[
             ar_idx
         ]  # DO NOT CHANGE THIS (compatible with BatchedRandomSampler)
-        views = self._get_views(idx, resolution, self._rng, nview)
+        while True:
+            try:
+                views = self._get_views(idx, resolution, self._rng, nview)
+                break
+
+            except Exception as e:
+                print(f"Error in getting sample {idx}: {e}.")
+                idx = random.randint(0, len(self) - 1)
+
         assert len(views) == nview
 
         if "camera_pose" not in views[0]:
@@ -371,40 +379,39 @@ class BaseMultiViewDataset(EasyDataset):
 
             view["true_shape"] = np.int32((height, width))
             view["img"] = transform(view["img"])
-            view["sky_mask"] = view["depthmap"] < 0
 
-            assert "camera_intrinsics" in view
-            if "camera_pose" not in view:
-                view["camera_pose"] = np.full((4, 4), np.nan, dtype=np.float32)
-            else:
+            if "camera_intrinsics" in view:
+                view["sky_mask"] = view["depthmap"] < 0
+                if "camera_pose" not in view:
+                    view["camera_pose"] = np.full((4, 4), np.nan, dtype=np.float32)
+                else:
+                    assert np.isfinite(
+                        view["camera_pose"]
+                    ).all(), f"NaN in camera pose for view {view_name(view)}"
+
+                ray_map = get_ray_map(
+                    first_view_camera_pose,
+                    view["camera_pose"],
+                    view["camera_intrinsics"],
+                    height,
+                    width,
+                )
+                view["ray_map"] = ray_map.astype(np.float32)
+
+                assert "pts3d" not in view
+                assert "valid_mask" not in view
                 assert np.isfinite(
-                    view["camera_pose"]
-                ).all(), f"NaN in camera pose for view {view_name(view)}"
+                    view["depthmap"]
+                ).all(), f"NaN in depthmap for view {view_name(view)}"
+                pts3d, valid_mask = depthmap_to_absolute_camera_coordinates(**view)
 
-            ray_map = get_ray_map(
-                first_view_camera_pose,
-                view["camera_pose"],
-                view["camera_intrinsics"],
-                height,
-                width,
-            )
-            view["ray_map"] = ray_map.astype(np.float32)
-
-            assert "pts3d" not in view
-            assert "valid_mask" not in view
-            assert np.isfinite(
-                view["depthmap"]
-            ).all(), f"NaN in depthmap for view {view_name(view)}"
-            pts3d, valid_mask = depthmap_to_absolute_camera_coordinates(**view)
-
-            view["pts3d"] = pts3d
-            view["valid_mask"] = valid_mask & np.isfinite(pts3d).all(axis=-1)
+                view["pts3d"] = pts3d
+                view["valid_mask"] = valid_mask & np.isfinite(pts3d).all(axis=-1)
 
             # check all datatypes
             for key, val in view.items():
                 res, err_msg = is_good_type(key, val)
                 assert res, f"{err_msg} with {key}={val} for view {view_name(view)}"
-            K = view["camera_intrinsics"]
 
         if self.n_corres > 0:
             ref_view = views[0]

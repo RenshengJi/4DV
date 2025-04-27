@@ -641,9 +641,12 @@ class ARCroco3DStereo(CroCoNet):
         imgs = torch.stack(
             [view["img"] for view in views], dim=0
         )  # Shape: (num_views, batch_size, C, H, W)
-        ray_maps = torch.stack(
-            [view["ray_map"] for view in views], dim=0
-        )  # Shape: (num_views, batch_size, H, W, C)
+        if "ray_map" in views[0]:
+            ray_maps = torch.stack(
+                [view["ray_map"] for view in views], dim=0
+            )  # Shape: (num_views, batch_size, H, W, C)
+        else:
+            ray_maps = None
         shapes = []
         for view in views:
             if "true_shape" in view:
@@ -657,9 +660,10 @@ class ARCroco3DStereo(CroCoNet):
         imgs = imgs.view(
             -1, *imgs.shape[2:]
         )  # Shape: (num_views * batch_size, C, H, W)
-        ray_maps = ray_maps.view(
-            -1, *ray_maps.shape[2:]
-        )  # Shape: (num_views * batch_size, H, W, C)
+        if ray_maps is not None:
+            ray_maps = ray_maps.view(
+                -1, *ray_maps.shape[2:]
+            )  # Shape: (num_views * batch_size, H, W, C)
         shapes = shapes.view(-1, 2)  # Shape: (num_views * batch_size, 2)
         img_masks_flat = img_mask.view(-1)  # Shape: (num_views * batch_size)
         ray_masks_flat = ray_mask.view(-1)
@@ -685,10 +689,10 @@ class ARCroco3DStereo(CroCoNet):
             full_out[i][img_masks_flat] += img_out[i]
             full_out[i][~img_masks_flat] += self.masked_img_token
         full_pos[img_masks_flat] += img_pos
-        ray_maps = ray_maps.permute(0, 3, 1, 2)  # Change shape to (N, C, H, W)
-        selected_ray_maps = ray_maps[ray_masks_flat]
-        selected_shapes_ray = shapes[ray_masks_flat]
-        if selected_ray_maps.size(0) > 0:
+        if ray_masks_flat.sum() > 0:
+            ray_maps = ray_maps.permute(0, 3, 1, 2)  # Change shape to (N, C, H, W)
+            selected_ray_maps = ray_maps[ray_masks_flat]
+            selected_shapes_ray = shapes[ray_masks_flat]
             ray_out, ray_pos, _ = self._encode_ray_map(
                 selected_ray_maps, selected_shapes_ray
             )
