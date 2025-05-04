@@ -246,18 +246,18 @@ class RenderLoss(Criterion, MultiLoss):
     def compute_loss(self, gts, preds, **kw):
         if self.shape == "BHWC":
             gt_rgbs = [gt["img"].permute(0, 2, 3, 1) * 0.5 + 0.5 for gt in gts]
-            pred_rgbs_in_self_view = [pred["render_in_self_view"].permute(0, 2, 3, 1) for pred in preds]
+            pred_rgbs_from_self_view = [pred["render_from_self_view"].permute(0, 2, 3, 1) for pred in preds]
             pred_rgbs_in_other_view = [pred["render_in_other_view"].permute(0, 2, 3, 1) for pred in preds]
         elif self.shape == "BCHW":
             gt_rgbs = [gt["img"] * 0.5 + 0.5 for gt in gts]
-            pred_rgbs_in_self_view = [pred["render_in_self_view"] for pred in preds]
+            pred_rgbs_from_self_view = [pred["render_from_self_view"] for pred in preds]
             pred_rgbs_in_other_view = [pred["render_in_other_view"] for pred in preds]
         else:
             raise ValueError(f"Unknown shape {self.shape}")
 
         ls = [
             self.img_loss(pred_rgb, gt_rgb)
-            for pred_rgb, gt_rgb in zip(pred_rgbs_in_self_view, gt_rgbs)
+            for pred_rgb, gt_rgb in zip(pred_rgbs_from_self_view, gt_rgbs)
         ]
         ls_other_view = [
             self.img_loss(pred_rgb, gt_rgb)
@@ -266,8 +266,8 @@ class RenderLoss(Criterion, MultiLoss):
         details = {}
         self_name = self.get_name()
         for i, l in enumerate(ls):
-            details[self_name + f"_rgb_in_self_view/{i+1}"] = float(l)
-            details[f"pred_rgb_in_self_view_{i+1}"] = pred_rgbs_in_self_view[i] if self.shape == "BHWC" else pred_rgbs_in_self_view[i].permute(0, 2, 3, 1)
+            details[self_name + f"_rgb_from_self_view/{i+1}"] = float(l)
+            details[f"pred_rgb_from_self_view_{i+1}"] = pred_rgbs_from_self_view[i] if self.shape == "BHWC" else pred_rgbs_from_self_view[i].permute(0, 2, 3, 1)
         for i, l in enumerate(ls_other_view):
             details[self_name + f"_rgb_in_other_view/{i+1}"] = float(l)
             details[f"pred_rgb_in_other_view_{i+1}"] = pred_rgbs_in_other_view[i] if self.shape == "BHWC" else pred_rgbs_in_other_view[i].permute(0, 2, 3, 1)

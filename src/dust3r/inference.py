@@ -253,7 +253,7 @@ def inference_step(view, state_args, model, device, verbose=True):
 
     with torch.amp.autocast("cuda", enabled=False):
         state_feat, state_pos, init_state_feat, mem, init_mem = state_args
-        pred, _ = model.inference_step(
+        pred, _, _ = model.inference_step(
             view, state_feat, state_pos, init_state_feat, mem, init_mem
         )
 

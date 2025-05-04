@@ -20,6 +20,7 @@ from dust3r.heads.postprocess import (
 import dust3r.utils.path_to_croco  # noqa: F401
 from models.dpt_block import DPTOutputAdapter, Interpolate  # noqa
 from dust3r.utils.camera import pose_encoding_to_camera, PoseDecoder
+from dust3r.utils.misc import tf32_off
 from dust3r.blocks import ConditionModulationBlock
 from dust3r.gaussians.adapter import UnifiedGaussianAdapter
 from torch.utils.checkpoint import checkpoint
@@ -321,7 +322,7 @@ class DPTGSPose(DPTPts3dPose):
         x = x[:-1] + [token]
         x_cross = x[:-1] + [token_cross]
 
-        with torch.amp.autocast("cuda", enabled=False):
+        with tf32_off(), torch.amp.autocast("cuda", enabled=False):
             self_out = checkpoint(
                 self.dpt_self,
                 x,
@@ -342,6 +343,9 @@ class DPTGSPose(DPTPts3dPose):
             rgb_output = postprocess_rgb(rgb_out)
             final_output.update(rgb_output)
 
+            pose = postprocess_pose(pose, self.pose_mode)
+            final_output["camera_pose"] = pose  # B,7
+
             self_gs_out = checkpoint(
                 self.dpt_gs_self,
                 x,
@@ -350,14 +354,18 @@ class DPTGSPose(DPTPts3dPose):
                 use_reentrant=False,
             )
             self_gs_out = postprocess_gaussian(self_gs_out, self.depth_mode, predict_offset=self.gaussian_adapter.predict_offset)
-            final_output["gaussian_in_self_view"] = self.gaussian_adapter.forward(
-                rearrange(final_output["pts3d_in_self_view"], "b h w c -> b (h w) c"),
+
+            camera_pose = pose_encoding_to_camera(pose)
+            pts3d_in_other_view = (
+                torch.einsum("bij, bhwj -> bhwi", camera_pose[:, :3, :3], final_output["pts3d_in_self_view"])
+                + camera_pose[:, None, None, :3, 3]
+            )
+            final_output["gaussian_from_self_view"] = self.gaussian_adapter.forward(
+                rearrange(pts3d_in_other_view, "b h w c -> b (h w) c"),
                 self_gs_out,
                 rearrange(final_output["rgb"], "b h w c -> b (h w) c"),
             )
 
-            pose = postprocess_pose(pose, self.pose_mode)
-            final_output["camera_pose"] = pose  # B,7
             cross_out = checkpoint(
                 self.dpt_cross,
                 x_cross,

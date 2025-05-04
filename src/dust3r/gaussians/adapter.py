@@ -30,7 +30,7 @@ class GaussianAdapterCfg:
     only_rest: bool = False
     scale_factor: float = 0.01
     scale_activation: str = "softplus"
-    predict_offset: bool = True
+    predict_offset: bool = False
     predict_velocity: bool = False
 
 
@@ -159,6 +159,7 @@ class UnifiedGaussianAdapter(GaussianAdapter):
                 mean_offsets = None
                 velocities = None
 
+        # TODO: Map velocities
 
         opacities = opacities.sigmoid()
 
@@ -182,6 +183,14 @@ class UnifiedGaussianAdapter(GaussianAdapter):
             sh = torch.cat(
                 (
                     RGB2SH(rgbs * 0.5 + 0.5).unsqueeze(-1),
+                    sh[..., 1:],
+                ),
+                dim=-1,
+            )
+        else:
+            sh = torch.cat(
+                (
+                    RGB2SH(sh[..., 0:1].sigmoid()),
                     sh[..., 1:],
                 ),
                 dim=-1,

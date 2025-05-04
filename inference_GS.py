@@ -412,7 +412,7 @@ def run_inference(args):
         #     os.path.join(args.output_dir, "ply", f"{i:06d}.ply"),
         # )
         save_image(
-            outputs["pred"][i]["render_in_self_view"],
+            outputs["pred"][i]["render_from_self_view"],
             os.path.join(output_path, f"self_view_{i:06d}.png"),
         )
         save_image(

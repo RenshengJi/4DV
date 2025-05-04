@@ -544,7 +544,7 @@ def train_one_epoch(
             and data_iter_step != len(data_loader) - 1
         ):
             print("saving at step", data_iter_step)
-            save_model(epoch - 1, f"latest_{data_iter_step}", float("inf"))
+            save_model(epoch - 1, f"epoch_{epoch}_{data_iter_step}", float("inf"))
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes(accelerator)
@@ -908,6 +908,12 @@ def get_vis_imgs_new(loss_details, num_imgs_vis, num_views, is_metric):
 )
 def run(cfg: OmegaConf):
     OmegaConf.resolve(cfg)
+    if cfg.get("debug", False):
+        cfg.num_workers = 0
+        import debugpy
+        debugpy.listen(5679)
+        print("Waiting for debugger to attach...")
+        debugpy.wait_for_client()
     logdir = pathlib.Path(cfg.logdir)
     logdir.mkdir(parents=True, exist_ok=True)
     train(cfg)
