@@ -348,13 +348,12 @@ class DPTGSPose(DPTPts3dPose):
 
             self_gs_out = checkpoint(
                 self.dpt_gs_self,
-                x,
+                x_cross,                                # predict gaussian in the global coordinate
                 image_size=(img_info[0], img_info[1]),
                 images=kwargs.get("img"),
                 use_reentrant=False,
             )
             self_gs_out = postprocess_gaussian(self_gs_out, self.depth_mode, predict_offset=self.gaussian_adapter.predict_offset)
-
             camera_pose = pose_encoding_to_camera(pose)
             pts3d_in_other_view = (
                 torch.einsum("bij, bhwj -> bhwi", camera_pose[:, :3, :3], final_output["pts3d_in_self_view"])
