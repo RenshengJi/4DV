@@ -119,6 +119,7 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         pose_head=False,
         gaussian_adapter_cfg=None,
         gaussian_decoder_cfg=None,
+        use_gt_pose=True,
         **croco_kwargs,
     ):
         super().__init__()
@@ -142,6 +143,7 @@ class ARCroco3DStereoConfig(PretrainedConfig):
         self.croco_kwargs = croco_kwargs
         self.gaussian_adapter_cfg = gaussian_adapter_cfg
         self.gaussian_decoder_cfg = gaussian_decoder_cfg
+        self.use_gt_pose = use_gt_pose
 
 
 class LocalMemory(nn.Module):
@@ -688,10 +690,19 @@ class ARCroco3DStereo(CroCoNet):
         shapes = shapes.view(-1, 2)  # Shape: (num_views * batch_size, 2)
         img_masks_flat = img_mask.view(-1)  # Shape: (num_views * batch_size)
         ray_masks_flat = ray_mask.view(-1)
+        
+        ray_maps_reshape = ray_maps.permute(0, 3, 1, 2)
         selected_imgs = imgs[img_masks_flat]
         selected_shapes = shapes[img_masks_flat]
+        selected_ray_maps = ray_maps_reshape[img_masks_flat]
+
         if selected_imgs.size(0) > 0:
             img_out, img_pos, _ = self._encode_image(selected_imgs, selected_shapes)
+            if not hasattr(self.config, "use_gt_pose"):
+                self.config.use_gt_pose = True
+            if self.config.use_gt_pose:
+                ray_out, _, _ = self._encode_ray_map(selected_ray_maps, selected_shapes)
+                img_out = [img_out[0] + ray_out[0]]
         else:
             raise NotImplementedError
         full_out = [
@@ -877,7 +888,18 @@ class ARCroco3DStereo(CroCoNet):
             dec[self.dec_depth * 3 // 4][:, 1:].float(),
             dec[self.dec_depth].float(),
         ]
-        res = self._downstream_head(head_input, shape_i, pos=pos_i, img=views[i]["img"])
+
+        # 如果self.config.use_gt_pose不存在，则设置为True FIXME: 训练新的模型之后可以去掉了
+        if not hasattr(self.config, "use_gt_pose"):
+            self.config.use_gt_pose = True  
+
+        with tf32_off():
+            gt_extrinsics = torch.matmul(torch.inverse(views[0]["camera_pose"]), views[i]["camera_pose"])
+            gt_intrinsics = views[i]["camera_intrinsics"]
+        
+        gt_extrinsics = gt_extrinsics.to(torch.float32)
+        
+        res = self._downstream_head(head_input, shape_i, pos=pos_i, img=views[i]["img"], use_gt_pose=self.config.use_gt_pose, extrinsics=gt_extrinsics)
 
         if "gaussian" in self.output_mode:
             pts3ds_self = res["pts3d_in_self_view"]
@@ -898,12 +920,20 @@ class ARCroco3DStereo(CroCoNet):
             with tf32_off(), torch.amp.autocast("cuda", enabled=False):
                 gaussian_from_self_view = res["gaussian_from_self_view"]
                 gaussian_in_other_view = res["gaussian_in_other_view"]
-                rendered_output = self.gaussian_decoder.forward(
-                    [gaussian_from_self_view, gaussian_in_other_view],
-                    extrinsics=[res["camera_pose"], res["camera_pose"]],
-                    intrinsics=[intrinsics, intrinsics],
-                    image_shape=[shape_i, shape_i],
-                )
+                if not self.config.use_gt_pose:  #FIXME: 新model
+                    rendered_output = self.gaussian_decoder.forward(
+                        [gaussian_from_self_view, gaussian_in_other_view],
+                        extrinsics=[res["camera_pose"], res["camera_pose"]],
+                        intrinsics=[intrinsics, intrinsics],
+                        image_shape=[shape_i, shape_i],
+                    )
+                else:
+                    rendered_output = self.gaussian_decoder.forward(
+                        [gaussian_from_self_view, gaussian_in_other_view],
+                        extrinsics=[gt_extrinsics, gt_extrinsics],
+                        intrinsics=[gt_intrinsics, gt_intrinsics],
+                        image_shape=[shape_i, shape_i],
+                    )
             rendered_self, rendered_other = rendered_output.color.chunk(2, dim=0)
             res["render_from_self_view"] = rendered_self
             res["render_in_other_view"] = rendered_other
@@ -976,7 +1006,16 @@ class ARCroco3DStereo(CroCoNet):
                 dec[self.dec_depth * 3 // 4][:, 1:].float(),
                 dec[self.dec_depth].float(),
             ]
-            res = self._downstream_head(head_input, shape[i], pos=pos_i, img=views[i]["img"])
+
+            # 如果self.config.use_gt_pose不存在，则设置为True FIXME: 训练新的模型之后可以去掉了
+            if not hasattr(self.config, "use_gt_pose"):
+                self.config.use_gt_pose = True  
+
+            with tf32_off():
+                gt_extrinsics = torch.matmul(torch.inverse(views[0]["camera_pose"]), views[i]["camera_pose"])
+                gt_intrinsics = views[i]["camera_intrinsics"].unsqueeze(0)
+            
+            res = self._downstream_head(head_input, shape[i], pos=pos_i, img=views[i]["img"], use_gt_pose=self.config.use_gt_pose, extrinsics=gt_extrinsics)
 
             if "gaussian" in self.output_mode:
                 pts3ds_self = res["pts3d_in_self_view"]
@@ -994,15 +1033,24 @@ class ARCroco3DStereo(CroCoNet):
                 intrinsics[:, 0, 2] = pp[:, 0]
                 intrinsics[:, 1, 2] = pp[:, 1]
 
+
                 with tf32_off(), torch.amp.autocast("cuda", enabled=False):
                     gaussian_from_self_view = res["gaussian_from_self_view"]
                     gaussian_in_other_view = res["gaussian_in_other_view"]
-                    rendered_output = self.gaussian_decoder.forward(
-                        [gaussian_from_self_view, gaussian_in_other_view],
-                        extrinsics=[res["camera_pose"], res["camera_pose"]],
-                        intrinsics=[intrinsics, intrinsics],
-                        image_shape=[shape[i], shape[i]],
-                    )
+                    if not self.config.use_gt_pose: 
+                        rendered_output = self.gaussian_decoder.forward(
+                            [gaussian_from_self_view, gaussian_in_other_view],
+                            extrinsics=[res["camera_pose"], res["camera_pose"]],
+                            intrinsics=[intrinsics, intrinsics],
+                            image_shape=[shape[i], shape[i]],
+                        )
+                    else:
+                        rendered_output = self.gaussian_decoder.forward(
+                            [gaussian_from_self_view, gaussian_in_other_view],
+                            extrinsics=[gt_extrinsics, gt_extrinsics],
+                            intrinsics=[gt_intrinsics, gt_intrinsics],
+                            image_shape=[shape[i], shape[i]],
+                        )
                 rendered_self, rendered_other = rendered_output.color.chunk(2, dim=0)
                 res["render_from_self_view"] = rendered_self
                 res["render_in_other_view"] = rendered_other

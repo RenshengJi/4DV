@@ -28,7 +28,8 @@ class GaussianAdapterCfg:
     gaussian_scale_min: float = 1e-6
     gaussian_scale_max: float = 0.3
     only_rest: bool = False
-    scale_factor: float = 0.01
+    scale_factor_alpha: float = 0.01
+    scale_factor_beta: float = 0.0
     scale_activation: str = "softplus"
     predict_offset: bool = False
     predict_velocity: bool = False
@@ -169,7 +170,7 @@ class UnifiedGaussianAdapter(GaussianAdapter):
         elif self.cfg.scale_activation == "sigmoid":
             scales = self.cfg.gaussian_scale_min + (self.cfg.gaussian_scale_max - self.cfg.gaussian_scale_min) * scales.sigmoid()
         elif self.cfg.scale_activation == "exp":
-            scales = self.cfg.scale_factor * torch.exp(scales)
+            scales = self.cfg.scale_factor_alpha * torch.exp(scales - self.cfg.scale_factor_beta)
             scales = scales.clamp_max(self.cfg.gaussian_scale_max)
         else:
             raise ValueError(f"Unknown scale activation: {self.cfg.scale_activation}")
@@ -190,8 +191,7 @@ class UnifiedGaussianAdapter(GaussianAdapter):
         else:
             sh = torch.cat(
                 (
-                    RGB2SH(sh[..., 0:1].sigmoid()),
-                    sh[..., 1:],
+                    RGB2SH(sh.sigmoid()),
                 ),
                 dim=-1,
             )

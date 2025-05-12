@@ -1,21 +1,3 @@
-#!/usr/bin/env python3
-"""
-3D Point Cloud Inference and Visualization Script
-
-This script performs inference using the ARCroco3DStereo model and visualizes the
-resulting 3D point clouds with the PointCloudViewer. Use the command-line arguments
-to adjust parameters such as the model checkpoint path, image sequence directory,
-image size, device, etc.
-
-Usage:
-    python demo.py [--model_path MODEL_PATH] [--seq_path SEQ_PATH] [--size IMG_SIZE]
-                            [--device DEVICE] [--output_dir OUT_DIR]
-
-Example:
-    python demo.py --model_path src/cut3r_512_dpt_4_64.pth \
-        --seq_path examples/001 --device cuda --size 512
-"""
-
 import os
 import sys
 import numpy as np
@@ -35,10 +17,6 @@ import json
 
 # Set random seed for reproducibility.
 random.seed(42)
-# import debugpy
-# debugpy.listen(("localhost", 5679))
-# print("Waiting for debugger to attach...")
-# debugpy.wait_for_client()
 
 def parse_args():
     """Parse command-line arguments."""
@@ -47,15 +25,9 @@ def parse_args():
     )
     parser.add_argument(
         "--model_path",
-        type=str,
-        default="src/cut3r_512_dpt_4_64.pth",
+        type=str, 
+        default="/data/yuxue.yang/fl/zq/4DVideo/src/checkpoint-epoch_0_11934.pth",
         help="Path to the pretrained model checkpoint.",
-    )
-    parser.add_argument(
-        "--seq_path",
-        type=str,
-        default="",
-        help="Path to the directory containing the image sequence.",
     )
     parser.add_argument(
         "--device",
@@ -81,218 +53,9 @@ def parse_args():
         default=1,
         help="Number of times to revisit each view during inference.",
     )
+    
 
     return parser.parse_args()
-
-
-def prepare_input(
-    img_paths, img_mask, size, raymaps=None, raymap_mask=None, revisit=1, update=True
-):
-    """
-    Prepare input views for inference from a list of image paths.
-
-    Args:
-        img_paths (list): List of image file paths.
-        img_mask (list of bool): Flags indicating valid images.
-        size (int): Target image size.
-        raymaps (list, optional): List of ray maps.
-        raymap_mask (list, optional): Flags indicating valid ray maps.
-        revisit (int): How many times to revisit each view.
-        update (bool): Whether to update the state on revisits.
-
-    Returns:
-        list: A list of view dictionaries.
-    """
-    # Import image loader (delayed import needed after adding ckpt path).
-    from src.dust3r.utils.image import load_images
-
-    images = load_images(img_paths, size=size)
-    views = []
-
-    if raymaps is None and raymap_mask is None:
-        # Only images are provided.
-        for i in range(len(images)):
-            view = {
-                "img": images[i]["img"],
-                "ray_map": torch.full(
-                    (
-                        images[i]["img"].shape[0],
-                        6,
-                        images[i]["img"].shape[-2],
-                        images[i]["img"].shape[-1],
-                    ),
-                    torch.nan,
-                ),
-                "true_shape": torch.from_numpy(images[i]["true_shape"]),
-                "idx": i,
-                "instance": str(i),
-                "camera_pose": torch.from_numpy(np.eye(4, dtype=np.float32)).unsqueeze(
-                    0
-                ),
-                "img_mask": torch.tensor(True).unsqueeze(0),
-                "ray_mask": torch.tensor(False).unsqueeze(0),
-                "update": torch.tensor(True).unsqueeze(0),
-                "reset": torch.tensor(False).unsqueeze(0),
-            }
-            views.append(view)
-    else:
-        # Combine images and raymaps.
-        num_views = len(images) + len(raymaps)
-        assert len(img_mask) == len(raymap_mask) == num_views
-        assert sum(img_mask) == len(images) and sum(raymap_mask) == len(raymaps)
-
-        j = 0
-        k = 0
-        for i in range(num_views):
-            view = {
-                "img": (
-                    images[j]["img"]
-                    if img_mask[i]
-                    else torch.full_like(images[0]["img"], torch.nan)
-                ),
-                "ray_map": (
-                    raymaps[k]
-                    if raymap_mask[i]
-                    else torch.full_like(raymaps[0], torch.nan)
-                ),
-                "true_shape": (
-                    torch.from_numpy(images[j]["true_shape"])
-                    if img_mask[i]
-                    else torch.from_numpy(np.int32([raymaps[k].shape[1:-1][::-1]]))
-                ),
-                "idx": i,
-                "instance": str(i),
-                "camera_pose": torch.from_numpy(np.eye(4, dtype=np.float32)).unsqueeze(
-                    0
-                ),
-                "img_mask": torch.tensor(img_mask[i]).unsqueeze(0),
-                "ray_mask": torch.tensor(raymap_mask[i]).unsqueeze(0),
-                "update": torch.tensor(img_mask[i]).unsqueeze(0),
-                "reset": torch.tensor(False).unsqueeze(0),
-            }
-            if img_mask[i]:
-                j += 1
-            if raymap_mask[i]:
-                k += 1
-            views.append(view)
-        assert j == len(images) and k == len(raymaps)
-
-    if revisit > 1:
-        new_views = []
-        for r in range(revisit):
-            for i, view in enumerate(views):
-                new_view = deepcopy(view)
-                new_view["idx"] = r * len(views) + i
-                new_view["instance"] = str(r * len(views) + i)
-                if r > 0 and not update:
-                    new_view["update"] = torch.tensor(False).unsqueeze(0)
-                new_views.append(new_view)
-        return new_views
-
-    return views
-
-
-def prepare_output(outputs, outdir, revisit=1, use_pose=True):
-    """
-    Process inference outputs to generate point clouds and camera parameters for visualization.
-
-    Args:
-        outputs (dict): Inference outputs.
-        revisit (int): Number of revisits per view.
-        use_pose (bool): Whether to transform points using camera pose.
-
-    Returns:
-        tuple: (points, colors, confidence, camera parameters dictionary)
-    """
-    from src.dust3r.utils.camera import pose_encoding_to_camera
-    from src.dust3r.post_process import estimate_focal_knowing_depth
-    from src.dust3r.utils.geometry import geotrf
-
-    # Only keep the outputs corresponding to one full pass.
-    valid_length = len(outputs["pred"]) // revisit
-    outputs["pred"] = outputs["pred"][-valid_length:]
-    outputs["views"] = outputs["views"][-valid_length:]
-
-    pts3ds_self_ls = [output["pts3d_in_self_view"].cpu() for output in outputs["pred"]]
-    pts3ds_other = [output["pts3d_in_other_view"].cpu() for output in outputs["pred"]]
-    conf_self = [output["conf_self"].cpu() for output in outputs["pred"]]
-    conf_other = [output["conf"].cpu() for output in outputs["pred"]]
-    pts3ds_self = torch.cat(pts3ds_self_ls, 0)
-
-    # Recover camera poses.
-    pr_poses = [
-        pose_encoding_to_camera(pred["camera_pose"].clone()).cpu()
-        for pred in outputs["pred"]
-    ]
-    R_c2w = torch.cat([pr_pose[:, :3, :3] for pr_pose in pr_poses], 0)
-    t_c2w = torch.cat([pr_pose[:, :3, 3] for pr_pose in pr_poses], 0)
-
-    if use_pose:
-        transformed_pts3ds_other = []
-        for pose, pself in zip(pr_poses, pts3ds_self):
-            transformed_pts3ds_other.append(geotrf(pose, pself.unsqueeze(0)))
-        pts3ds_other = transformed_pts3ds_other
-        conf_other = conf_self
-
-    # Estimate focal length based on depth.
-    B, H, W, _ = pts3ds_self.shape
-    pp = torch.tensor([W // 2, H // 2], device=pts3ds_self.device).float().repeat(B, 1)
-    focal = estimate_focal_knowing_depth(pts3ds_self, pp, focal_mode="weiszfeld")
-
-    colors = [
-        0.5 * (output["img"].permute(0, 2, 3, 1) + 1.0) for output in outputs["views"]
-    ]
-
-    cam_dict = {
-        "focal": focal.cpu().numpy(),
-        "pp": pp.cpu().numpy(),
-        "R": R_c2w.cpu().numpy(),
-        "t": t_c2w.cpu().numpy(),
-    }
-
-    pts3ds_self_tosave = pts3ds_self  # B, H, W, 3
-    depths_tosave = pts3ds_self_tosave[..., 2]
-    pts3ds_other_tosave = torch.cat(pts3ds_other)  # B, H, W, 3
-    conf_self_tosave = torch.cat(conf_self)  # B, H, W
-    conf_other_tosave = torch.cat(conf_other)  # B, H, W
-    colors_tosave = torch.cat(
-        [
-            0.5 * (output["img"].permute(0, 2, 3, 1).cpu() + 1.0)
-            for output in outputs["views"]
-        ]
-    )  # [B, H, W, 3]
-    cam2world_tosave = torch.cat(pr_poses)  # B, 4, 4
-    intrinsics_tosave = (
-        torch.eye(3).unsqueeze(0).repeat(cam2world_tosave.shape[0], 1, 1)
-    )  # B, 3, 3
-    intrinsics_tosave[:, 0, 0] = focal.detach().cpu()
-    intrinsics_tosave[:, 1, 1] = focal.detach().cpu()
-    intrinsics_tosave[:, 0, 2] = pp[:, 0]
-    intrinsics_tosave[:, 1, 2] = pp[:, 1]
-
-    os.makedirs(os.path.join(outdir, "depth"), exist_ok=True)
-    os.makedirs(os.path.join(outdir, "conf"), exist_ok=True)
-    os.makedirs(os.path.join(outdir, "color"), exist_ok=True)
-    os.makedirs(os.path.join(outdir, "camera"), exist_ok=True)
-    for f_id in range(len(pts3ds_self)):
-        depth = depths_tosave[f_id].cpu().numpy()
-        conf = conf_self_tosave[f_id].cpu().numpy()
-        color = colors_tosave[f_id].cpu().numpy()
-        c2w = cam2world_tosave[f_id].cpu().numpy()
-        intrins = intrinsics_tosave[f_id].cpu().numpy()
-        np.save(os.path.join(outdir, "depth", f"{f_id:06d}.npy"), depth)
-        np.save(os.path.join(outdir, "conf", f"{f_id:06d}.npy"), conf)
-        iio.imwrite(
-            os.path.join(outdir, "color", f"{f_id:06d}.png"),
-            (color * 255).astype(np.uint8),
-        )
-        np.savez(
-            os.path.join(outdir, "camera", f"{f_id:06d}.npz"),
-            pose=c2w,
-            intrinsics=intrins,
-        )
-
-    return pts3ds_other, colors, conf_other, cam_dict
 
 
 def parse_seq_path(p):
@@ -341,36 +104,22 @@ def run_inference(args):
         device = "cpu"
 
     # Add the checkpoint path (required for model imports in the dust3r package).
-    # 当前文件夹
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
     # Import model and inference functions after adding the ckpt path.
     from src.dust3r.inference import inference, inference_recurrent
     from src.dust3r.model import ARCroco3DStereo
-    from src.dust3r.utils.ply_export import export_ply
     from src.dust3r.utils.metrics import compute_lpips, compute_psnr, compute_ssim
     from viser_utils import PointCloudViewer
 
-    # Prepare image file paths.
-    img_paths, tmpdirname = parse_seq_path(args.seq_path)
-    if not img_paths:
-        print(f"No images found in {args.seq_path}. Please verify the path.")
-        return
-
-    print(f"Found {len(img_paths)} images in {args.seq_path}.")
-    img_mask = [True] * len(img_paths)
-
+    from src.dust3r.datasets.waymo import Waymo_Multi
+    dataset = Waymo_Multi(allow_repeat=True, split=None, ROOT="../data/dust3r_data/processed_waymo/", img_ray_mask_p=[1.0, 0.0, 0.0], aug_crop=16, resolution=[(512, 384), (512, 336), (512, 288), (512, 256), (512, 208), (512, 144), (384, 512), (336, 512), (288, 512), (256, 512)], num_views=64, n_corres=0)
     # Prepare input views.
     print("Preparing input views...")
-    views = prepare_input(
-        img_paths=img_paths,
-        img_mask=img_mask,
-        size=args.size,
-        revisit=args.revisit,
-        update=True,
-    )
-    if tmpdirname is not None:
-        shutil.rmtree(tmpdirname)
+    idx = 1
+    num_views = 64
+    views = dataset.__getitem__((idx, 2, num_views))
+    
 
     # Load and prepare the model.
     print(f"Loading model from {args.model_path}...")
@@ -389,43 +138,30 @@ def run_inference(args):
 
     # Process outputs for visualization.
     print("Preparing output for visualization...")
-    # pts3ds_other, colors, conf, cam_dict = prepare_output(
-    #     outputs, args.output_dir, 1, True
-    # )
 
-    # # Convert tensors to numpy arrays for visualization.
-    # pts3ds_to_vis = [p.cpu().numpy() for p in pts3ds_other]
-    # colors_to_vis = [c.cpu().numpy() for c in colors]
-    # edge_colors = [None] * len(pts3ds_to_vis)
-    # get the relative path
+   
     relative_path = os.path.relpath(args.model_path, "src/checkpoints")
     output_path = os.path.join(args.output_dir, relative_path.replace(".pth", ""))
     os.makedirs(output_path, exist_ok=True)
     metrics = []
+    # Prepare lists to store frames for each type of view
+    self_view_frames = []
+    other_view_frames = []
+    gt_frames = []
+
     for i in range(len(outputs["pred"])):
-        # export_ply(
-        #     outputs["pred"][i]["gaussian_in_other_view"].means[0],
-        #     outputs["pred"][i]["gaussian_in_other_view"].scales[0],
-        #     outputs["pred"][i]["gaussian_in_other_view"].rotations[0],
-        #     outputs["pred"][i]["gaussian_in_other_view"].harmonics[0],
-        #     outputs["pred"][i]["gaussian_in_other_view"].opacities[0],
-        #     os.path.join(args.output_dir, "ply", f"{i:06d}.ply"),
-        # )
-        save_image(
-            outputs["pred"][i]["render_from_self_view"],
-            os.path.join(output_path, f"self_view_{i:06d}.png"),
+        # Convert tensors to numpy arrays and append to respective lists
+        self_view_frames.append(
+            (outputs["pred"][i]["render_from_self_view"][0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
         )
-        save_image(
-            outputs["pred"][i]["render_in_other_view"],
-            os.path.join(output_path, f"other_view_{i:06d}.png"),
+        other_view_frames.append(
+            (outputs["pred"][i]["render_in_other_view"][0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
         )
-        save_image(
-            outputs['views'][i]['img'] * 0.5 + 0.5,
-            os.path.join(output_path, f"gt_{i:06d}.png"),
+        gt_frames.append(
+            ((outputs['views'][i]['img'][0].permute(1, 2, 0).cpu().numpy() * 0.5 + 0.5) * 255).astype(np.uint8)
         )
         metrics.append(
             {
-                "image_path": img_paths[i],
                 "psnr": compute_psnr(
                     outputs['views'][i]['img'] * 0.5 + 0.5,
                     outputs["pred"][i]["render_in_other_view"],
@@ -440,7 +176,26 @@ def run_inference(args):
                 ).item(),
             }
         )
-        # print("Exported PLY file:", os.path.join(args.output_dir, "ply", f"{i:06d}.ply"))
+
+    # Define video output paths
+    self_view_video_path = os.path.join(output_path, "self_view.mp4")
+    other_view_video_path = os.path.join(output_path, "other_view.mp4")
+    gt_video_path = os.path.join(output_path, "gt.mp4")
+
+    # Save frames as videos
+    def save_video(frames, video_path, fps=30):
+        height, width, _ = frames[0].shape
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        out = cv2.VideoWriter(video_path, fourcc, fps, (width, height))
+        for frame in frames:
+            out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        out.release()
+
+    save_video(self_view_frames, self_view_video_path)
+    save_video(other_view_frames, other_view_video_path)
+    save_video(gt_frames, gt_video_path)
+        
+
     summary = {
         "average_psnr": np.mean([m["psnr"] for m in metrics]),
         "average_ssim": np.mean([m["ssim"] for m in metrics]),
@@ -453,13 +208,7 @@ def run_inference(args):
 
 def main():
     args = parse_args()
-    if not args.seq_path:
-        print(
-            "No inputs found! Please use our gradio demo if you would like to iteractively upload inputs."
-        )
-        return
-    else:
-        run_inference(args)
+    run_inference(args)
 
 
 if __name__ == "__main__":

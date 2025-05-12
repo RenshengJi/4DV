@@ -1,21 +1,3 @@
-#!/usr/bin/env python3
-"""
-3D Point Cloud Inference and Visualization Script
-
-This script performs inference using the ARCroco3DStereo model and visualizes the
-resulting 3D point clouds with the PointCloudViewer. Use the command-line arguments
-to adjust parameters such as the model checkpoint path, image sequence directory,
-image size, device, etc.
-
-Usage:
-    python demo.py [--model_path MODEL_PATH] [--seq_path SEQ_PATH] [--size IMG_SIZE]
-                            [--device DEVICE] [--vis_threshold VIS_THRESHOLD] [--output_dir OUT_DIR]
-
-Example:
-    python demo.py --model_path src/cut3r_512_dpt_4_64.pth \
-        --seq_path examples/001 --device cuda --size 512
-"""
-
 import os
 import numpy as np
 import torch
@@ -42,14 +24,8 @@ def parse_args():
     parser.add_argument(
         "--model_path",
         type=str,
-        default="src/cut3r_512_dpt_4_64.pth",
+        default="/data/yuxue.yang/fl/zq/4DVideo/src/checkpoint-epoch_0_11934.pth",
         help="Path to the pretrained model checkpoint.",
-    )
-    parser.add_argument(
-        "--seq_path",
-        type=str,
-        default="",
-        help="Path to the directory containing the image sequence.",
     )
     parser.add_argument(
         "--device",
@@ -79,113 +55,6 @@ def parse_args():
     return parser.parse_args()
 
 
-def prepare_input(
-    img_paths, img_mask, size, raymaps=None, raymap_mask=None, revisit=1, update=True
-):
-    """
-    Prepare input views for inference from a list of image paths.
-
-    Args:
-        img_paths (list): List of image file paths.
-        img_mask (list of bool): Flags indicating valid images.
-        size (int): Target image size.
-        raymaps (list, optional): List of ray maps.
-        raymap_mask (list, optional): Flags indicating valid ray maps.
-        revisit (int): How many times to revisit each view.
-        update (bool): Whether to update the state on revisits.
-
-    Returns:
-        list: A list of view dictionaries.
-    """
-    # Import image loader (delayed import needed after adding ckpt path).
-    from src.dust3r.utils.image import load_images
-
-    images = load_images(img_paths, size=size)
-    views = []
-
-    if raymaps is None and raymap_mask is None:
-        # Only images are provided.
-        for i in range(len(images)):
-            view = {
-                "img": images[i]["img"],
-                "ray_map": torch.full(
-                    (
-                        images[i]["img"].shape[0],
-                        6,
-                        images[i]["img"].shape[-2],
-                        images[i]["img"].shape[-1],
-                    ),
-                    torch.nan,
-                ),
-                "true_shape": torch.from_numpy(images[i]["true_shape"]),
-                "idx": i,
-                "instance": str(i),
-                "camera_pose": torch.from_numpy(np.eye(4, dtype=np.float32)).unsqueeze(
-                    0
-                ),
-                "img_mask": torch.tensor(True).unsqueeze(0),
-                "ray_mask": torch.tensor(False).unsqueeze(0),
-                "update": torch.tensor(True).unsqueeze(0),
-                "reset": torch.tensor(False).unsqueeze(0),
-            }
-            views.append(view)
-    else:
-        # Combine images and raymaps.
-        num_views = len(images) + len(raymaps)
-        assert len(img_mask) == len(raymap_mask) == num_views
-        assert sum(img_mask) == len(images) and sum(raymap_mask) == len(raymaps)
-
-        j = 0
-        k = 0
-        for i in range(num_views):
-            view = {
-                "img": (
-                    images[j]["img"]
-                    if img_mask[i]
-                    else torch.full_like(images[0]["img"], torch.nan)
-                ),
-                "ray_map": (
-                    raymaps[k]
-                    if raymap_mask[i]
-                    else torch.full_like(raymaps[0], torch.nan)
-                ),
-                "true_shape": (
-                    torch.from_numpy(images[j]["true_shape"])
-                    if img_mask[i]
-                    else torch.from_numpy(np.int32([raymaps[k].shape[1:-1][::-1]]))
-                ),
-                "idx": i,
-                "instance": str(i),
-                "camera_pose": torch.from_numpy(np.eye(4, dtype=np.float32)).unsqueeze(
-                    0
-                ),
-                "img_mask": torch.tensor(img_mask[i]).unsqueeze(0),
-                "ray_mask": torch.tensor(raymap_mask[i]).unsqueeze(0),
-                "update": torch.tensor(img_mask[i]).unsqueeze(0),
-                "reset": torch.tensor(False).unsqueeze(0),
-            }
-            if img_mask[i]:
-                j += 1
-            if raymap_mask[i]:
-                k += 1
-            views.append(view)
-        assert j == len(images) and k == len(raymaps)
-
-    if revisit > 1:
-        new_views = []
-        for r in range(revisit):
-            for i, view in enumerate(views):
-                new_view = deepcopy(view)
-                new_view["idx"] = r * len(views) + i
-                new_view["instance"] = str(r * len(views) + i)
-                if r > 0 and not update:
-                    new_view["update"] = torch.tensor(False).unsqueeze(0)
-                new_views.append(new_view)
-        return new_views
-
-    return views
-
-
 def prepare_output(outputs, outdir, revisit=1, use_pose=True):
     """
     Process inference outputs to generate point clouds and camera parameters for visualization.
@@ -208,6 +77,7 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True):
     outputs["views"] = outputs["views"][-valid_length:]
 
     pts3ds_self_ls = [output["pts3d_in_self_view"].cpu() for output in outputs["pred"]]
+
     pts3ds_other = [output["pts3d_in_other_view"].cpu() for output in outputs["pred"]]
     conf_self = [output["conf_self"].cpu() for output in outputs["pred"]]
     conf_other = [output["conf"].cpu() for output in outputs["pred"]]
@@ -342,26 +212,14 @@ def run_inference(args):
     from src.dust3r.model import ARCroco3DStereo
     from viser_utils import PointCloudViewer
 
-    # Prepare image file paths.
-    img_paths, tmpdirname = parse_seq_path(args.seq_path)
-    if not img_paths:
-        print(f"No images found in {args.seq_path}. Please verify the path.")
-        return
 
-    print(f"Found {len(img_paths)} images in {args.seq_path}.")
-    img_mask = [True] * len(img_paths)
-
+    from src.dust3r.datasets.waymo import Waymo_Multi
+    dataset = Waymo_Multi(allow_repeat=True, split=None, ROOT="../data/dust3r_data/processed_waymo/", img_ray_mask_p=[1.0, 0.0, 0.0], aug_crop=16, resolution=[(512, 384), (512, 336), (512, 288), (512, 256), (512, 208), (512, 144), (384, 512), (336, 512), (288, 512), (256, 512)], num_views=64, n_corres=0)
     # Prepare input views.
     print("Preparing input views...")
-    views = prepare_input(
-        img_paths=img_paths,
-        img_mask=img_mask,
-        size=args.size,
-        revisit=1,
-        update=True,
-    )
-    if tmpdirname is not None:
-        shutil.rmtree(tmpdirname)
+    idx = 1
+    num_views = 64
+    views = dataset.__getitem__((idx, 2, num_views))
 
     # Load and prepare the model.
     print(f"Loading model from {args.model_path}...")
@@ -409,13 +267,7 @@ def run_inference(args):
 
 def main():
     args = parse_args()
-    if not args.seq_path:
-        print(
-            "No inputs found! Please use our gradio demo if you would like to iteractively upload inputs."
-        )
-        return
-    else:
-        run_inference(args)
+    run_inference(args)
 
 
 if __name__ == "__main__":

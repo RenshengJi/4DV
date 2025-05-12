@@ -55,6 +55,9 @@ def pose_encoding_to_camera(
         pose_encoding_type: The type of pose encoding,
     """
 
+    if pose_encoding.shape[-1] == 4:
+        return pose_encoding
+
     if pose_encoding_type == "absT_quaR":
 
         abs_T = pose_encoding[:, :3]

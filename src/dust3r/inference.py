@@ -216,10 +216,15 @@ def loss_of_one_batch_tbptt(
     return result[ret] if ret else result
 
 
+import numpy as np
+
 @torch.no_grad()
 def inference(groups, model, device, verbose=True):
     ignore_keys = set(
-        ["depthmap", "dataset", "label", "instance", "idx", "true_shape", "rng"]
+        ["depthmap", "dataset", "label", "instance", "idx", "rng"]
+    )
+    unsqueeze_keys = set(
+        ["img", "ray_map", "camera_pose", "img_mask", "ray_mask", "update", "reset"]
     )
     for view in groups:
         for name in view.keys():  # pseudo_focal
@@ -228,7 +233,14 @@ def inference(groups, model, device, verbose=True):
             if isinstance(view[name], tuple) or isinstance(view[name], list):
                 view[name] = [x.to(device, non_blocking=True) for x in view[name]]
             else:
+                if isinstance(view[name], np.ndarray):
+                    view[name] = torch.from_numpy(view[name])
+                if isinstance(view[name], bool):
+                    view[name] = torch.tensor(view[name], dtype=torch.bool)
                 view[name] = view[name].to(device, non_blocking=True)
+            if name in unsqueeze_keys:
+                view[name] = view[name].unsqueeze(0)
+            
 
     if verbose:
         print(f">> Inference with model on {len(groups)} image/raymaps")

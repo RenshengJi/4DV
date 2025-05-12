@@ -4,11 +4,12 @@ model: "ARCroco3DStereo(
     img_size=(512, 512), head_type='dpt', output_mode='gaussian', depth_mode=('exp', -inf, inf),
     conf_mode=('exp', 1, inf), pose_mode=('exp', -inf, inf), enc_embed_dim=1024, enc_depth=24, enc_num_heads=16,
     dec_embed_dim=768, dec_depth=12, dec_num_heads=12, landscape_only=False,
-    gaussian_adapter_cfg=GaussianAdapterCfg(gaussian_scale_max=0.3, sh_degree=3, scale_activation='exp', scale_factor=0.05, predict_offset=True, only_rest=True),
+    gaussian_adapter_cfg=GaussianAdapterCfg(gaussian_scale_max=0.3, sh_degree=3, scale_activation='exp', scale_factor_alpha=0.05, only_rest=False, predict_offset=True),
     gaussian_decoder_cfg=DecoderSplattingCUDACfg(name='splatting_cuda', background_color=[0.0, 0.0, 0.0], make_scale_invariant=False, near=0.01, far=100.0),
+    use_gt_pose=True,
   )
   )"
-pretrained: cut3r_512_dpt_4_64.pth
+pretrained: checkpoint-epoch_0_11934.pth
 load_only_encoder: False
 long_context: True
 fixed_length: False
@@ -19,7 +20,7 @@ num_test_views : 16
 n_corres_train: 0
 n_corres_test: 0
 
-train_criterion: RenderLoss(MSE, shape="BHWC") + RGBLoss(MSE)
+train_criterion: RenderLoss(MSE, shape="BHWC") + 0.1 * RenderLoss(LPIPS, shape="BCHW")
 test_criterion: RenderLoss(MSE, shape="BHWC")
 
 resolution: [(512, 384), (512, 336), (512, 288), (512, 256), (512, 208), (512, 144), (384, 512), (336, 512), (288, 512), (256, 512)]
@@ -35,9 +36,9 @@ gradient_checkpointing: True
 epochs: 10
 start_epoch: 0
 weight_decay: 0.05
-lr: 1e-6
-min_lr: 1e-7
-warmup_epochs: 0.5
+lr: 1e-5
+min_lr: 1e-6
+warmup_epochs: 0.005
 amp: 1
 
 num_workers: 4
@@ -56,7 +57,7 @@ print_freq: 10
 print_img_freq: 50000000
 num_imgs_vis: 4
 save_dir: 'checkpoints/waymo'
-exp_name: 'exp_0.05_0.3_w_offset_rest'
+exp_name: 'exp_0.05_0.3_w_offset_gt'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/

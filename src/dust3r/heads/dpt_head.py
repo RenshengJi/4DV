@@ -354,7 +354,10 @@ class DPTGSPose(DPTPts3dPose):
                 use_reentrant=False,
             )
             self_gs_out = postprocess_gaussian(self_gs_out, self.depth_mode, predict_offset=self.gaussian_adapter.predict_offset)
-            camera_pose = pose_encoding_to_camera(pose)
+            if kwargs.get("use_gt_pose") == True:
+                camera_pose = kwargs.get("extrinsics")
+            else:
+                camera_pose = pose_encoding_to_camera(pose)
             pts3d_in_other_view = (
                 torch.einsum("bij, bhwj -> bhwi", camera_pose[:, :3, :3], final_output["pts3d_in_self_view"])
                 + camera_pose[:, None, None, :3, 3]

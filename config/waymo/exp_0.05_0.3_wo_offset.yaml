@@ -37,7 +37,7 @@ start_epoch: 0
 weight_decay: 0.05
 lr: 1e-6
 min_lr: 1e-7
-warmup_epochs: 0.5
+warmup_epochs: 0.05
 amp: 1
 
 num_workers: 4

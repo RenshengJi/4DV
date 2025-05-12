@@ -130,6 +130,9 @@ def render_cuda(
         all_images.append(image)
         all_radii.append(radii)
         all_depths.append(depth.squeeze(0))
+
+
+
     return torch.stack(all_images), torch.stack(all_depths)
 
 
