@@ -18,6 +18,7 @@ import json
 # Set random seed for reproducibility.
 random.seed(42)
 
+
 def parse_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
