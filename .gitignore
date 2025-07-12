@@ -52,6 +52,7 @@ docs/_build/
 
 # Ignore data and ckpts
 *.pth
+*.pt
 data
 src/checkpoints
 /tmp
@@ -59,3 +60,4 @@ src/checkpoints
 /config/debug
 debug_*.png
 demo_tmp/
+results/

@@ -22,6 +22,9 @@ import PIL.Image
 import numpy as np
 
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
+import sys
+# 添加vggt路径
+sys.path.append(os.path.join(os.path.dirname(__file__), '../src/'))
 import cv2
 
 import tensorflow.compat.v1 as tf
@@ -33,7 +36,7 @@ from src.dust3r.utils.geometry import geotrf, inv
 from src.dust3r.utils.image import imread_cv2
 from src.dust3r.utils.parallel import parallel_processes as parallel_map
 from datasets_preprocess.utils import cropping
-from src.dust3r.viz import show_raw_pointcloud
+# from src.dust3r.viz import show_raw_pointcloud
 
 
 def get_parser():
@@ -41,9 +44,10 @@ def get_parser():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--waymo_dir", required=True)
-    parser.add_argument("--precomputed_pairs", required=True)
-    parser.add_argument("--output_dir", default="data/waymo_processed")
-    parser.add_argument("--workers", type=int, default=1)
+    # parser.add_argument("--precomputed_pairs", required=True)
+    parser.add_argument("--precomputed_pairs")
+    parser.add_argument("--output_dir", default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/val")
+    parser.add_argument("--workers", type=int, default=100)
     return parser
 
 
@@ -51,18 +55,18 @@ def main(waymo_root, pairs_path, output_dir, workers=1):
     extract_frames(waymo_root, output_dir, workers=workers)
     make_crops(output_dir, workers=args.workers)
 
-    # make sure all pairs are there
-    with np.load(pairs_path) as data:
-        scenes = data["scenes"]
-        frames = data["frames"]
-        pairs = data["pairs"]  # (array of (scene_id, img1_id, img2_id)
+    # # make sure all pairs are there
+    # with np.load(pairs_path) as data:
+    #     scenes = data["scenes"]
+    #     frames = data["frames"]
+    #     pairs = data["pairs"]  # (array of (scene_id, img1_id, img2_id)
 
-    for scene_id, im1_id, im2_id in pairs:
-        for im_id in (im1_id, im2_id):
-            path = osp.join(output_dir, scenes[scene_id], frames[im_id] + ".jpg")
-            assert osp.isfile(
-                path
-            ), f"Missing a file at {path=}\nDid you download all .tfrecord files?"
+    # for scene_id, im1_id, im2_id in pairs:
+    #     for im_id in (im1_id, im2_id):
+    #         path = osp.join(output_dir, scenes[scene_id], frames[im_id] + ".jpg")
+    #         assert osp.isfile(
+    #             path
+    #         ), f"Missing a file at {path=}\nDid you download all .tfrecord files?"
 
     shutil.rmtree(osp.join(output_dir, "tmp"))
     print("Done! all data generated at", output_dir)
@@ -119,7 +123,7 @@ def extract_frames_one_seq(filename):
 
     for data in tqdm(dataset, leave=False):
         frame = open_dataset.Frame()
-        frame.ParseFromString(bytearray(data.numpy()))
+        frame.ParseFromString((data.numpy()))
 
         content = frame_utils.parse_range_image_and_camera_projection(frame)
         range_images, camera_projections, _, range_image_top_pose = content
@@ -174,10 +178,10 @@ def extract_frames_one_seq(filename):
                 img=rgb, pose=pose, pixels=pix, pts3d=pts3d, timestamp=timestamp
             )
 
-        if not "show full point cloud":
-            show_raw_pointcloud(
-                [v["pts3d"] for v in views.values()], [v["img"] for v in views.values()]
-            )
+        # if not "show full point cloud":
+        #     show_raw_pointcloud(
+        #         [v["pts3d"] for v in views.values()], [v["img"] for v in views.values()]
+        #     )
 
     return calib, frames
 

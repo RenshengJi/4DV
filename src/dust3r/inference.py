@@ -1,7 +1,7 @@
 import tqdm
 import torch
 from dust3r.utils.device import to_cpu, collate_with_cat
-from dust3r.utils.misc import invalid_to_nans
+from dust3r.utils.misc import invalid_to_nans, tf32_off
 from dust3r.utils.geometry import depthmap_to_pts3d, geotrf
 from dust3r.model import ARCroco3DStereo
 from accelerate import Accelerator
@@ -217,14 +217,51 @@ def loss_of_one_batch_tbptt(
 
 
 import numpy as np
+def cut3r_batch_to_vggt(views):
+    # views: List[Dict], 长度为num_views
+    # 目标: [1, S, 3, H, W] (B=1, S=num_views)
+    imgs = [v['img'] for v in views]  # List of [B,3,H,W]
+    imgs = torch.stack(imgs, dim=0)  # [S,B,3,H,W]
+
+    vggt_batch = {
+        'images': imgs * 0.5 + 0.5,  # [S,B,3,H,W], 归一化到[0,1]
+        'depths': torch.stack([v['depthmap'] for v in views], dim=0) if 'depthmap' in views[0] else None,
+        'intrinsics': torch.stack([v['camera_intrinsics'] for v in views], dim=0) if 'camera_intrinsics' in views[0] else None,
+        'extrinsics': torch.stack([v['camera_pose'] for v in views], dim=0) if 'camera_pose' in views[0] else None,
+        'point_masks': torch.stack([v['valid_mask'] for v in views], dim=0) if 'valid_mask' in views[0] else None,
+        'world_points': torch.stack([v['pts3d'] for v in views], dim=0) if 'pts3d' in views[0] else None,
+    }
+
+    with tf32_off(), torch.amp.autocast("cuda", enabled=False):
+        # 转换world points的坐标系到第一帧相机坐标系
+        B, S, H, W, _ = vggt_batch['world_points'].shape
+        world_points = vggt_batch['world_points'].reshape(B, S, H*W, 3)
+        world_points = torch.matmul(torch.linalg.inv(vggt_batch['extrinsics'][0])[:, :3, :3], world_points.transpose(-1, -2)).transpose(-1, -2) + \
+                                   torch.linalg.inv(vggt_batch['extrinsics'][0])[:, :3, 3:4].transpose(-1, -2)
+        vggt_batch['world_points'] = world_points.reshape(B, S, H, W, 3)
+
+        # 转换extrinsics的坐标系到第一帧相机坐标系
+        vggt_batch['extrinsics'] = torch.matmul(
+                torch.linalg.inv(vggt_batch['extrinsics']),
+                vggt_batch['extrinsics'][0]
+            )
+
+    vggt_batch['images'] = vggt_batch['images'].permute(1, 0, 2, 3, 4).contiguous()
+    vggt_batch['depths'] = vggt_batch['depths'].permute(1, 0, 2, 3).contiguous() if vggt_batch['depths'] is not None else None
+    vggt_batch['intrinsics'] = vggt_batch['intrinsics'].permute(1, 0, 2, 3).contiguous() if vggt_batch['intrinsics'] is not None else None
+    vggt_batch['extrinsics'] = vggt_batch['extrinsics'].permute(1, 0, 2, 3).contiguous() if vggt_batch['extrinsics'] is not None else None
+    vggt_batch['point_masks'] = vggt_batch['point_masks'].permute(1, 0, 2, 3).contiguous() if vggt_batch['point_masks'] is not None else None
+    vggt_batch['world_points'] = vggt_batch['world_points'].permute(1, 0, 2, 3, 4).contiguous() if vggt_batch['world_points'] is not None else None
+
+    return vggt_batch
 
 @torch.no_grad()
 def inference(groups, model, device, verbose=True):
     ignore_keys = set(
-        ["depthmap", "dataset", "label", "instance", "idx", "rng"]
+        ["dataset", "label", "instance", "idx", "rng"]
     )
     unsqueeze_keys = set(
-        ["img", "ray_map", "camera_pose", "img_mask", "ray_mask", "update", "reset"]
+        ["img", "ray_map", "camera_pose", "img_mask", "ray_mask", "update", "reset", "depthmap", "camera_intrinsics", "camera_extrinsics", "valid_mask", "pts3d"]
     )
     for view in groups:
         for name in view.keys():  # pseudo_focal
@@ -245,9 +282,13 @@ def inference(groups, model, device, verbose=True):
     if verbose:
         print(f">> Inference with model on {len(groups)} image/raymaps")
 
-    res, state_args = loss_of_one_batch(groups, model, None, None, inference=True)
-    result = to_cpu(res)
-    return result, state_args
+    vggt_batch = cut3r_batch_to_vggt(groups)
+
+    preds = model(vggt_batch['images'])
+
+    # preds = to_cpu(preds)
+    # vggt_batch = to_cpu(vggt_batch)
+    return preds, vggt_batch
 
 
 @torch.no_grad()

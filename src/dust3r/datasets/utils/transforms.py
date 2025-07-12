@@ -47,7 +47,7 @@ def SeqColorJitter():
     saturation = _check_input(0.5)
     hue = _check_input(0.1, center=0, bound=(-0.5, 0.5), clip_first_on_zero=False)
 
-    fn_idx = torch.randperm(4)
+    fn_idx = torch.randperm(4, generator=torch.Generator().manual_seed(0))
     brightness_factor = (
         None
         if brightness is None

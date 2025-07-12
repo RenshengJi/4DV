@@ -122,9 +122,10 @@ class Waymo_Multi(BaseMultiViewDataset):
             start_id,
             all_image_ids,
             rng,
-            max_interval=max_interval,
-            video_prob=0.9,
-            fix_interval_prob=0.9,
+            max_interval=2,
+            min_interval=1,
+            video_prob=1.0,
+            fix_interval_prob=0.0,
             block_shuffle=16,
         )
         image_idxs = np.array(all_image_ids)[pos]

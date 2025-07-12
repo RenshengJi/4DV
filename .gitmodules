@@ -1,0 +1,3 @@
+[submodule "src/SEA-RAFT"]
+	path = src/SEA-RAFT
+	url = https://github.com/princeton-vl/SEA-RAFT.git

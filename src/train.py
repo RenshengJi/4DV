@@ -15,6 +15,23 @@ import math
 from collections import defaultdict
 from pathlib import Path
 from typing import Sized
+import re
+
+# ===== VGGT相关导入 =====
+import sys
+# 添加vggt路径
+sys.path.append(os.path.join(os.path.dirname(__file__), 'vggt'))
+from vggt.vggt.models.vggt import VGGT
+from vggt.training.loss import camera_loss, depth_loss, point_loss, render_and_loss, flow_loss
+
+import torch
+import torch.backends.cudnn as cudnn
+import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
+import re
+sys.path.append(os.path.join(os.path.dirname(__file__), "SEA-RAFT/core"))
+from raft import RAFT
+from vggt.utils.auxiliary import RAFTCfg, calc_flow
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -36,6 +53,7 @@ from dust3r.inference import loss_of_one_batch, loss_of_one_batch_tbptt  # noqa
 from dust3r.viz import colorize
 from dust3r.utils.render import get_render_results
 from dust3r.gaussians import GaussianAdapterCfg, DecoderSplattingCUDACfg
+from dust3r.utils.misc import tf32_off
 import dust3r.utils.path_to_croco  # noqa: F401
 import croco.utils.misc as misc  # noqa
 from croco.utils.misc import NativeScalerWithGradNormCount as NativeScaler  # noqa
@@ -101,6 +119,8 @@ def save_current_code(outdir):
             "*.idea*",
             "*.zip",
             "*.jpg",
+            "*.pt",
+            "*.pth",
         ),
         dirs_exist_ok=True,
     )
@@ -170,54 +190,59 @@ def train(args):
         for dataset in args.test_dataset.split("+")
     }
 
+
     # model
     printer.info("Loading model: %s", args.model)
-    model: PreTrainedModel = eval(args.model)
+    model = eval(args.model)
+    model.gradient_checkpointing_enable(True)
     printer.info(f"All model parameters: {sum(p.numel() for p in model.parameters())}")
-    printer.info(
-        f"Encoder parameters: {sum(p.numel() for p in model.enc_blocks.parameters())}"
-    )
-    printer.info(
-        f"Decoder parameters: {sum(p.numel() for p in model.dec_blocks.parameters())}"
-    )
-
-    printer.info(f">> Creating train criterion = {args.train_criterion}")
-    train_criterion = eval(args.train_criterion).to(device)
-    printer.info(
-        f">> Creating test criterion = {args.test_criterion or args.train_criterion}"
-    )
-    test_criterion = eval(args.test_criterion or args.criterion).to(device)
 
     model.to(device)
-
-    if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
-    if args.long_context:
-        model.fixed_input_length = False
 
     if args.pretrained and not args.resume:
         printer.info(f"Loading pretrained: {args.pretrained}")
         ckpt = torch.load(args.pretrained, map_location=device)
-        load_only_encoder = getattr(args, "load_only_encoder", False)
-        if load_only_encoder:
-            filtered_state_dict = {
-                k: v
-                for k, v in ckpt["model"].items()
-                if "enc_blocks" in k or "patch_embed" in k
-            }
-            printer.info(
-                model.load_state_dict(strip_module(filtered_state_dict), strict=False)
-            )
-        else:
-            printer.info(
-                model.load_state_dict(strip_module(ckpt["model"]), strict=False)
-            )
-        del ckpt  # in case it occupies memory
+        # ckpt = torch.load(args.pretrained, map_location=device)['model']
+        # ckpt = {k.replace("module.", ""): v for k, v in ckpt.items()}
+        model.load_state_dict(ckpt, strict=False)
+        del ckpt
+        ckpt = torch.load(args.pretrained_init, map_location=device)
+        ckpt = {k.replace("depth_head.", ""): v for k, v in ckpt.items()}
+        model.depth_init_head.load_state_dict(ckpt, strict=False)
+        
+        
+
+
+    auxiliary_model_configs = getattr(args, "auxiliary_models", None)
+    auxiliary_models = dict()
+    if auxiliary_model_configs is not None:
+        for model_name, model_config in auxiliary_model_configs.items():
+            auxiliary_model = eval(model_config)
+            offload_match = re.search(r"offload\s*=\s*(\"True\"|False)\b", model_config, re.IGNORECASE)
+            if offload_match:
+                offload = offload_match.group(1).lower() == "true"
+            else:
+                offload = False
+            if not offload:
+                auxiliary_model.to(device)
+            # capture the model checkpoint path from the config string
+            model_ckpt_match = re.search(r"path\s*=\s*\"([^\"]+)\"", model_config)
+            if model_ckpt_match:
+                model_ckpt = model_ckpt_match.group(1)
+                state_dict = torch.load(model_ckpt, map_location="cpu" if offload else device)
+                missing_keys, unexpected_keys = auxiliary_model.load_state_dict(state_dict, strict=False)
+                printer.info(f"Unexpected key numbers in {model_name}: {len(unexpected_keys)}")
+                printer.info(f"Missing key numbers in {model_name}: {len(missing_keys)}")
+            auxiliary_model.eval()
+            auxiliary_model.requires_grad_(False)
+            auxiliary_models[model_name] = auxiliary_model
+        printer.info(f"successfully load auxiliary model: {model_name}")
+
+
 
     # # following timm: set wd as 0 for bias and norm layers
     param_groups = misc.get_parameter_groups(model, args.weight_decay)
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
-    # print(optimizer)
     loss_scaler = NativeScaler(accelerator=accelerator)
 
     accelerator.even_batches = False
@@ -225,25 +250,6 @@ def train(args):
         optimizer, model, data_loader_train
     )
 
-    def write_log_stats(epoch, train_stats, test_stats):
-        if accelerator.is_main_process:
-            if log_writer is not None:
-                log_writer.flush()
-
-            log_stats = dict(
-                epoch=epoch, **{f"train_{k}": v for k, v in train_stats.items()}
-            )
-            for test_name in data_loader_test:
-                if test_name not in test_stats:
-                    continue
-                log_stats.update(
-                    {test_name + "_" + k: v for k, v in test_stats[test_name].items()}
-                )
-
-            with open(
-                os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8"
-            ) as f:
-                f.write(json.dumps(log_stats) + "\n")
 
     def save_model(epoch, fname, best_so_far):
         misc.save_model(
@@ -268,64 +274,103 @@ def train(args):
 
     printer.info(f"Start training for {args.epochs} epochs")
     start_time = time.time()
-    train_stats = test_stats = {}
 
     for epoch in range(args.start_epoch, args.epochs + 1):
+        if hasattr(data_loader_train, "dataset") and hasattr(data_loader_train.dataset, "set_epoch"):
+            data_loader_train.dataset.set_epoch(epoch)
+        if (
+            hasattr(data_loader_train, "batch_sampler")
+            and hasattr(data_loader_train.batch_sampler, "batch_sampler")
+            and hasattr(data_loader_train.batch_sampler.batch_sampler, "set_epoch")
+        ):
+            data_loader_train.batch_sampler.batch_sampler.set_epoch(epoch)
+        model.train()
+        metric_logger = misc.MetricLogger(delimiter="	")
+        header = f"Epoch: [{epoch}]"
+        optimizer.zero_grad()
+        for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader_train, args.print_freq, accelerator, header)):
+            with accelerator.accumulate(model):
+                epoch_f = epoch + data_iter_step / len(data_loader_train)
+                if data_iter_step % args.accum_iter == 0:
+                    misc.adjust_learning_rate(optimizer, epoch_f, args)
+                vggt_batch = cut3r_batch_to_vggt(batch)
+                preds = model(vggt_batch["images"])
+                loss = 0.0
+                loss_dict = {}
 
-        # Save immediately the last checkpoint
-        if epoch > args.start_epoch:
-            if (
-                args.save_freq
-                and np.allclose(epoch / args.save_freq, int(epoch / args.save_freq))
-                or epoch == args.epochs
-            ):
-                save_model(epoch - 1, "last", best_so_far)
+                interval = 2
 
-        # Test on multiple datasets
-        new_best = False
-        # if epoch > 0 and args.eval_freq > 0 and epoch % args.eval_freq == 0:
-        #     test_stats = {}
-        #     for test_name, testset in data_loader_test.items():
-        #         stats = test_one_epoch(
-        #             model,
-        #             test_criterion,
-        #             testset,
-        #             accelerator,
-        #             device,
-        #             epoch,
-        #             log_writer=log_writer,
-        #             args=args,
-        #             prefix=test_name,
-        #         )
-        #         test_stats[test_name] = stats
+                forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, forward_in_bound_mask, backward_in_bound_mask = calc_flow(
+                    vggt_batch["images"], auxiliary_models["flow"],
+                    check_consistency=True,
+                    geo_thresh=auxiliary_models["flow"].args.geo_thresh,
+                    photo_thresh=auxiliary_models["flow"].args.photo_thresh,
+                    interval=interval,
+                )
 
-        #         # Save best of all
-        #         if stats["loss_med"] < best_so_far:
-        #             best_so_far = stats["loss_med"]
-        #             new_best = True
-        # Save more stuff
-        write_log_stats(epoch, train_stats, test_stats)
+                # camera loss
+                # if vggt_batch.get("extrinsics") is not None and vggt_batch.get("intrinsics") is not None and vggt_batch.get("point masks") is not None:
+                #     cam_loss, __ = camera_loss([preds["pose_enc"]], vggt_batch)
+                #     loss += cam_loss["loss_camera"]
+                #     loss_dict.update(cam_loss)
+                # point loss
+                if vggt_batch.get("world_points") is not None and vggt_batch.get("point_masks") is not None:
+                    point_loss_dict = point_loss(preds["world_points"], preds["world_points_conf"], vggt_batch)
+                    loss += 0.00000001 * point_loss_dict.get("loss_conf", 0.0)
+                    loss_dict.update(point_loss_dict)
+                # depth loss
+                # if vggt_batch.get("depths") is not None and vggt_batch.get("point_masks") is not None:
+                #     depth_loss_dict = depth_loss(preds["depth"], preds["depth_conf"], vggt_batch)
+                #     loss += depth_loss_dict.get("loss_conf_depth", 0.0)
+                #     loss_dict.update(depth_loss_dict)
+                # gaussian loss
+                # if vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
+                #     conf = preds["depth_init_conf"] > 10
+                #     gaussian_loss_dict, _ = render_and_loss(conf, interval, forward_consist_mask, backward_consist_mask, preds["depth"].detach(), preds["gaussian_params"], preds["velocity"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"], vggt_batch["depths"], vggt_batch["point_masks"])
+                #     loss += gaussian_loss_dict.get("loss_render_rgb", 0.0) + 0.1 * gaussian_loss_dict.get("loss_render_lpips", 0.0) + gaussian_loss_dict.get("loss_render_depth", 0.0) + 0.001 * gaussian_loss_dict.get("loss_velocity", 0.0) 
+                #     loss_dict.update(gaussian_loss_dict)
+                # optical flow -> velocity loss
+                if vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
+                    conf = preds["depth_init_conf"] > 2
+                    flow_loss_dict = flow_loss(conf, interval, forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, preds["depth"], preds["velocity"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"])
+                    loss += flow_loss_dict.get("forward_loss", 0.0) # + flow_loss_dict.get("backward_loss", 0.0)
+                    loss_dict.update(flow_loss_dict)
+                loss_value = float(loss)
+                loss_scaler(
+                    loss,
+                    optimizer,
+                    parameters=model.parameters(),
+                    update_grad=True,
+                    clip_grad=1.0,
+                )
+                optimizer.zero_grad()
+                lr = optimizer.param_groups[0]["lr"]
+                metric_logger.update(epoch=epoch)
+                metric_logger.update(lr=lr)
+                metric_logger.update(loss=loss_value, **loss_dict)
+                if log_writer is not None:
+                    step = epoch * len(data_loader_train) + data_iter_step
+                    log_writer.add_scalar("train_loss", loss_value, step)
+                    log_writer.add_scalar("train_lr", lr, step)
+                    for name, val in loss_dict.items():
+                        if isinstance(val, torch.Tensor):
+                            if val.ndim > 0:
+                                continue
+                        if isinstance(val, dict):
+                            continue
+                        log_writer.add_scalar("train_" + name, val, step)
 
-        if epoch > args.start_epoch:
-            if args.keep_freq and epoch % args.keep_freq == 0:
-                save_model(epoch - 1, str(epoch), best_so_far)
-            if new_best:
-                save_model(epoch - 1, "best", best_so_far)
-        if epoch >= args.epochs:
-            break  # exit after writing last test to disk
+                # 按照save_freq保存模型
+                if (
+                    data_iter_step % int(args.save_freq * len(data_loader_train)) == 0
+                    and data_iter_step != 0
+                    and data_iter_step % len(data_loader_train) != 0
+                ):
+                    print("saving at step", data_iter_step)
+                    save_model(epoch - 1, f"epoch_{epoch}_{data_iter_step}", float("inf"))
+                metric_logger.synchronize_between_processes(accelerator)
+                printer.info("Averaged stats: %s", metric_logger)
 
-        # Train
-        train_stats = train_one_epoch(
-            model,
-            train_criterion,
-            data_loader_train,
-            optimizer,
-            accelerator,
-            epoch,
-            loss_scaler,
-            log_writer=log_writer,
-            args=args,
-        )
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -899,6 +944,45 @@ def get_vis_imgs_new(loss_details, num_imgs_vis, num_views, is_metric):
         )
         ret_dict[f"imgs_{i}"] = out
     return ret_dict
+
+
+def cut3r_batch_to_vggt(views):
+    # views: List[Dict], 长度为num_views
+    # 目标: [1, S, 3, H, W] (B=1, S=num_views)
+    imgs = [v['img'] for v in views]  # List of [B,3,H,W]
+    imgs = torch.stack(imgs, dim=0)  # [S,B,3,H,W]
+
+    vggt_batch = {
+        'images': imgs * 0.5 + 0.5,  # [S,B,3,H,W], 归一化到[0,1]
+        'depths': torch.stack([v['depthmap'] for v in views], dim=0) if 'depthmap' in views[0] else None,
+        'intrinsics': torch.stack([v['camera_intrinsics'] for v in views], dim=0) if 'camera_intrinsics' in views[0] else None,
+        'extrinsics': torch.stack([v['camera_pose'] for v in views], dim=0) if 'camera_pose' in views[0] else None,
+        'point_masks': torch.stack([v['valid_mask'] for v in views], dim=0) if 'valid_mask' in views[0] else None,
+        'world_points': torch.stack([v['pts3d'] for v in views], dim=0) if 'pts3d' in views[0] else None,
+    }
+
+    with tf32_off(), torch.amp.autocast("cuda", enabled=False):
+        # 转换world points的坐标系到第一帧相机坐标系
+        B, S, H, W, _ = vggt_batch['world_points'].shape
+        world_points = vggt_batch['world_points'].reshape(B, S, H*W, 3)
+        world_points = torch.matmul(torch.linalg.inv(vggt_batch['extrinsics'][0])[:, :3, :3], world_points.transpose(-1, -2)).transpose(-1, -2) + \
+                                   torch.linalg.inv(vggt_batch['extrinsics'][0])[:, :3, 3:4].transpose(-1, -2)
+        vggt_batch['world_points'] = world_points.reshape(B, S, H, W, 3)
+
+        # 转换extrinsics的坐标系到第一帧相机坐标系
+        vggt_batch['extrinsics'] = torch.matmul(
+                torch.linalg.inv(vggt_batch['extrinsics']),
+                vggt_batch['extrinsics'][0]
+            )
+
+    vggt_batch['images'] = vggt_batch['images'].permute(1, 0, 2, 3, 4).contiguous()
+    vggt_batch['depths'] = vggt_batch['depths'].permute(1, 0, 2, 3).contiguous() if vggt_batch['depths'] is not None else None
+    vggt_batch['intrinsics'] = vggt_batch['intrinsics'].permute(1, 0, 2, 3).contiguous() if vggt_batch['intrinsics'] is not None else None
+    vggt_batch['extrinsics'] = vggt_batch['extrinsics'].permute(1, 0, 2, 3).contiguous() if vggt_batch['extrinsics'] is not None else None
+    vggt_batch['point_masks'] = vggt_batch['point_masks'].permute(1, 0, 2, 3).contiguous() if vggt_batch['point_masks'] is not None else None
+    vggt_batch['world_points'] = vggt_batch['world_points'].permute(1, 0, 2, 3, 4).contiguous() if vggt_batch['world_points'] is not None else None
+
+    return vggt_batch
 
 
 @hydra.main(
