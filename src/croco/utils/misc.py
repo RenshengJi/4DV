@@ -571,7 +571,7 @@ def get_parameter_groups(
 
         parameter_group_vars[group_name]["params"].append(param)
         parameter_group_names[group_name]["params"].append(name)
-    printer.info("Param groups = %s" % json.dumps(parameter_group_names, indent=2))
+    # printer.info("Param groups = %s" % json.dumps(parameter_group_names, indent=2))
     return list(parameter_group_vars.values())
 
 

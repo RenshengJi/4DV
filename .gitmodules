@@ -1,3 +1,6 @@
 [submodule "src/SEA-RAFT"]
 	path = src/SEA-RAFT
 	url = https://github.com/princeton-vl/SEA-RAFT.git
+[submodule "src/sam2"]
+	path = src/sam2
+	url = https://github.com/facebookresearch/sam2.git

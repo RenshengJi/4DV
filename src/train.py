@@ -17,26 +17,32 @@ from pathlib import Path
 from typing import Sized
 import re
 
+import faulthandler
+faulthandler.enable()
+
 # ===== VGGT相关导入 =====
 import sys
 # 添加vggt路径
 sys.path.append(os.path.join(os.path.dirname(__file__), 'vggt'))
 from vggt.vggt.models.vggt import VGGT
 from vggt.training.loss import camera_loss, depth_loss, point_loss, render_and_loss, flow_loss
+from vggt.utils.auxiliary import RAFTCfg, calc_flow
+
+# ===== SAM2相关导入 =====
+# 添加sam2路径
+sys.path.append(os.path.join(os.path.dirname(__file__), 'sam2'))
+# 延迟导入SAM2，避免Hydra冲突
+# from sam2.build_sam import build_sam2
+# from sam2.modeling.sam2_base import SAM2Base
 
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard.writer import SummaryWriter
 import re
 sys.path.append(os.path.join(os.path.dirname(__file__), "SEA-RAFT/core"))
 from raft import RAFT
-from vggt.utils.auxiliary import RAFTCfg, calc_flow
 
-import torch
-import torch.backends.cudnn as cudnn
-import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
 
 torch.backends.cuda.matmul.allow_tf32 = True  # for gpu >= Ampere and pytorch >= 1.12
 
@@ -201,42 +207,94 @@ def train(args):
 
     if args.pretrained and not args.resume:
         printer.info(f"Loading pretrained: {args.pretrained}")
-        ckpt = torch.load(args.pretrained, map_location=device)
-        # ckpt = torch.load(args.pretrained, map_location=device)['model']
-        # ckpt = {k.replace("module.", ""): v for k, v in ckpt.items()}
+        # ckpt = torch.load(args.pretrained, map_location=device, weights_only=True)
+        ckpt = torch.load(args.pretrained, map_location=device)['model']
+        ckpt = {k.replace("module.", ""): v for k, v in ckpt.items()}
         model.load_state_dict(ckpt, strict=False)
         del ckpt
-        ckpt = torch.load(args.pretrained_init, map_location=device)
+        ckpt = torch.load(args.pretrained_init, map_location=device, weights_only=True)
         ckpt = {k.replace("depth_head.", ""): v for k, v in ckpt.items()}
         model.depth_init_head.load_state_dict(ckpt, strict=False)
+        del ckpt
         
-        
-
 
     auxiliary_model_configs = getattr(args, "auxiliary_models", None)
     auxiliary_models = dict()
     if auxiliary_model_configs is not None:
         for model_name, model_config in auxiliary_model_configs.items():
-            auxiliary_model = eval(model_config)
-            offload_match = re.search(r"offload\s*=\s*(\"True\"|False)\b", model_config, re.IGNORECASE)
-            if offload_match:
-                offload = offload_match.group(1).lower() == "true"
+            # 检查是否是SAM2模型
+            if "SAM2Base" in model_config:
+                # 延迟导入SAM2，避免Hydra冲突
+                try:
+                    from sam2.build_sam import build_sam2
+                    from sam2.modeling.sam2_base import SAM2Base
+                    from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+                    
+                    # 解析SAM2配置
+                    config_match = re.search(r"config_file\s*=\s*\"([^\"]+)\"", model_config)
+                    path_match = re.search(r"path\s*=\s*\"([^\"]+)\"", model_config)
+                    offload_match = re.search(r"offload\s*=\s*(\"True\"|False)\b", model_config, re.IGNORECASE)
+                    
+                    if config_match and path_match:
+                        config_file = config_match.group(1)
+                        ckpt_path = path_match.group(1)
+                        offload = offload_match.group(1).lower() == "true" if offload_match else False
+                        
+                        # 构建SAM2模型
+                        sam2_model = build_sam2(
+                            config_file=config_file,
+                            ckpt_path=ckpt_path,
+                            device="cpu" if offload else device,
+                            mode="eval"
+                        )
+                        
+                        if not offload:
+                            sam2_model.to(device)
+                        
+                        sam2_model.eval()
+                        sam2_model.requires_grad_(False)
+                        
+                        # 创建SAM2AutomaticMaskGenerator
+                        auxiliary_model = SAM2AutomaticMaskGenerator(
+                            model=sam2_model,
+                            points_per_side=8,
+                            pred_iou_thresh=0.8,
+                            stability_score_thresh=0.95,
+                            mask_threshold=0.0,
+                            box_nms_thresh=0.7,
+                            min_mask_region_area=100,
+                            output_mode="binary_mask"
+                        )
+                        
+                        auxiliary_models[model_name] = auxiliary_model
+                        printer.info(f"successfully load SAM2 automatic mask generator: {model_name}")
+                    else:
+                        printer.warning(f"Missing config_file or path for SAM2 model: {model_name}")
+                except Exception as e:
+                    printer.warning(f"Failed to load SAM2 model {model_name}: {e}")
+                    printer.info("Skipping SAM2 model loading due to error")
             else:
-                offload = False
-            if not offload:
-                auxiliary_model.to(device)
-            # capture the model checkpoint path from the config string
-            model_ckpt_match = re.search(r"path\s*=\s*\"([^\"]+)\"", model_config)
-            if model_ckpt_match:
-                model_ckpt = model_ckpt_match.group(1)
-                state_dict = torch.load(model_ckpt, map_location="cpu" if offload else device)
-                missing_keys, unexpected_keys = auxiliary_model.load_state_dict(state_dict, strict=False)
-                printer.info(f"Unexpected key numbers in {model_name}: {len(unexpected_keys)}")
-                printer.info(f"Missing key numbers in {model_name}: {len(missing_keys)}")
-            auxiliary_model.eval()
-            auxiliary_model.requires_grad_(False)
-            auxiliary_models[model_name] = auxiliary_model
-        printer.info(f"successfully load auxiliary model: {model_name}")
+                # 原有的RAFT模型加载逻辑
+                auxiliary_model = eval(model_config)
+                offload_match = re.search(r"offload\s*=\s*(\"True\"|False)\b", model_config, re.IGNORECASE)
+                if offload_match:
+                    offload = offload_match.group(1).lower() == "true"
+                else:
+                    offload = False
+                if not offload:
+                    auxiliary_model.to(device)
+                # capture the model checkpoint path from the config string
+                model_ckpt_match = re.search(r"path\s*=\s*\"([^\"]+)\"", model_config)
+                if model_ckpt_match:
+                    model_ckpt = model_ckpt_match.group(1)
+                    state_dict = torch.load(model_ckpt, map_location="cpu" if offload else device, weights_only=True)
+                    missing_keys, unexpected_keys = auxiliary_model.load_state_dict(state_dict, strict=False)
+                    printer.info(f"Unexpected key numbers in {model_name}: {len(unexpected_keys)}")
+                    printer.info(f"Missing key numbers in {model_name}: {len(missing_keys)}")
+                auxiliary_model.eval()
+                auxiliary_model.requires_grad_(False)
+                auxiliary_models[model_name] = auxiliary_model
+                printer.info(f"successfully load auxiliary model: {model_name}")
 
 
 
@@ -245,7 +303,7 @@ def train(args):
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
     loss_scaler = NativeScaler(accelerator=accelerator)
 
-    accelerator.even_batches = False
+    accelerator.even_batches = True
     optimizer, model, data_loader_train = accelerator.prepare(
         optimizer, model, data_loader_train
     )
@@ -313,29 +371,71 @@ def train(args):
                 #     cam_loss, __ = camera_loss([preds["pose_enc"]], vggt_batch)
                 #     loss += cam_loss["loss_camera"]
                 #     loss_dict.update(cam_loss)
+
                 # point loss
-                if vggt_batch.get("world_points") is not None and vggt_batch.get("point_masks") is not None:
-                    point_loss_dict = point_loss(preds["world_points"], preds["world_points_conf"], vggt_batch)
-                    loss += 0.00000001 * point_loss_dict.get("loss_conf", 0.0)
-                    loss_dict.update(point_loss_dict)
+                # if vggt_batch.get("world_points") is not None and vggt_batch.get("point_masks") is not None:
+                #     point_loss_dict = point_loss(preds["world_points"], preds["world_points_conf"], vggt_batch)
+                #     loss += 0.00000001 * point_loss_dict.get("loss_conf", 0.0)
+                #     loss_dict.update(point_loss_dict)
+
                 # depth loss
                 # if vggt_batch.get("depths") is not None and vggt_batch.get("point_masks") is not None:
                 #     depth_loss_dict = depth_loss(preds["depth"], preds["depth_conf"], vggt_batch)
                 #     loss += depth_loss_dict.get("loss_conf_depth", 0.0)
                 #     loss_dict.update(depth_loss_dict)
+
                 # gaussian loss
-                # if vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
-                #     conf = preds["depth_init_conf"] > 10
-                #     gaussian_loss_dict, _ = render_and_loss(conf, interval, forward_consist_mask, backward_consist_mask, preds["depth"].detach(), preds["gaussian_params"], preds["velocity"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"], vggt_batch["depths"], vggt_batch["point_masks"])
-                #     loss += gaussian_loss_dict.get("loss_render_rgb", 0.0) + 0.1 * gaussian_loss_dict.get("loss_render_lpips", 0.0) + gaussian_loss_dict.get("loss_render_depth", 0.0) + 0.001 * gaussian_loss_dict.get("loss_velocity", 0.0) 
-                #     loss_dict.update(gaussian_loss_dict)
+                if vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
+                    conf = preds["depth_init_conf"] > 2
+                    try:
+                        gaussian_loss_dict, _ = render_and_loss(conf, interval, forward_consist_mask, backward_consist_mask, preds["depth"].detach(), preds["gaussian_params"], preds["velocity"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"], vggt_batch["depths"], vggt_batch["point_masks"])
+                        loss += gaussian_loss_dict.get("loss_render_rgb", 0.0) + 0.1 * gaussian_loss_dict.get("loss_render_lpips", 0.0) + gaussian_loss_dict.get("loss_render_depth", 0.0) + 0.001 * gaussian_loss_dict.get("loss_velocity", 0.0) 
+                        loss_dict.update(gaussian_loss_dict)
+                    except Exception as e:
+                        print(f"Error in gaussian loss computation: {e}")
+                        # 添加零损失作为fallback
+                        loss_dict.update({
+                            "loss_render_rgb": torch.tensor(0.0, device=device, requires_grad=True),
+                            "loss_render_lpips": torch.tensor(0.0, device=device, requires_grad=True),
+                            "loss_render_depth": torch.tensor(0.0, device=device, requires_grad=True),
+                            "loss_velocity": torch.tensor(0.0, device=device, requires_grad=True),
+                        })
+
                 # optical flow -> velocity loss
                 if vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
                     conf = preds["depth_init_conf"] > 2
-                    flow_loss_dict = flow_loss(conf, interval, forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, preds["depth"], preds["velocity"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"])
-                    loss += flow_loss_dict.get("forward_loss", 0.0) # + flow_loss_dict.get("backward_loss", 0.0)
-                    loss_dict.update(flow_loss_dict)
+                    try:
+                        flow_loss_dict = flow_loss(conf, interval, forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, preds["depth"], preds["velocity"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"])
+                        loss += flow_loss_dict.get("forward_loss", 0.0) # + flow_loss_dict.get("backward_loss", 0.0)
+                        loss_dict.update(flow_loss_dict)
+                    except Exception as e:
+                        print(f"Error in flow loss computation: {e}")
+                        # 添加零损失作为fallback
+                        loss_dict.update({
+                            "forward_loss": torch.tensor(0.0, device=device, requires_grad=True),
+                            "backward_loss": torch.tensor(0.0, device=device, requires_grad=True),
+                        })
+                
+                # SAM2 mask-based velocity consistency loss
+                if "sam2" in auxiliary_models and vggt_batch.get("images") is not None:
+                    try:
+                        sam2_velocity_loss_dict = sam2_velocity_consistency_loss(
+                            vggt_batch["images"], 
+                            preds["velocity"], 
+                            auxiliary_models["sam2"],
+                            device=device
+                        )
+                        loss += 10000 * sam2_velocity_loss_dict.get("sam2_velocity_consistency_loss", 0.0)
+                        loss_dict.update(sam2_velocity_loss_dict)
+                    except Exception as e:
+                        print(f"Error in SAM2 loss computation: {e}")
+                        # 添加零损失作为fallback
+                        loss_dict.update({
+                            "sam2_velocity_consistency_loss": torch.tensor(0.0, device=device, requires_grad=True),
+                        })
+                
                 loss_value = float(loss)
+                
                 loss_scaler(
                     loss,
                     optimizer,
@@ -370,6 +470,7 @@ def train(args):
                     save_model(epoch - 1, f"epoch_{epoch}_{data_iter_step}", float("inf"))
                 metric_logger.synchronize_between_processes(accelerator)
                 printer.info("Averaged stats: %s", metric_logger)
+                
 
 
     total_time = time.time() - start_time
@@ -946,6 +1047,24 @@ def get_vis_imgs_new(loss_details, num_imgs_vis, num_views, is_metric):
     return ret_dict
 
 
+def sam2_velocity_consistency_loss(images, velocity, sam2_model, device):
+    """
+    Compute velocity consistency loss using SAM2 masks.
+    
+    Args:
+        images: [B, S, 3, H, W] - input images
+        velocity: [B, S, H, W, 3] - predicted velocity
+        sam2_model: SAM2AutomaticMaskGenerator instance
+        device: torch device
+    
+    Returns:
+        dict: loss dictionary containing sam2_velocity_consistency_loss
+    """
+    from vggt.training.loss import sam2_velocity_consistency_loss_impl
+    
+    return sam2_velocity_consistency_loss_impl(images, velocity, sam2_model, device)
+
+
 def cut3r_batch_to_vggt(views):
     # views: List[Dict], 长度为num_views
     # 目标: [1, S, 3, H, W] (B=1, S=num_views)
@@ -995,7 +1114,7 @@ def run(cfg: OmegaConf):
     if cfg.get("debug", False):
         cfg.num_workers = 0
         import debugpy
-        debugpy.listen(5679)
+        debugpy.listen(5678)
         print("Waiting for debugger to attach...")
         debugpy.wait_for_client()
     logdir = pathlib.Path(cfg.logdir)
