@@ -25,7 +25,7 @@ import sys
 # 添加vggt路径
 sys.path.append(os.path.join(os.path.dirname(__file__), 'vggt'))
 from vggt.vggt.models.vggt import VGGT
-from vggt.training.loss import camera_loss, depth_loss, point_loss, render_and_loss, flow_loss
+from vggt.training.loss import camera_loss, depth_loss, point_loss, cross_render_and_loss, flow_loss, self_render_and_loss
 from vggt.utils.auxiliary import RAFTCfg, calc_flow
 
 # ===== SAM2相关导入 =====
@@ -207,9 +207,9 @@ def train(args):
 
     if args.pretrained and not args.resume:
         printer.info(f"Loading pretrained: {args.pretrained}")
-        # ckpt = torch.load(args.pretrained, map_location=device, weights_only=True)
-        ckpt = torch.load(args.pretrained, map_location=device)['model']
-        ckpt = {k.replace("module.", ""): v for k, v in ckpt.items()}
+        ckpt = torch.load(args.pretrained, map_location=device, weights_only=True)
+        # ckpt = torch.load(args.pretrained, map_location=device)['model']
+        # ckpt = {k.replace("module.", ""): v for k, v in ckpt.items()}
         model.load_state_dict(ckpt, strict=False)
         del ckpt
         ckpt = torch.load(args.pretrained_init, map_location=device, weights_only=True)
@@ -358,13 +358,13 @@ def train(args):
 
                 interval = 2
 
-                forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, forward_in_bound_mask, backward_in_bound_mask = calc_flow(
-                    vggt_batch["images"], auxiliary_models["flow"],
-                    check_consistency=True,
-                    geo_thresh=auxiliary_models["flow"].args.geo_thresh,
-                    photo_thresh=auxiliary_models["flow"].args.photo_thresh,
-                    interval=interval,
-                )
+                # forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, forward_in_bound_mask, backward_in_bound_mask = calc_flow(
+                #     vggt_batch["images"], auxiliary_models["flow"],
+                #     check_consistency=True,
+                #     geo_thresh=auxiliary_models["flow"].args.geo_thresh,
+                #     photo_thresh=auxiliary_models["flow"].args.photo_thresh,
+                #     interval=interval,
+                # )
 
                 # camera loss
                 # if vggt_batch.get("extrinsics") is not None and vggt_batch.get("intrinsics") is not None and vggt_batch.get("point masks") is not None:
@@ -384,55 +384,70 @@ def train(args):
                 #     loss += depth_loss_dict.get("loss_conf_depth", 0.0)
                 #     loss_dict.update(depth_loss_dict)
 
-                # gaussian loss
+                # gaussian loss (cross)
+                # if vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
+                #     conf = preds["depth_init_conf"] > 2
+                #     try:
+                #         gaussian_loss_dict, _ = cross_render_and_loss(conf, interval, forward_consist_mask, backward_consist_mask, preds["depth"].detach(), preds["gaussian_params"], preds["velocity"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"], vggt_batch["depths"], vggt_batch["point_masks"])
+                #         loss += gaussian_loss_dict.get("loss_render_rgb", 0.0) + 0.1 * gaussian_loss_dict.get("loss_render_lpips", 0.0) + gaussian_loss_dict.get("loss_render_depth", 0.0) + 0.001 * gaussian_loss_dict.get("loss_velocity", 0.0) 
+                #         loss_dict.update(gaussian_loss_dict)
+                #     except Exception as e:
+                #         print(f"Error in gaussian loss computation: {e}")
+                #         # 添加零损失作为fallback
+                #         loss_dict.update({
+                #             "loss_render_rgb": torch.tensor(0.0, device=device, requires_grad=True),
+                #             "loss_render_lpips": torch.tensor(0.0, device=device, requires_grad=True),
+                #             "loss_render_depth": torch.tensor(0.0, device=device, requires_grad=True),
+                #             "loss_velocity": torch.tensor(0.0, device=device, requires_grad=True),
+                #         })
+
+                # self render loss (self)
                 if vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
-                    conf = preds["depth_init_conf"] > 2
                     try:
-                        gaussian_loss_dict, _ = render_and_loss(conf, interval, forward_consist_mask, backward_consist_mask, preds["depth"].detach(), preds["gaussian_params"], preds["velocity"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"], vggt_batch["depths"], vggt_batch["point_masks"])
-                        loss += gaussian_loss_dict.get("loss_render_rgb", 0.0) + 0.1 * gaussian_loss_dict.get("loss_render_lpips", 0.0) + gaussian_loss_dict.get("loss_render_depth", 0.0) + 0.001 * gaussian_loss_dict.get("loss_velocity", 0.0) 
-                        loss_dict.update(gaussian_loss_dict)
+                        self_loss_dict, _ = self_render_and_loss(preds["depth"].detach(), preds["gaussian_params"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"])
+                        loss += self_loss_dict.get("loss_self_render_rgb", 0.0) + 0.1 * self_loss_dict.get("loss_self_render_lpips", 0.0) + self_loss_dict.get("loss_self_render_depth", 0.0)
+                        loss_dict.update(self_loss_dict)
                     except Exception as e:
-                        print(f"Error in gaussian loss computation: {e}")
+                        print(f"Error in self render loss computation: {e}")
                         # 添加零损失作为fallback
                         loss_dict.update({
-                            "loss_render_rgb": torch.tensor(0.0, device=device, requires_grad=True),
-                            "loss_render_lpips": torch.tensor(0.0, device=device, requires_grad=True),
-                            "loss_render_depth": torch.tensor(0.0, device=device, requires_grad=True),
-                            "loss_velocity": torch.tensor(0.0, device=device, requires_grad=True),
+                            "loss_self_render_rgb": torch.tensor(0.0, device=device, requires_grad=True),
+                            "loss_self_render_lpips": torch.tensor(0.0, device=device, requires_grad=True),
+                            "loss_self_render_depth": torch.tensor(0.0, device=device, requires_grad=True),
                         })
 
-                # optical flow -> velocity loss
-                if vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
-                    conf = preds["depth_init_conf"] > 2
-                    try:
-                        flow_loss_dict = flow_loss(conf, interval, forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, preds["depth"], preds["velocity"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"])
-                        loss += flow_loss_dict.get("forward_loss", 0.0) # + flow_loss_dict.get("backward_loss", 0.0)
-                        loss_dict.update(flow_loss_dict)
-                    except Exception as e:
-                        print(f"Error in flow loss computation: {e}")
-                        # 添加零损失作为fallback
-                        loss_dict.update({
-                            "forward_loss": torch.tensor(0.0, device=device, requires_grad=True),
-                            "backward_loss": torch.tensor(0.0, device=device, requires_grad=True),
-                        })
+                # # optical flow -> velocity loss
+                # if vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
+                #     conf = preds["depth_init_conf"] > 2
+                #     try:
+                #         flow_loss_dict = flow_loss(conf, interval, forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, preds["depth"], preds["velocity"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"])
+                #         loss += flow_loss_dict.get("forward_loss", 0.0) # + flow_loss_dict.get("backward_loss", 0.0)
+                #         loss_dict.update(flow_loss_dict)
+                #     except Exception as e:
+                #         print(f"Error in flow loss computation: {e}")
+                #         # 添加零损失作为fallback
+                #         loss_dict.update({
+                #             "forward_loss": torch.tensor(0.0, device=device, requires_grad=True),
+                #             "backward_loss": torch.tensor(0.0, device=device, requires_grad=True),
+                #         })
                 
-                # SAM2 mask-based velocity consistency loss
-                if "sam2" in auxiliary_models and vggt_batch.get("images") is not None:
-                    try:
-                        sam2_velocity_loss_dict = sam2_velocity_consistency_loss(
-                            vggt_batch["images"], 
-                            preds["velocity"], 
-                            auxiliary_models["sam2"],
-                            device=device
-                        )
-                        loss += 10000 * sam2_velocity_loss_dict.get("sam2_velocity_consistency_loss", 0.0)
-                        loss_dict.update(sam2_velocity_loss_dict)
-                    except Exception as e:
-                        print(f"Error in SAM2 loss computation: {e}")
-                        # 添加零损失作为fallback
-                        loss_dict.update({
-                            "sam2_velocity_consistency_loss": torch.tensor(0.0, device=device, requires_grad=True),
-                        })
+                # # SAM2 mask-based velocity consistency loss
+                # if "sam2" in auxiliary_models and vggt_batch.get("images") is not None:
+                #     try:
+                #         sam2_velocity_loss_dict = sam2_velocity_consistency_loss(
+                #             vggt_batch["images"], 
+                #             preds["velocity"], 
+                #             auxiliary_models["sam2"],
+                #             device=device
+                #         )
+                #         loss += 10000 * sam2_velocity_loss_dict.get("sam2_velocity_consistency_loss", 0.0)
+                #         loss_dict.update(sam2_velocity_loss_dict)
+                #     except Exception as e:
+                #         print(f"Error in SAM2 loss computation: {e}")
+                #         # 添加零损失作为fallback
+                #         loss_dict.update({
+                #             "sam2_velocity_consistency_loss": torch.tensor(0.0, device=device, requires_grad=True),
+                #         })
                 
                 loss_value = float(loss)
                 

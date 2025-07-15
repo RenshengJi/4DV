@@ -17,7 +17,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'src/vggt'))
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 from vggt.models.vggt import VGGT
 from dust3r.utils.misc import tf32_off
-from training.loss import cross_render_and_loss
+from training.loss import self_render_and_loss
 # Import model and inference functions after adding the ckpt path.
 from src.dust3r.inference import inference
 
@@ -36,12 +36,12 @@ random.seed(42)
 def parse_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Run 3D point cloud inference and visualization using ARCroco3DStereo."
+        description="Run 3D point cloud inference and visualization using ARCroco3DStereo with self rendering."
     )
     parser.add_argument(
         "--model_path",
         type=str,
-        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/debug_sam2_8points_true+weight10000/checkpoint-epoch_0_16688.pth",
+        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/self/checkpoint-epoch_0_2276.pth",
         # default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(fix_mask+nometric+fixgs+depth+fixlpips+lowvelocity+fixrepeat+l1loss+onlyforward+novelocityreg)/checkpoint-epoch_2_2384.pth",
         help="Path to the pretrained model checkpoint.",
     )
@@ -66,7 +66,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./results",
+        default="./results_self",
         help="value for tempfile.tempdir",
     )
     parser.add_argument(
@@ -115,29 +115,24 @@ def depth_to_world_points(depth, intrinsic):
 
 
 
-def prepare_output(preds, vggt_batch):
+def prepare_output_self(preds, vggt_batch):
     """
-    Process inference outputs to generate point clouds and camera parameters for visualization.
+    Process inference outputs to generate point clouds and camera parameters for visualization using self rendering.
 
     Args:
-        outputs (dict): Inference outputs.
-        revisit (int): Number of revisits per view.
-        use_pose (bool): Whether to transform points using camera pose.
+        preds (dict): Inference outputs.
+        vggt_batch (dict): VGGT batch data.
 
     Returns:
-        tuple: (points, colors, confidence, camera parameters dictionary)
+        dict: Image dictionary for visualization.
     """
     from src.dust3r.utils.camera import pose_encoding_to_camera
     from src.dust3r.post_process import estimate_focal_knowing_depth
     from src.dust3r.utils.geometry import geotrf
     from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
-    conf = preds["depth_init_conf"] > 10
-    interval = 2
-
-
-    # metric depth 
-    _, img_dict = cross_render_and_loss(conf, interval, None, None, preds["depth"].detach(), preds["gaussian_params"], preds["velocity"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"], vggt_batch["depths"], vggt_batch["point_masks"])
+    # 调用self_render_and_loss函数
+    _, img_dict = self_render_and_loss(preds["depth"].detach(), preds["gaussian_params"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"])
     
 
     return img_dict
@@ -177,9 +172,9 @@ def parse_seq_path(p):
 
 
 
-def run_inference(dataset, model, device, args):
+def run_inference_self(dataset, model, device, args):
     """
-    Execute the full inference and visualization pipeline.
+    Execute the full inference and visualization pipeline with self rendering.
 
     Args:
         args: Parsed command-line arguments.
@@ -205,7 +200,7 @@ def run_inference(dataset, model, device, args):
 
     # Process outputs for visualization.
     print("Preparing output for visualization...")
-    img_dict = prepare_output(outputs, batch)
+    img_dict = prepare_output_self(outputs, batch)
 
     # img_dict -> video
     img_dict = deepcopy(img_dict)
@@ -227,33 +222,33 @@ def run_inference(dataset, model, device, args):
         return (arr * 255).astype(np.uint8)
 
     # 将两个深度图从灰度图转换为RGB图(红近, 蓝远)
-    img_dict["target_depth_pred"] = np.stack([
+    img_dict["self_depth_pred"] = np.stack([
     cv2.applyColorMap(
-            normalize_to_uint8(img_dict["target_depth_pred"][i][0]), cv2.COLORMAP_JET
+            normalize_to_uint8(img_dict["self_depth_pred"][i][0]), cv2.COLORMAP_JET
         ).transpose(2, 0, 1)
-        for i in range(len(img_dict["target_depth_pred"]))
+        for i in range(len(img_dict["self_depth_pred"]))
     ], axis=0)
-    img_dict["target_depth_gt"] = np.stack([
+    img_dict["self_depth_gt"] = np.stack([
         cv2.applyColorMap(
-            normalize_to_uint8(img_dict["target_depth_gt"][i][0]), cv2.COLORMAP_JET
+            normalize_to_uint8(img_dict["self_depth_gt"][i][0]), cv2.COLORMAP_JET
         ).transpose(2, 0, 1)
-        for i in range(len(img_dict["target_depth_gt"]))
+        for i in range(len(img_dict["self_depth_gt"]))
     ], axis=0)
 
     
     # 将其他的rgb图*255转换为int
-    for key in ["source_rgb", "target_rgb_pred", "target_rgb_gt", "velocity"]:
+    for key in ["self_rgb_pred", "self_rgb_gt"]:
         img_dict[key] = np.stack([
             (img_dict[key][i] * 255).astype(np.uint8) for i in range(len(img_dict[key]))
         ], axis=0)
     
 
-    # 将6种img_dict拼接为video
-    video_path = os.path.join(args.output_dir, str(args.idx) + "_" + views[0]['label'].split('.')[0] + ".mp4")
+    # 将4种img_dict拼接为video
+    video_path = os.path.join(args.output_dir, str(args.idx) + "_" + views[0]['label'].split('.')[0] + "_self.mp4")
     with iio.get_writer(video_path, fps=10) as writer:
-        max_length = max(len(img_dict["source_rgb"]), len(img_dict["target_rgb_pred"]),
-                         len(img_dict["target_rgb_gt"]), len(img_dict["target_depth_pred"]),
-                         len(img_dict["target_depth_gt"]), len(img_dict["velocity"]))
+        max_length = max(len(img_dict["self_rgb_pred"]),
+                         len(img_dict["self_rgb_gt"]), len(img_dict["self_depth_pred"]),
+                         len(img_dict["self_depth_gt"]))
         for i in range(max_length):
             frame = []
             for key in img_dict:
@@ -264,14 +259,6 @@ def run_inference(dataset, model, device, args):
             combined_frame = np.concatenate(frame, axis=1)
             writer.append_data(combined_frame.transpose(1, 2, 0))  # Transpose to HWC format for video writer
     print(f"Output video saved to {video_path}")
-
-    # # 将source_rgb和velocity拼接为video
-    # video_path = os.path.join(args.output_dir, str(args.idx) + "_" + views[0]['label'].split('.')[0] + ".mp4")
-    # with iio.get_writer(video_path, fps=10) as writer:
-    #     for i in range(len(img_dict["source_rgb"])):
-    #         frame = np.concatenate([img_dict["source_rgb"][i], img_dict["velocity"][i]], axis=1)
-    #         writer.append_data(frame.transpose(1, 2, 0))
-    # print(f"Output video saved to {video_path}")
 
 
 def main():
@@ -308,10 +295,10 @@ def main():
         print(f"\n========== Running inference for idx={idx} ==========")
         args.idx = idx
         try:
-            run_inference(dataset, model, device, args)
+            run_inference_self(dataset, model, device, args)
         except Exception as e:
             print(f"Error at idx={idx}: {e}")
         idx += 200
 
 if __name__ == "__main__":
-    main()
+    main() 
