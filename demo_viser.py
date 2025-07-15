@@ -459,12 +459,12 @@ parser = argparse.ArgumentParser(description="VGGT demo with viser for 3D visual
 # parser.add_argument(
 #     "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/val/segment-1505698981571943321_1186_773_1206_773_with_camera_labels.tfrecord", help="Path to folder containing images"
 # )
-parser.add_argument(
-    "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train/segment-15795616688853411272_1245_000_1265_000_with_camera_labels.tfrecord", help="Path to folder containing images"
-)
 # parser.add_argument(
-#     "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train/segment-15787777881771177481_8820_000_8840_000_with_camera_labels.tfrecord", help="Path to folder containing images"
+#     "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train/segment-15795616688853411272_1245_000_1265_000_with_camera_labels.tfrecord", help="Path to folder containing images"
 # )
+parser.add_argument(
+    "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train/segment-15787777881771177481_8820_000_8840_000_with_camera_labels.tfrecord", help="Path to folder containing images"
+)
 # parser.add_argument(
 #     "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train/segment-14830022845193837364_3488_060_3508_060_with_camera_labels.tfrecord", help="Path to folder containing images"
 # )
@@ -526,7 +526,7 @@ def main():
     # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(fix_mask+nometric+fixgs+depth+fixlpips+lowvelocity+fixrepeat+l1loss+onlyforward+novelocityreg+finetune10conf)/checkpoint-epoch_1_7152.pth", map_location=device)['model']
     # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(onlyflow+lr)/checkpoint-epoch_0_7152.pth", map_location=device)['model']
     # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(onlyflow+lr+interval)/checkpoint-epoch_0_22648.pth", map_location=device)['model']
-    ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/debug_sam2_8points_true/checkpoint-epoch_0_10728.pth", map_location=device)['model']
+    ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/debug_sam2_8points_true+weight10000/checkpoint-epoch_0_16688.pth", map_location=device)['model']
     ckpt = {k.replace("module.", ""): v for k, v in ckpt.items()}
     model.load_state_dict(ckpt, strict=False)
     # model.load_state_dict(torch.load("src/model.pt"), strict=False)
@@ -550,13 +550,88 @@ def main():
     # 只提取_后面是1.jpg或.png的图片
     image_names = [name for name in image_names if name.split("/")[-1].split("_")[-1] in ["1.jpg", "1.png"]]
     # image_names = sorted(image_names)[::args.image_interval][:8][::-1]
-    image_names = sorted(image_names)[::args.image_interval][20:44]
+    image_names = sorted(image_names)[::args.image_interval][20:28]
     # 第一个不变，其他逆序
     # image_names = [image_names[0]] + image_names[1:][::-1]
     print(f"Found {len(image_names)} images")
 
     images = load_and_preprocess_images(image_names).to(device)
     print(f"Preprocessed images shape: {images.shape}")
+
+
+    # 将images保存为video
+    video_path = os.path.join("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo", "video.mp4")
+    
+    print(f"图像形状: {images.shape}")
+    print(f"图像数据类型: {images.dtype}")
+    print(f"图像值范围: [{images.min():.3f}, {images.max():.3f}]")
+    
+    # 检查视频写入器是否可用
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(video_path, fourcc, 5, (images.shape[3], images.shape[2]))
+    
+    if not out.isOpened():
+        print("无法创建MP4视频文件，尝试使用AVI格式...")
+        # 尝试使用不同的编码器
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        video_path = video_path.replace('.mp4', '.avi')
+        out = cv2.VideoWriter(video_path, fourcc, 2, (images.shape[3], images.shape[2]))
+        
+        if not out.isOpened():
+            print("仍然无法创建视频文件，尝试使用MJPG编码器...")
+            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+            video_path = video_path.replace('.avi', '.avi')
+            out = cv2.VideoWriter(video_path, fourcc, 2, (images.shape[3], images.shape[2]))
+            
+            if not out.isOpened():
+                print("无法创建视频文件，跳过视频保存")
+                out = None
+    
+    if out is not None:
+        try:
+            for i, image in enumerate(images):
+                # 确保图像格式正确：从 (C, H, W) 转换为 (H, W, C)
+                img_np = image.cpu().numpy().transpose(1, 2, 0)
+                
+                # 确保像素值在0-255范围内
+                if img_np.max() <= 1.0:
+                    img_np = (img_np * 255).astype(np.uint8)
+                else:
+                    img_np = img_np.astype(np.uint8)
+                
+                # 确保是BGR格式（OpenCV需要）
+                if img_np.shape[2] == 3:
+                    img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+                
+                # 检查图像数据是否有效
+                if img_np.shape[0] == 0 or img_np.shape[1] == 0:
+                    print(f"跳过无效图像帧 {i}")
+                    continue
+                
+                out.write(img_np)
+            
+            out.release()
+            print(f"成功保存视频到 {video_path}")
+            
+            # 验证文件是否成功创建
+            if os.path.exists(video_path):
+                file_size = os.path.getsize(video_path)
+                print(f"视频文件大小: {file_size} 字节")
+                if file_size == 0:
+                    print("警告: 视频文件大小为0，可能损坏")
+            else:
+                print("错误: 视频文件未创建")
+                
+        except Exception as e:
+            print(f"保存视频时出错: {e}")
+            import traceback
+            traceback.print_exc()
+            if out is not None:
+                out.release()
+    else:
+        print("跳过视频保存")
+
+
 
     print("Running inference...")
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16

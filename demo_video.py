@@ -41,7 +41,7 @@ def parse_args():
     parser.add_argument(
         "--model_path",
         type=str,
-        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/debug_sam2_8points_true+weight10000/checkpoint-epoch_0_2384.pth",
+        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/debug_sam2_8points_true+weight10000/checkpoint-epoch_0_16688.pth",
         # default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(fix_mask+nometric+fixgs+depth+fixlpips+lowvelocity+fixrepeat+l1loss+onlyforward+novelocityreg)/checkpoint-epoch_2_2384.pth",
         help="Path to the pretrained model checkpoint.",
     )
@@ -66,7 +66,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./results_2384",
+        default="./results",
         help="value for tempfile.tempdir",
     )
     parser.add_argument(
@@ -132,12 +132,12 @@ def prepare_output(preds, vggt_batch):
     from src.dust3r.utils.geometry import geotrf
     from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
-    conf = preds["depth_init_conf"] > 2
+    conf = preds["depth_init_conf"] > 10
     interval = 2
 
 
     # metric depth 
-    gaussian_loss_dict, img_dict = render_and_loss(conf, interval, None, None, preds["depth"].detach(), preds["gaussian_params"], preds["velocity"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"], vggt_batch["depths"], vggt_batch["point_masks"])
+    _, img_dict = render_and_loss(conf, interval, None, None, preds["depth"].detach(), preds["gaussian_params"], preds["velocity"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"], vggt_batch["depths"], vggt_batch["point_masks"])
     
 
     return img_dict
@@ -265,6 +265,14 @@ def run_inference(dataset, model, device, args):
             writer.append_data(combined_frame.transpose(1, 2, 0))  # Transpose to HWC format for video writer
     print(f"Output video saved to {video_path}")
 
+    # # 将source_rgb和velocity拼接为video
+    # video_path = os.path.join(args.output_dir, str(args.idx) + "_" + views[0]['label'].split('.')[0] + ".mp4")
+    # with iio.get_writer(video_path, fps=10) as writer:
+    #     for i in range(len(img_dict["source_rgb"])):
+    #         frame = np.concatenate([img_dict["source_rgb"][i], img_dict["velocity"][i]], axis=1)
+    #         writer.append_data(frame.transpose(1, 2, 0))
+    # print(f"Output video saved to {video_path}")
+
 
 def main():
 
@@ -279,9 +287,11 @@ def main():
     # Add the checkpoint path (required for model imports in the dust3r package).
     add_path_to_dust3r(args.model_path)
 
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
 
     from src.dust3r.datasets.waymo import Waymo_Multi
-    dataset = Waymo_Multi(allow_repeat=False, split=None, ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train", img_ray_mask_p=[1.0, 0.0, 0.0], aug_crop=16, resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], num_views=24, n_corres=0)
+    dataset = Waymo_Multi(allow_repeat=False, split=None, ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train", img_ray_mask_p=[1.0, 0.0, 0.0], aug_crop=16, resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], num_views=24, n_corres=0, seq_aug_crop=True)
 
 
     # Load and prepare the model.
