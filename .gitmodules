@@ -4,3 +4,6 @@
 [submodule "src/sam2"]
 	path = src/sam2
 	url = https://github.com/facebookresearch/sam2.git
+[submodule "src/dam2"]
+	path = src/dam2
+	url = https://github.com/DepthAnything/Depth-Anything-V2.git

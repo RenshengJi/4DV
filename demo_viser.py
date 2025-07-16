@@ -459,12 +459,12 @@ parser = argparse.ArgumentParser(description="VGGT demo with viser for 3D visual
 # parser.add_argument(
 #     "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/val/segment-1505698981571943321_1186_773_1206_773_with_camera_labels.tfrecord", help="Path to folder containing images"
 # )
-# parser.add_argument(
-#     "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train/segment-15795616688853411272_1245_000_1265_000_with_camera_labels.tfrecord", help="Path to folder containing images"
-# )
 parser.add_argument(
-    "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train/segment-15787777881771177481_8820_000_8840_000_with_camera_labels.tfrecord", help="Path to folder containing images"
+    "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train/segment-15795616688853411272_1245_000_1265_000_with_camera_labels.tfrecord", help="Path to folder containing images"
 )
+# parser.add_argument(
+#     "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train/segment-15787777881771177481_8820_000_8840_000_with_camera_labels.tfrecord", help="Path to folder containing images"
+# )
 # parser.add_argument(
 #     "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train/segment-14830022845193837364_3488_060_3508_060_with_camera_labels.tfrecord", help="Path to folder containing images"
 # )
@@ -524,9 +524,9 @@ def main():
     # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(fix_mask+nometric+fixgs+depth+fixlpips+lowvelocity+fixrepeat+l1loss+onlyforward+novelocityreg)/checkpoint-epoch_2_2384.pth", map_location=device)['model']
     # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(fix_mask+nometric+fixgs+depth+fixlpips+lowvelocity+fixrepeat+l1loss+onlyforward+novelocityreg)/checkpoint-epoch_0_30992.pth", map_location=device)['model']
     # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(fix_mask+nometric+fixgs+depth+fixlpips+lowvelocity+fixrepeat+l1loss+onlyforward+novelocityreg+finetune10conf)/checkpoint-epoch_1_7152.pth", map_location=device)['model']
-    # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(onlyflow+lr)/checkpoint-epoch_0_7152.pth", map_location=device)['model']
-    # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(onlyflow+lr+interval)/checkpoint-epoch_0_22648.pth", map_location=device)['model']
-    ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/debug_sam2_8points_true+weight10000/checkpoint-epoch_0_16688.pth", map_location=device)['model']
+    # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(onlyflow+lr)/checkpoint-epoch_0_3576.pth", map_location=device)['model']
+    ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/debug_sam2_8points_true/checkpoint-epoch_0_2384.pth", map_location=device)['model']
+    # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/flow-samweight1/checkpoint-epoch_0_7152.pth", map_location=device)['model']
     ckpt = {k.replace("module.", ""): v for k, v in ckpt.items()}
     model.load_state_dict(ckpt, strict=False)
     # model.load_state_dict(torch.load("src/model.pt"), strict=False)

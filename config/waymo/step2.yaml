@@ -4,16 +4,17 @@ model: "VGGT(img_size=518, patch_size=14, embed_dim=1024)"
 # pretrained: /mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(fix_mask)/checkpoint-epoch_1_31892.pth
 # pretrained: /mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(flow)/checkpoint-epoch_0_50778.pth
 # pretrained: /mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(fix_mask+nometric+fixgs+depth+fixlpips+lowvelocity+fixrepeat+l1loss+onlyforward+novelocityreg)/checkpoint-epoch_0_53640.pth
-pretrained: /mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/debug_sam2_8points_true/checkpoint-epoch_0_10728.pth
-pretrained_init: model.pt
+pretrained: /mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/self/checkpoint-epoch_0_6828.pth
+pretrained_init: /mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(fix_mask+nometric+fixgs+depth+fixlpips+lowvelocity+fixrepeat+l1loss+onlyforward+novelocityreg)/checkpoint-epoch_2_2384.pth
 
 auxiliary_models:
   flow: RAFT(RAFTCfg(name="kitti-M", dataset="kitti", path="Tartan-C-T-TSKH-kitti432x960-M.pth",
     use_var=True, var_min=0, var_max=10, pretrain="resnet34", initial_dim=64, block_dims=[64, 128, 256],
     radius=4, dim=128, num_blocks=2, iters=4, image_size=[432, 960],
     offload=${offload_auxiliary}, geo_thresh=2, photo_thresh=-1))
-  sam2: SAM2Base(config_file="sam2.1_hiera_t.yaml", path="sam2.1_hiera_tiny.pt",
-    offload=${offload_auxiliary})
+  # sam2: SAM2Base(config_file="sam2.1_hiera_t.yaml", path="sam2.1_hiera_tiny.pt",
+  #   offload=${offload_auxiliary})
+  # dam2: DepthAnythingV2(encoder="vitb", offload=${offload_auxiliary})
 
 offload_auxiliary: False
 load_only_encoder: False
@@ -32,8 +33,8 @@ test_criterion: RenderLoss(MSE, shape="BHWC")
 resolution: [(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)]
 
 allow_repeat: False
-train_dataset: Waymo_Multi(allow_repeat=${allow_repeat}, split=None, ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train", img_ray_mask_p=[1.0, 0.0, 0.0], valid_camera_id_list=["1", "2", "3"], aug_crop=16, resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], transform=ImgNorm, num_views=${num_views}, n_corres=${n_corres_train})
-test_dataset: 1000 @ Waymo_Multi(split=None, ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train", img_ray_mask_p=[1.0, 0.0, 0.0], valid_camera_id_list=["1", "2", "3"], resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], num_views=${num_test_views}, seed=42, n_corres=${n_corres_test})
+train_dataset: Waymo_Multi(allow_repeat=${allow_repeat}, split=None, ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train", img_ray_mask_p=[1.0, 0.0, 0.0], valid_camera_id_list=["1", "2", "3"], aug_crop=16, resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], transform=ImgNorm, num_views=${num_views}, n_corres=${n_corres_train}, seq_aug_crop=True)
+test_dataset: 1000 @ Waymo_Multi(split=None, ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train", img_ray_mask_p=[1.0, 0.0, 0.0], valid_camera_id_list=["1", "2", "3"], resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], num_views=${num_test_views}, seed=42, n_corres=${n_corres_test}, seq_aug_crop=True)
 
 seed: 0
 batch_size: 1
@@ -42,7 +43,7 @@ gradient_checkpointing: True
 epochs: 10
 start_epoch: 0
 weight_decay: 0.05
-lr: 3e-5
+lr: 3e-4
 min_lr: 1e-8
 warmup_epochs: 0.005
 amp: 1
@@ -65,8 +66,9 @@ num_imgs_vis: 4
 save_dir: 'checkpoints/waymo'
 # exp_name: 'step2(fix_mask+nometric+fixgs+depth+fixlpips+lowvelocity+fixrepeat+l1loss+onlyforward+novelocityreg+finetune10conf)'
 # exp_name: 'step2(onlyflow+lr+interval)'
-exp_name: 'debug_sam2_8points_true+weight10000'
+# exp_name: 'flow-samweight1'
 # exp_name: 'debug'
+exp_name: 'step2(true)'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/

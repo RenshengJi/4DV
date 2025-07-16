@@ -41,8 +41,13 @@ def parse_args():
     parser.add_argument(
         "--model_path",
         type=str,
-        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/debug_sam2_8points_true+weight10000/checkpoint-epoch_0_16688.pth",
-        # default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(fix_mask+nometric+fixgs+depth+fixlpips+lowvelocity+fixrepeat+l1loss+onlyforward+novelocityreg)/checkpoint-epoch_2_2384.pth",
+        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/self/checkpoint-epoch_0_6828.pth",
+        help="Path to the pretrained model checkpoint.",
+    )
+    parser.add_argument(
+        "--model_velocity_path",
+        type=str,
+        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/flow-samweight1/checkpoint-epoch_0_8344.pth",
         help="Path to the pretrained model checkpoint.",
     )
     parser.add_argument(
@@ -66,7 +71,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./results",
+        default="./results_sam_8344",
         help="value for tempfile.tempdir",
     )
     parser.add_argument(
@@ -132,7 +137,7 @@ def prepare_output(preds, vggt_batch):
     from src.dust3r.utils.geometry import geotrf
     from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
-    conf = preds["depth_init_conf"] > 10
+    conf = preds["depth_conf"] > 10
     interval = 2
 
 
@@ -300,6 +305,14 @@ def main():
     ckpt = torch.load(args.model_path, map_location=device)['model']
     ckpt = {k.replace("module.", ""): v for k, v in ckpt.items()}
     model.load_state_dict(ckpt, strict=False)
+    del ckpt
+    ckpt = torch.load(args.model_velocity_path, map_location=device)['model']
+    ckpt = {k.replace("module.", ""): v for k, v in ckpt.items()}
+    ckpt = {k.replace("velocity_head.", ""): v for k, v in ckpt.items()}
+    model.velocity_head.load_state_dict(ckpt, strict=False)
+    del ckpt
+
+
     model.eval()
     model = model.to(device)
     

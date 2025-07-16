@@ -12,6 +12,7 @@ import os
 import sys
 import time
 import math
+import cv2
 from collections import defaultdict
 from pathlib import Path
 from typing import Sized
@@ -34,6 +35,12 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'sam2'))
 # 延迟导入SAM2，避免Hydra冲突
 # from sam2.build_sam import build_sam2
 # from sam2.modeling.sam2_base import SAM2Base
+
+# ===== DAM2相关导入 =====
+# 添加dam2路径
+sys.path.append(os.path.join(os.path.dirname(__file__), 'dam2'))
+# 延迟导入DAM2，避免Hydra冲突
+# from depth_anything_v2.dpt import DepthAnythingV2
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -207,14 +214,15 @@ def train(args):
 
     if args.pretrained and not args.resume:
         printer.info(f"Loading pretrained: {args.pretrained}")
-        ckpt = torch.load(args.pretrained, map_location=device, weights_only=True)
-        # ckpt = torch.load(args.pretrained, map_location=device)['model']
-        # ckpt = {k.replace("module.", ""): v for k, v in ckpt.items()}
+        # ckpt = torch.load(args.pretrained, map_location=device, weights_only=True)
+        ckpt = torch.load(args.pretrained, map_location=device)['model']
+        ckpt = {k.replace("module.", ""): v for k, v in ckpt.items()}
         model.load_state_dict(ckpt, strict=False)
         del ckpt
-        ckpt = torch.load(args.pretrained_init, map_location=device, weights_only=True)
-        ckpt = {k.replace("depth_head.", ""): v for k, v in ckpt.items()}
-        model.depth_init_head.load_state_dict(ckpt, strict=False)
+        ckpt = torch.load(args.pretrained_init, map_location=device)['model']
+        ckpt = {k.replace("module.", ""): v for k, v in ckpt.items()}
+        ckpt = {k.replace("velocity_head.", ""): v for k, v in ckpt.items()}
+        model.velocity_head.load_state_dict(ckpt, strict=False)
         del ckpt
         
 
@@ -273,6 +281,52 @@ def train(args):
                 except Exception as e:
                     printer.warning(f"Failed to load SAM2 model {model_name}: {e}")
                     printer.info("Skipping SAM2 model loading due to error")
+            # 检查是否是DAM2模型
+            elif "DepthAnythingV2" in model_config:
+                # 延迟导入DAM2，避免Hydra冲突
+                try:
+                    # 添加dam2目录到Python路径
+                    dam2_path = os.path.join(os.path.dirname(__file__), 'dam2')
+                    if dam2_path not in sys.path:
+                        sys.path.insert(0, dam2_path)
+                    from depth_anything_v2.dpt import DepthAnythingV2
+                    
+                    # 解析DAM2配置
+                    encoder_match = re.search(r"encoder\s*=\s*\"([^\"]+)\"", model_config)
+                    offload_match = re.search(r"offload\s*=\s*(\"True\"|False)\b", model_config, re.IGNORECASE)
+                    
+                    if encoder_match:
+                        encoder = encoder_match.group(1)
+                        # 直接从src目录加载模型文件
+                        ckpt_path = os.path.join(os.path.dirname(__file__), f"depth_anything_v2_{encoder}.pth")
+                        offload = offload_match.group(1).lower() == "true" if offload_match else False
+                        
+                        # 模型配置
+                        model_configs = {
+                            'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+                            'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+                            'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
+                            'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
+                        }
+                        
+                        # 构建DAM2模型
+                        dam2_model = DepthAnythingV2(**model_configs[encoder])
+                        state_dict = torch.load(ckpt_path, map_location="cpu" if offload else device, weights_only=True)
+                        dam2_model.load_state_dict(state_dict)
+                        
+                        if not offload:
+                            dam2_model.to(device)
+                        
+                        dam2_model.eval()
+                        dam2_model.requires_grad_(False)
+                        
+                        auxiliary_models[model_name] = dam2_model
+                        printer.info(f"successfully load DAM2 model: {model_name}")
+                    else:
+                        printer.warning(f"Missing encoder or path for DAM2 model: {model_name}")
+                except Exception as e:
+                    printer.warning(f"Failed to load DAM2 model {model_name}: {e}")
+                    printer.info("Skipping DAM2 model loading due to error")
             else:
                 # 原有的RAFT模型加载逻辑
                 auxiliary_model = eval(model_config)
@@ -358,13 +412,13 @@ def train(args):
 
                 interval = 2
 
-                # forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, forward_in_bound_mask, backward_in_bound_mask = calc_flow(
-                #     vggt_batch["images"], auxiliary_models["flow"],
-                #     check_consistency=True,
-                #     geo_thresh=auxiliary_models["flow"].args.geo_thresh,
-                #     photo_thresh=auxiliary_models["flow"].args.photo_thresh,
-                #     interval=interval,
-                # )
+                forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, forward_in_bound_mask, backward_in_bound_mask = calc_flow(
+                    vggt_batch["images"], auxiliary_models["flow"],
+                    check_consistency=True,
+                    geo_thresh=auxiliary_models["flow"].args.geo_thresh,
+                    photo_thresh=auxiliary_models["flow"].args.photo_thresh,
+                    interval=interval,
+                )
 
                 # camera loss
                 # if vggt_batch.get("extrinsics") is not None and vggt_batch.get("intrinsics") is not None and vggt_batch.get("point masks") is not None:
@@ -385,21 +439,21 @@ def train(args):
                 #     loss_dict.update(depth_loss_dict)
 
                 # gaussian loss (cross)
-                # if vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
-                #     conf = preds["depth_init_conf"] > 2
-                #     try:
-                #         gaussian_loss_dict, _ = cross_render_and_loss(conf, interval, forward_consist_mask, backward_consist_mask, preds["depth"].detach(), preds["gaussian_params"], preds["velocity"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"], vggt_batch["depths"], vggt_batch["point_masks"])
-                #         loss += gaussian_loss_dict.get("loss_render_rgb", 0.0) + 0.1 * gaussian_loss_dict.get("loss_render_lpips", 0.0) + gaussian_loss_dict.get("loss_render_depth", 0.0) + 0.001 * gaussian_loss_dict.get("loss_velocity", 0.0) 
-                #         loss_dict.update(gaussian_loss_dict)
-                #     except Exception as e:
-                #         print(f"Error in gaussian loss computation: {e}")
-                #         # 添加零损失作为fallback
-                #         loss_dict.update({
-                #             "loss_render_rgb": torch.tensor(0.0, device=device, requires_grad=True),
-                #             "loss_render_lpips": torch.tensor(0.0, device=device, requires_grad=True),
-                #             "loss_render_depth": torch.tensor(0.0, device=device, requires_grad=True),
-                #             "loss_velocity": torch.tensor(0.0, device=device, requires_grad=True),
-                #         })
+                if vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
+                    conf = preds["depth_conf"] > 2
+                    try:
+                        gaussian_loss_dict, _ = cross_render_and_loss(conf, interval, forward_consist_mask, backward_consist_mask, preds["depth"].detach(), preds["gaussian_params"], preds["velocity"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"], vggt_batch["depths"], vggt_batch["point_masks"])
+                        loss += gaussian_loss_dict.get("loss_render_rgb", 0.0) + 0.1 * gaussian_loss_dict.get("loss_render_lpips", 0.0) + gaussian_loss_dict.get("loss_render_depth", 0.0) # + 0.001 * gaussian_loss_dict.get("loss_velocity", 0.0) 
+                        loss_dict.update(gaussian_loss_dict)
+                    except Exception as e:
+                        print(f"Error in gaussian loss computation: {e}")
+                        # 添加零损失作为fallback
+                        loss_dict.update({
+                            "loss_render_rgb": torch.tensor(0.0, device=device, requires_grad=True),
+                            "loss_render_lpips": torch.tensor(0.0, device=device, requires_grad=True),
+                            "loss_render_depth": torch.tensor(0.0, device=device, requires_grad=True),
+                            # "loss_velocity": torch.tensor(0.0, device=device, requires_grad=True),
+                        })
 
                 # self render loss (self)
                 if vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
@@ -416,20 +470,20 @@ def train(args):
                             "loss_self_render_depth": torch.tensor(0.0, device=device, requires_grad=True),
                         })
 
-                # # optical flow -> velocity loss
-                # if vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
-                #     conf = preds["depth_init_conf"] > 2
-                #     try:
-                #         flow_loss_dict = flow_loss(conf, interval, forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, preds["depth"], preds["velocity"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"])
-                #         loss += flow_loss_dict.get("forward_loss", 0.0) # + flow_loss_dict.get("backward_loss", 0.0)
-                #         loss_dict.update(flow_loss_dict)
-                #     except Exception as e:
-                #         print(f"Error in flow loss computation: {e}")
-                #         # 添加零损失作为fallback
-                #         loss_dict.update({
-                #             "forward_loss": torch.tensor(0.0, device=device, requires_grad=True),
-                #             "backward_loss": torch.tensor(0.0, device=device, requires_grad=True),
-                #         })
+                # optical flow -> velocity loss
+                if vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
+                    conf = preds["depth_conf"] > 2
+                    try:
+                        flow_loss_dict = flow_loss(conf, interval, forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, preds["depth"], preds["velocity"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"])
+                        loss += flow_loss_dict.get("forward_loss", 0.0) # + flow_loss_dict.get("backward_loss", 0.0)
+                        loss_dict.update(flow_loss_dict)
+                    except Exception as e:
+                        print(f"Error in flow loss computation: {e}")
+                        # 添加零损失作为fallback
+                        loss_dict.update({
+                            "forward_loss": torch.tensor(0.0, device=device, requires_grad=True),
+                            "backward_loss": torch.tensor(0.0, device=device, requires_grad=True),
+                        })
                 
                 # # SAM2 mask-based velocity consistency loss
                 # if "sam2" in auxiliary_models and vggt_batch.get("images") is not None:
@@ -440,7 +494,7 @@ def train(args):
                 #             auxiliary_models["sam2"],
                 #             device=device
                 #         )
-                #         loss += 10000 * sam2_velocity_loss_dict.get("sam2_velocity_consistency_loss", 0.0)
+                #         loss += sam2_velocity_loss_dict.get("sam2_velocity_consistency_loss", 0.0)
                 #         loss_dict.update(sam2_velocity_loss_dict)
                 #     except Exception as e:
                 #         print(f"Error in SAM2 loss computation: {e}")
@@ -448,6 +502,22 @@ def train(args):
                 #         loss_dict.update({
                 #             "sam2_velocity_consistency_loss": torch.tensor(0.0, device=device, requires_grad=True),
                 #         })
+                
+                # # DAM2 sky mask generation
+                # if "dam2" in auxiliary_models and vggt_batch.get("images") is not None:
+                #     try:
+                #         sky_masks = dam2_sky_mask_generation(
+                #             vggt_batch["images"], 
+                #             auxiliary_models["dam2"],
+                #             device=device
+                #         )
+                #         # 将sky masks添加到vggt_batch中，供后续使用
+                #         vggt_batch["sky_masks"] = sky_masks
+                #     except Exception as e:
+                #         print(f"Error in DAM2 sky mask generation: {e}")
+                #         # 添加空的sky masks作为fallback
+                #         B, S, C, H, W = vggt_batch["images"].shape
+                #         vggt_batch["sky_masks"] = torch.zeros(B, S, H, W, device=device)
                 
                 loss_value = float(loss)
                 
@@ -1078,6 +1148,59 @@ def sam2_velocity_consistency_loss(images, velocity, sam2_model, device):
     from vggt.training.loss import sam2_velocity_consistency_loss_impl
     
     return sam2_velocity_consistency_loss_impl(images, velocity, sam2_model, device)
+
+
+def dam2_sky_mask_generation(images, dam2_model, device):
+    """
+    Generate sky masks using DAM2 depth predictions.
+    
+    Args:
+        images: [B, S, 3, H, W] - input images in range [0, 1]
+        dam2_model: DepthAnythingV2 model instance
+        device: torch device
+    
+    Returns:
+        torch.Tensor: [B, S, H, W] - sky masks where 1 indicates sky (depth=0) regions
+    """
+    B, S, C, H, W = images.shape
+    sky_masks = torch.zeros(B, S, H, W, device=device)
+    
+    with torch.no_grad():
+        for b in range(B):
+            for s in range(S):
+                # 获取单张图片
+                img = images[b, s]  # [3, H, W]
+                
+                # 转换为numpy格式用于DAM2推理
+                img_np = (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                img_np = np.clip(img_np, 0, 255)
+                
+                # 使用DAM2预测深度
+                depth = dam2_model.infer_image(img_np, input_size=518)
+                
+                # 将深度转换为tensor
+                depth_tensor = torch.from_numpy(depth).to(device)
+                
+                # 调整深度图尺寸以匹配原图
+                if depth_tensor.shape != (H, W):
+                    depth_tensor = F.interpolate(
+                        depth_tensor.unsqueeze(0).unsqueeze(0), 
+                        size=(H, W), 
+                        mode='bilinear', 
+                        align_corners=True
+                    ).squeeze(0).squeeze(0)
+                
+                # 生成sky mask：深度值接近0的区域被认为是天空
+                # 使用阈值来识别深度为0的区域
+                depth_threshold = 0.1  # 可以根据需要调整阈值
+                sky_mask = (depth_tensor < depth_threshold).float()
+                
+                # 可选：使用形态学操作来平滑mask
+                # 这里可以添加开运算和闭运算来改善mask质量
+                
+                sky_masks[b, s] = sky_mask
+    
+    return sky_masks
 
 
 def cut3r_batch_to_vggt(views):
