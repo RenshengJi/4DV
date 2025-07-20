@@ -41,13 +41,13 @@ def parse_args():
     parser.add_argument(
         "--model_path",
         type=str,
-        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/self/checkpoint-epoch_0_6828.pth",
+        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(true+fixmodel+lowlr!+nolpips+onlyflow)/checkpoint-epoch_0_52448.pth",
         help="Path to the pretrained model checkpoint.",
     )
     parser.add_argument(
         "--model_velocity_path",
         type=str,
-        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/flow-samweight1/checkpoint-epoch_0_8344.pth",
+        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(true+fixmodel+lowlr!+nolpips+onlyflow)/checkpoint-epoch_0_52448.pth",
         help="Path to the pretrained model checkpoint.",
     )
     parser.add_argument(
@@ -71,7 +71,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./results_sam_8344",
+        default="./results_flow_52448",
         help="value for tempfile.tempdir",
     )
     parser.add_argument(

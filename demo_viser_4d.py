@@ -38,17 +38,18 @@ from raft import RAFT
 from vggt.utils.auxiliary import RAFTCfg, calc_flow
 
 
-def viser_wrapper(
+def viser_wrapper_4d(
     pred_dict: dict,
     port: int = 8080,
     init_conf_threshold: float = 50.0,  # represents percentage (e.g., 50 means filter lowest 50%)
+    init_velocity_threshold: float = 0.1,  # 初始速度阈值
     use_point_map: bool = False,
     background_mode: bool = False,
     mask_sky: bool = False,
     image_folder: str = None,
 ):
     """
-    Visualize predicted 3D points and camera poses with viser.
+    Visualize predicted 3D points and camera poses with viser, with 4D dynamic/static separation.
 
     Args:
         pred_dict (dict):
@@ -60,9 +61,11 @@ def viser_wrapper(
                 "depth_conf": (S, H, W),
                 "extrinsic": (S, 3, 4),
                 "intrinsic": (S, 3, 3),
+                "velocity": (S-1, H, W, 3),  # 速度场
             }
         port (int): Port number for the viser server.
         init_conf_threshold (float): Initial percentage of low-confidence points to filter out.
+        init_velocity_threshold (float): Initial velocity threshold for static/dynamic separation.
         use_point_map (bool): Whether to visualize world_points or use depth-based points.
         background_mode (bool): Whether to run the server in background thread.
         mask_sky (bool): Whether to apply sky segmentation to filter out sky points.
@@ -75,53 +78,42 @@ def viser_wrapper(
 
     # Unpack prediction dict
     images = pred_dict["images"]  # (S, 3, H, W)
-
     depth_map = pred_dict["depth"]  # (S, H, W, 1)
     depth_conf = pred_dict["depth_conf"]  # (S, H, W)
-
     extrinsics_cam = pred_dict["extrinsic"]  # (S, 3, 4)
     intrinsics_cam = pred_dict["intrinsic"]  # (S, 3, 3)
+    velocity = pred_dict["velocity"]  # (S, H, W, 3)
 
     world_points = unproject_depth_map_to_point_map(depth_map, extrinsics_cam, intrinsics_cam)
     conf = depth_conf
-
-    world_points_in_next = pred_dict["pts_in_next_frame"]
-    world_points_in_next = np.concatenate(
-        [world_points_in_next, np.zeros_like(world_points_in_next[:1])], axis=0
-    )
-    world_points_in_next_mask = pred_dict["pts_in_next_frame_mask"]
-    world_points_in_next_mask = np.concatenate(
-        [world_points_in_next_mask, np.zeros_like(world_points_in_next_mask[:1])], axis=0
-    )
 
     # Apply sky segmentation if enabled
     if mask_sky and image_folder is not None:
         conf = apply_sky_segmentation(conf, image_folder)
 
     # Convert images from (S, 3, H, W) to (S, H, W, 3)
-    # Then flatten everything for the point cloud
     colors = images.transpose(0, 2, 3, 1)  # now (S, H, W, 3)
     S, H, W, _ = world_points.shape
 
-    # Flatten
+    # 计算速度幅值用于动静态分离
+    velocity_magnitude = np.linalg.norm(velocity, axis=-1)  # (S, H, W)
+    
+    
+
+    # Flatten all data
     points = world_points.reshape(-1, 3)
     colors_flat = (colors.reshape(-1, 3) * 255).astype(np.uint8)
     conf_flat = conf.reshape(-1)
-    points_in_next = world_points_in_next.reshape(-1, 3)
-    points_in_next_mask = world_points_in_next_mask.reshape(-1)
+    velocity_magnitude_flat = velocity_magnitude.reshape(-1)
+    frame_indices = np.repeat(np.arange(S), H * W)
 
-    cam_to_world_mat = closed_form_inverse_se3(extrinsics_cam)  # shape (S, 4, 4) typically
-    # For convenience, we store only (3,4) portion
+    cam_to_world_mat = closed_form_inverse_se3(extrinsics_cam)
     cam_to_world = cam_to_world_mat[:, :3, :]
 
     # Compute scene center and recenter
     scene_center = np.mean(points, axis=0)
     points_centered = points - scene_center
     cam_to_world[..., -1] -= scene_center
-    points_in_next = points_in_next - scene_center
-
-    # Store frame indices so we can filter by frame
-    frame_indices = np.repeat(np.arange(S), H * W)
 
     # Build the viser GUI
     gui_show_frames = server.gui.add_checkbox(
@@ -129,7 +121,6 @@ def viser_wrapper(
         initial_value=True,
     )
 
-    # Now the slider represents percentage of points to filter out
     gui_points_conf = server.gui.add_slider(
         "Confidence Percent",
         min=0,
@@ -138,16 +129,42 @@ def viser_wrapper(
         initial_value=init_conf_threshold,
     )
 
-    gui_frame_selector = server.gui.add_dropdown(
-        "Show Points from Frames",
-        options=["All"] + [str(i) for i in range(S)],
-        initial_value="All",
+    gui_velocity_threshold = server.gui.add_slider(
+        "Velocity Threshold",
+        min=0.0,
+        max=2.0,
+        step=0.01,
+        initial_value=init_velocity_threshold,
     )
 
-    gui_show_next_frame = server.gui.add_button("Next Frame")
-    gui_show_prev_frame = server.gui.add_button("Previous Frame")
-    gui_anchor = server.gui.add_checkbox(
-        "Anchor Points",
+    gui_frame_slider = server.gui.add_slider(
+        "Dynamic Frame",
+        min=0,
+        max=S-1,
+        step=1,
+        initial_value=0,
+    )
+
+    gui_auto_play = server.gui.add_checkbox(
+        "Auto Play",
+        initial_value=False,
+    )
+
+    gui_playback_speed = server.gui.add_slider(
+        "Playback Speed (FPS)",
+        min=0.1,
+        max=10.0,
+        step=0.1,
+        initial_value=2.0,
+    )
+
+    gui_show_static = server.gui.add_checkbox(
+        "Show Static Points",
+        initial_value=True,
+    )
+
+    gui_show_dynamic = server.gui.add_checkbox(
+        "Show Dynamic Points",
         initial_value=True,
     )
 
@@ -159,14 +176,27 @@ def viser_wrapper(
         initial_value=0.002,
     )
 
-    # Create the main point cloud handle
-    # Compute the threshold value as the given percentile
+    # 创建静态和动态点云
     init_threshold_val = np.percentile(conf_flat, init_conf_threshold)
     init_conf_mask = (conf_flat >= init_threshold_val) & (conf_flat > 0.1)
-    point_cloud = server.scene.add_point_cloud(
-        name="viser_pcd",
-        points=points_centered[init_conf_mask],
-        colors=colors_flat[init_conf_mask],
+    init_velocity_mask = velocity_magnitude_flat <= init_velocity_threshold
+    
+    # 静态点云
+    static_mask = init_conf_mask & init_velocity_mask
+    static_point_cloud = server.scene.add_point_cloud(
+        name="static_pcd",
+        points=points_centered[static_mask],
+        colors=colors_flat[static_mask],
+        point_size=0.002,
+        point_shape="circle",
+    )
+
+    # 动态点云（初始显示第0帧）
+    dynamic_mask = init_conf_mask & (velocity_magnitude_flat > init_velocity_threshold) & (frame_indices == 0)
+    dynamic_point_cloud = server.scene.add_point_cloud(
+        name="dynamic_pcd",
+        points=points_centered[dynamic_mask],
+        colors=colors_flat[dynamic_mask],
         point_size=0.002,
         point_shape="circle",
     )
@@ -174,6 +204,10 @@ def viser_wrapper(
     # We will store references to frames & frustums so we can toggle visibility
     frames: List[viser.FrameHandle] = []
     frustums: List[viser.CameraFrustumHandle] = []
+    
+    # 自动播放相关变量
+    last_play_time = time.time()
+    current_frame_index = 0
 
     def visualize_frames(extrinsics: np.ndarray, images_: np.ndarray) -> None:
         """
@@ -237,80 +271,68 @@ def viser_wrapper(
             frustums.append(frustum_cam)
             attach_callback(frustum_cam, frame_axis)
 
-    def update_point_cloud() -> None:
-        """Update the point cloud based on current GUI selections."""
-        # Here we compute the threshold value based on the current percentage
+    def update_point_clouds() -> None:
+        """Update both static and dynamic point clouds based on current GUI selections."""
+        # 计算置信度阈值
         current_percentage = gui_points_conf.value
         threshold_val = np.percentile(conf_flat, current_percentage)
-
-        print(f"Threshold absolute value: {threshold_val}, percentage: {current_percentage}%")
-
         conf_mask = (conf_flat >= threshold_val) & (conf_flat > 1e-5)
-
-        if gui_frame_selector.value == "All":
-            frame_mask = np.ones_like(conf_mask, dtype=bool)
-        else:
-            selected_idx = int(gui_frame_selector.value)
-            frame_mask = frame_indices == selected_idx
-
-        combined_mask = conf_mask & frame_mask
-        # point_cloud.points = points_in_next[combined_mask]
-        if gui_anchor.value == False:
-            point_cloud.points = points_in_next[combined_mask]
-        else:
-            point_cloud.points = points_centered[combined_mask]
-        point_cloud.colors = colors_flat[combined_mask]
+        
+        # 计算速度阈值
+        velocity_threshold = gui_velocity_threshold.value
+        velocity_mask = velocity_magnitude_flat <= velocity_threshold
+        
+        # 更新静态点云
+        static_mask = conf_mask & velocity_mask
+        static_point_cloud.points = points_centered[static_mask]
+        static_point_cloud.colors = colors_flat[static_mask]
+        
+        # 更新动态点云
+        current_frame = int(gui_frame_slider.value)
+        dynamic_mask = conf_mask & (velocity_magnitude_flat > velocity_threshold) & (frame_indices == current_frame)
+        dynamic_point_cloud.points = points_centered[dynamic_mask]
+        dynamic_point_cloud.colors = colors_flat[dynamic_mask]
 
     @gui_points_conf.on_update
     def _(_) -> None:
-        update_point_cloud()
+        update_point_clouds()
 
-    @gui_frame_selector.on_update
+    @gui_velocity_threshold.on_update
     def _(_) -> None:
-        update_point_cloud()
+        update_point_clouds()
 
-    @gui_show_next_frame.on_click
+    @gui_frame_slider.on_update
     def _(_) -> None:
-        """Toggle visibility of next frame points."""
-        if gui_frame_selector.value == "All":
-            return
-        selected_idx = int(gui_frame_selector.value)
-        if gui_anchor.value:
-            gui_anchor.value = False
-            selected_idx = int(gui_frame_selector.value)
-            frame_mask = frame_indices == selected_idx
-            conf_mask = (conf_flat >= np.percentile(conf_flat, gui_points_conf.value)) & (conf_flat > 0.1)
-            combined_mask = frame_mask & points_in_next_mask & conf_mask
-            point_cloud.points = points_in_next[combined_mask]
-            point_cloud.colors = colors_flat[combined_mask]
-        else:
-            gui_anchor.value = True
-            gui_frame_selector.value = str(selected_idx + 1 if selected_idx + 1 < S else 0)
+        update_point_clouds()
 
-    @gui_show_prev_frame.on_click
+    @gui_auto_play.on_update
     def _(_) -> None:
-        """Toggle visibility of previous frame points."""
-        if gui_frame_selector.value == "All":
-            return
-        selected_idx = int(gui_frame_selector.value)
-        if gui_anchor.value:
-            gui_anchor.value = False
-            gui_frame_selector.value = str(selected_idx - 1 if selected_idx > 0 else S - 1)
-            selected_idx = int(gui_frame_selector.value)
-            frame_mask = frame_indices == selected_idx
-            conf_mask = (conf_flat >= np.percentile(conf_flat, gui_points_conf.value)) & (conf_flat > 0.1)
-            combined_mask = frame_mask & points_in_next_mask & conf_mask
-            point_cloud.points = points_in_next[combined_mask]
-            point_cloud.colors = colors_flat[combined_mask]
-        else:
-            gui_anchor.value = True
-            update_point_cloud()
+        """Toggle auto play mode."""
+        nonlocal current_frame_index
+        if not gui_auto_play.value:
+            # 停止自动播放时，重置到当前滑块位置
+            current_frame_index = int(gui_frame_slider.value)
 
+    @gui_playback_speed.on_update
+    def _(_) -> None:
+        """Update playback speed."""
+        pass  # 速度更新在自动播放循环中处理
+
+    @gui_show_static.on_update
+    def _(_) -> None:
+        """Toggle visibility of static point cloud."""
+        static_point_cloud.visible = gui_show_static.value
+
+    @gui_show_dynamic.on_update
+    def _(_) -> None:
+        """Toggle visibility of dynamic point cloud."""
+        dynamic_point_cloud.visible = gui_show_dynamic.value
 
     @gui_point_size.on_update
     def _(_) -> None:
-        """Update the point size of the point cloud."""
-        point_cloud.point_size = gui_point_size.value
+        """Update the point size of both point clouds."""
+        static_point_cloud.point_size = gui_point_size.value
+        dynamic_point_cloud.point_size = gui_point_size.value
 
     @gui_show_frames.on_update
     def _(_) -> None:
@@ -335,6 +357,20 @@ def viser_wrapper(
         thread.start()
     else:
         while True:
+            # 自动播放逻辑
+            if gui_auto_play.value:
+                current_time = time.time()
+                frame_interval = 1.0 / gui_playback_speed.value
+                
+                if current_time - last_play_time >= frame_interval:
+                    # 更新帧索引
+                    current_frame_index = (current_frame_index + 1) % S
+                    gui_frame_slider.value = current_frame_index
+                    last_play_time = current_time
+                    
+                    # 更新点云
+                    update_point_clouds()
+            
             time.sleep(0.01)
 
     return server
@@ -393,82 +429,20 @@ def apply_sky_segmentation(conf: np.ndarray, image_folder: str) -> np.ndarray:
     return conf
 
 
-def get_next_pts(preds, pred_pts=False):
-    images = preds["images"]
-    depthmaps = preds["depth"]
-    extrinsic, intrinsic = pose_encoding_to_extri_intri(preds["pose_enc"], images.shape[-2:])
-    pad_row = torch.tensor([0, 0, 0, 1], device=images.device)[None, None, None].expand(*extrinsic.shape[:-2], -1, -1)
-    extrinsic = torch.cat([extrinsic, pad_row], dim=-2)
-    B, S, H, W, _ = depthmaps.shape
-    world_points, _, world_points_mask = unproject_depth_map_to_point_map_batch(
-        depthmaps.reshape(B * S, H, W, -1),
-        extrinsic.reshape(B * S, 4, 4),
-        intrinsic.reshape(B * S, 3, 3),
-    )
-    world_points = world_points.reshape(B, S, H, W, 3)
-    world_points_mask = world_points_mask.reshape(B, S, H, W)
 
-    velocity = preds.pop("velocity")
-    velocity = torch.sign(velocity) * (torch.exp(torch.abs(velocity)) - 1)
-
-    pts_in_next = world_points + velocity
-    pts_in_next = pts_in_next[:, :-1]  # remove the last frame
-    pts_in_next_mask = torch.ones_like(pts_in_next[..., 0], dtype=torch.bool)
-    preds["pts_in_next_frame"] = pts_in_next
-    preds["pts_in_next_frame_mask"] = pts_in_next_mask
-    return preds
-
-
-def get_next_pts_by_flow(preds, forward_flow, forward_consist_mask, pred_pts=False):
-    images = preds["images"]
-    depthmaps = preds["depth"]
-    extrinsic, intrinsic = pose_encoding_to_extri_intri(preds["pose_enc"], images.shape[-2:])
-    pad_row = torch.tensor([0, 0, 0, 1], device=images.device)[None, None, None].expand(*extrinsic.shape[:-2], -1, -1)
-    extrinsic = torch.cat([extrinsic, pad_row], dim=-2)
-    B, S, H, W, _ = depthmaps.shape
-    world_points, _, world_points_mask = unproject_depth_map_to_point_map_batch(
-        depthmaps.reshape(B * S, H, W, -1),
-        extrinsic.reshape(B * S, 4, 4),
-        intrinsic.reshape(B * S, 3, 3),
-    )
-    world_points = world_points.reshape(B, S, H, W, 3)
-    world_points_mask = world_points_mask.reshape(B, S, H, W)
-
-
-    forward_consist_mask = torch.ones_like(forward_consist_mask, dtype=torch.bool)
-    inds = torch.nonzero(forward_consist_mask, as_tuple=True)
-    init_pos_b, init_pos_t, _, init_pos_h, init_pos_w = inds
-    flow = forward_flow[init_pos_b, init_pos_t, :, init_pos_h, init_pos_w]
-
-    warped_pos_b = init_pos_b
-    T = world_points.shape[1]
-    warped_pos_t = (init_pos_t + 2).clamp(min=0, max=T-1)
-
-    warped_pos_h = (init_pos_h + flow[:, 1]).clamp(min=0, max=H-1).round().long()
-    warped_pos_w = (init_pos_w + flow[:, 0]).clamp(min=0, max=W-1).round().long()
-    world_points = world_points[warped_pos_b, warped_pos_t, warped_pos_h, warped_pos_w, :]
-
-
-    pts_in_next_mask = torch.ones_like(world_points[..., 0], dtype=torch.bool)
-    preds["pts_in_next_frame"] = world_points.unsqueeze(0)
-    preds["pts_in_next_frame_mask"] = pts_in_next_mask.unsqueeze(0)
-    return preds
-
-
-
-parser = argparse.ArgumentParser(description="VGGT demo with viser for 3D visualization")
+parser = argparse.ArgumentParser(description="VGGT demo with viser for 4D visualization")
 # parser.add_argument(
 #     "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/val/segment-1505698981571943321_1186_773_1206_773_with_camera_labels.tfrecord", help="Path to folder containing images"
 # )
 # parser.add_argument(
 #     "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train/segment-15795616688853411272_1245_000_1265_000_with_camera_labels.tfrecord", help="Path to folder containing images"
 # )
-parser.add_argument(
-    "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train/segment-10023947602400723454_1120_000_1140_000_with_camera_labels.tfrecord", help="Path to folder containing images"
-)
 # parser.add_argument(
-#     "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train/segment-14830022845193837364_3488_060_3508_060_with_camera_labels.tfrecord", help="Path to folder containing images"
+#     "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train/segment-10023947602400723454_1120_000_1140_000_with_camera_labels.tfrecord", help="Path to folder containing images"
 # )
+parser.add_argument(
+    "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train/segment-10226164909075980558_180_000_200_000_with_camera_labels.tfrecord", help="Path to folder containing images"
+)
 parser.add_argument(
     "--image_interval", type=int, default=1, help="Interval for selecting images from the folder"
 )
@@ -478,20 +452,23 @@ parser.add_argument("--port", type=int, default=8080, help="Port number for the 
 parser.add_argument(
     "--conf_threshold", type=float, default=50.0, help="Initial percentage of low-confidence points to filter out"
 )
+parser.add_argument(
+    "--velocity_threshold", type=float, default=0.1, help="Initial velocity threshold for static/dynamic separation"
+)
 parser.add_argument("--pred_pts", action="store_true", help="Use next frame points in local coordinate")
 parser.add_argument("--mask_sky", action="store_true", help="Apply sky segmentation to filter out sky points")
 parser.add_argument("--debug", action="store_true", help="Enable debug mode for additional logging")
 
 def main():
     """
-    Main function for the VGGT demo with viser for 3D visualization.
+    Main function for the VGGT demo with viser for 4D visualization.
 
     This function:
     1. Loads the VGGT model
     2. Processes input images from the specified folder
     3. Runs inference to generate 3D points and camera poses
-    4. Optionally applies sky segmentation to filter out sky points
-    5. Visualizes the results using viser
+    4. Separates static and dynamic points based on velocity threshold
+    5. Visualizes the results using viser with 4D capabilities
 
     Command-line arguments:
     --image_folder: Path to folder containing input images
@@ -499,6 +476,7 @@ def main():
     --background_mode: Run the viser server in background mode
     --port: Port number for the viser server
     --conf_threshold: Initial percentage of low-confidence points to filter out
+    --velocity_threshold: Initial velocity threshold for static/dynamic separation
     --mask_sky: Apply sky segmentation to filter out sky points
     """
     args = parser.parse_args()
@@ -511,26 +489,10 @@ def main():
     print(f"Using device: {device}")
 
     print("Initializing and loading VGGT model...")
-    # model = VGGT.from_pretrained("facebook/VGGT-1B")
-
     model = VGGT()
-    # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(flow)/checkpoint-epoch_0_52080.pth", map_location=device)['model']
-    # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(fix_mask)/checkpoint-epoch_1_31892.pth", map_location=device)['model']
-    # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/debug_fix-intrinsics-bug/checkpoint-epoch_2_35070.pth", map_location=device)['model']
-    # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step1/checkpoint-epoch_1_6762.pth", map_location=device)['model']
-    # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(fix_mask+nometric+fixgs)/checkpoint-epoch_0_53533.pth", map_location=device)['model']
-    # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(fix_mask+nometric+fixgs+depth+fixlpips)/checkpoint-epoch_1_37587.pth", map_location=device)['model']
-    # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(fix_mask+nometric+fixgs+depth+fixlpips)/checkpoint-epoch_0_39865.pth", map_location=device)['model']
-    # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(fix_mask+nometric+fixgs+depth+fixlpips+lowvelocity+fixrepeat+l1loss)/checkpoint-epoch_1_30992.pth", map_location=device)['model']
-    # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(fix_mask+nometric+fixgs+depth+fixlpips+lowvelocity+fixrepeat+l1loss+onlyforward+novelocityreg)/checkpoint-epoch_2_2384.pth", map_location=device)['model']
-    # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(fix_mask+nometric+fixgs+depth+fixlpips+lowvelocity+fixrepeat+l1loss+onlyforward+novelocityreg)/checkpoint-epoch_0_30992.pth", map_location=device)['model']
-    # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(fix_mask+nometric+fixgs+depth+fixlpips+lowvelocity+fixrepeat+l1loss+onlyforward+novelocityreg+finetune10conf)/checkpoint-epoch_1_7152.pth", map_location=device)['model']
-    # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(onlyflow+lr)/checkpoint-epoch_0_3576.pth", map_location=device)['model']
     ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(true+fixmodel+lowlr!+nolpips+onlyflow)/checkpoint-epoch_0_52448.pth", map_location=device)['model']
-    # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/flow-samweight1/checkpoint-epoch_0_7152.pth", map_location=device)['model']
     ckpt = {k.replace("module.", ""): v for k, v in ckpt.items()}
     model.load_state_dict(ckpt, strict=False)
-    # model.load_state_dict(torch.load("src/model.pt"), strict=False)
 
     model.eval()
     model = model.to(device)
@@ -550,16 +512,11 @@ def main():
     image_names = glob.glob(os.path.join(args.image_folder, "*.jpg")) + glob.glob(os.path.join(args.image_folder, "*.png"))
     # 只提取_后面是1.jpg或.png的图片
     image_names = [name for name in image_names if name.split("/")[-1].split("_")[-1] in ["1.jpg", "1.png"]]
-    # image_names = sorted(image_names)[::args.image_interval][:8][::-1]
-    image_names = sorted(image_names)[::args.image_interval][60:84]
-    # image_names = sorted(image_names)[::args.image_interval][:24]
-    # 第一个不变，其他逆序
-    # image_names = [image_names[0]] + image_names[1:][::-1]
+    image_names = sorted(image_names)[::args.image_interval][100:124]
     print(f"Found {len(image_names)} images")
 
     images = load_and_preprocess_images(image_names).to(device)
     print(f"Preprocessed images shape: {images.shape}")
-
 
     # 将images保存为video
     video_path = os.path.join("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo", "video.mp4")
@@ -609,8 +566,6 @@ def main():
         import traceback
         traceback.print_exc()
 
-
-
     print("Running inference...")
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
@@ -623,18 +578,6 @@ def main():
     predictions["extrinsic"] = extrinsic
     predictions["intrinsic"] = intrinsic
     
-    predictions = get_next_pts(predictions, pred_pts=args.pred_pts)
-
-    # interval = 2
-    # forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, forward_in_bound_mask, backward_in_bound_mask = calc_flow(
-    #                 images.unsqueeze(0), auxiliary_models["flow"],
-    #                 check_consistency=True,
-    #                 geo_thresh=auxiliary_models["flow"].args.geo_thresh,
-    #                 photo_thresh=auxiliary_models["flow"].args.photo_thresh,
-    #                 interval=interval,
-    #             )
-    # predictions = get_next_pts_by_flow(predictions, forward_flow, forward_consist_mask, pred_pts=args.pred_pts)
-
     print("Processing model outputs...")
     for key in predictions.keys():
         if isinstance(predictions[key], torch.Tensor):
@@ -648,25 +591,20 @@ def main():
     if args.mask_sky:
         print("Sky segmentation enabled - will filter out sky points")
 
-    print("Starting viser visualization...")
+    print("Starting viser 4D visualization...")
 
-    viser_server = viser_wrapper(
+    viser_server = viser_wrapper_4d(
         predictions,
         port=args.port,
         init_conf_threshold=args.conf_threshold,
+        init_velocity_threshold=args.velocity_threshold,
         use_point_map=args.use_point_map,
         background_mode=args.background_mode,
         mask_sky=args.mask_sky,
         image_folder=args.image_folder,
     )
-    print("Visualization complete")
+    print("4D Visualization complete")
 
 
 if __name__ == "__main__":
-    # import debugpy
-    # debugpy.listen(("localhost", 5678))
-    # print("Waiting for debugger to attach...")
-    # debugpy.wait_for_client()
-    main()
-
-
+    main() 
