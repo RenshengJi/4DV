@@ -41,13 +41,13 @@ def parse_args():
     parser.add_argument(
         "--model_path",
         type=str,
-        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(true+fixmodel+lowlr!+nolpips+onlyflow)/checkpoint-epoch_0_52448.pth",
+        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(true+fixmodel+lowlr!+nolpips+onlyflow+velocitylocal)/checkpoint-epoch_0_1192.pth",
         help="Path to the pretrained model checkpoint.",
     )
     parser.add_argument(
         "--model_velocity_path",
         type=str,
-        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(true+fixmodel+lowlr!+nolpips+onlyflow)/checkpoint-epoch_0_52448.pth",
+        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(true+fixmodel+lowlr!+nolpips+onlyflow+velocitylocal)/checkpoint-epoch_0_1192.pth",
         help="Path to the pretrained model checkpoint.",
     )
     parser.add_argument(
@@ -320,10 +320,11 @@ def main():
     while True:
         print(f"\n========== Running inference for idx={idx} ==========")
         args.idx = idx
-        try:
-            run_inference(dataset, model, device, args)
-        except Exception as e:
-            print(f"Error at idx={idx}: {e}")
+        run_inference(dataset, model, device, args)
+        # try:
+        #     run_inference(dataset, model, device, args)
+        # except Exception as e:
+        #     print(f"Error at idx={idx}: {e}")
         idx += 200
 
 if __name__ == "__main__":

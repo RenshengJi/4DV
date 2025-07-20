@@ -7,3 +7,6 @@
 [submodule "src/dam2"]
 	path = src/dam2
 	url = https://github.com/DepthAnything/Depth-Anything-V2.git
+[submodule "src/storm"]
+	path = src/storm
+	url = https://github.com/NVlabs/GaussianSTORM.git
