@@ -41,13 +41,13 @@ def parse_args():
     parser.add_argument(
         "--model_path",
         type=str,
-        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(true+fixmodel+lowlr!+nolpips+onlyflow+velocitylocal)/checkpoint-epoch_0_1192.pth",
+        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(true+fixmodel+lowlr!+nolpips+onlyflow+velocitylocal+fromscratch)/checkpoint-epoch_0_4768.pth",
         help="Path to the pretrained model checkpoint.",
     )
     parser.add_argument(
         "--model_velocity_path",
         type=str,
-        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(true+fixmodel+lowlr!+nolpips+onlyflow+velocitylocal)/checkpoint-epoch_0_1192.pth",
+        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(true+fixmodel+lowlr!+nolpips+onlyflow+velocitylocal+fromscratch)/checkpoint-epoch_0_4768.pth",
         help="Path to the pretrained model checkpoint.",
     )
     parser.add_argument(
