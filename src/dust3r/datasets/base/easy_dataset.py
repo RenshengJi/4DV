@@ -46,7 +46,7 @@ class EasyDataset:
             self,
             batch_size,
             num_of_aspect_ratios,
-            8 if not fixed_length else num_of_views,
+            4 if not fixed_length else num_of_views,
             num_of_views,
             world_size,
             warmup=1,

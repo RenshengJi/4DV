@@ -1,21 +1,17 @@
 # debug: True
 model: "VGGT(img_size=518, patch_size=14, embed_dim=1024)"
-# pretrained: /mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step1/checkpoint-epoch_1_5635.pth
-# pretrained: /mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(fix_mask)/checkpoint-epoch_1_31892.pth
-# pretrained: /mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(flow)/checkpoint-epoch_0_50778.pth
-# pretrained: /mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(fix_mask+nometric+fixgs+depth+fixlpips+lowvelocity+fixrepeat+l1loss+onlyforward+novelocityreg)/checkpoint-epoch_2_2384.pth
-pretrained: /mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/self/checkpoint-epoch_0_6828.pth
-# pretrained_init: /mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(fix_mask+nometric+fixgs+depth+fixlpips+lowvelocity+fixrepeat+l1loss+onlyforward+novelocityreg)/checkpoint-epoch_2_2384.pth
-pretrained_init: /mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/self/checkpoint-epoch_0_6828.pth
+pretrained: /mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(true+fixmodel+lowlr!+nolpips+onlyflow+velocitylocal+fromscratch)/checkpoint-epoch_2_17880.pth
+
 
 auxiliary_models:
   flow: RAFT(RAFTCfg(name="kitti-M", dataset="kitti", path="Tartan-C-T-TSKH-kitti432x960-M.pth",
     use_var=True, var_min=0, var_max=10, pretrain="resnet34", initial_dim=64, block_dims=[64, 128, 256],
     radius=4, dim=128, num_blocks=2, iters=4, image_size=[432, 960],
     offload=${offload_auxiliary}, geo_thresh=2, photo_thresh=-1))
-  sam2: SAM2Base(config_file="sam2.1_hiera_t.yaml", path="sam2.1_hiera_tiny.pt",
-    offload=${offload_auxiliary})
-  # dam2: DepthAnythingV2(encoder="vitb", offload=${offload_auxiliary})
+  # sam2: SAM2Base(config_file="sam2.1_hiera_t.yaml", path="sam2.1_hiera_tiny.pt",
+  #   offload=${offload_auxiliary})
+  dam2: DepthAnythingV2(encoder="vitb", offload=${offload_auxiliary})
+  vggt_teacher: VGGT(path="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/model.pt", offload=${offload_auxiliary})
 
 offload_auxiliary: False
 load_only_encoder: False
@@ -23,7 +19,7 @@ long_context: True
 fixed_length: False
 resume: null
 benchmark: False
-num_views : 24
+num_views : 4
 num_test_views : 16
 n_corres_train: 0
 n_corres_test: 0
@@ -68,8 +64,8 @@ save_dir: 'checkpoints/waymo'
 # exp_name: 'step2(fix_mask+nometric+fixgs+depth+fixlpips+lowvelocity+fixrepeat+l1loss+onlyforward+novelocityreg+finetune10conf)'
 # exp_name: 'step2(onlyflow+lr+interval)'
 # exp_name: 'flow-samweight1'
-# exp_name: 'debug'
-exp_name: 'step2(true+fixmodel+lowlr!+nolpips+onlyflow+velocitylocal+fromscratch)'
+exp_name: 'new_all_freezehead'
+# exp_name: 'step2(true+fixmodel+lowlr!+nolpips+onlyflow+velocitylocal+fromscratch)'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/

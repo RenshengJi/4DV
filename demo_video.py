@@ -41,13 +41,7 @@ def parse_args():
     parser.add_argument(
         "--model_path",
         type=str,
-        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(true+fixmodel+lowlr!+nolpips+onlyflow+velocitylocal+fromscratch)/checkpoint-epoch_0_4768.pth",
-        help="Path to the pretrained model checkpoint.",
-    )
-    parser.add_argument(
-        "--model_velocity_path",
-        type=str,
-        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(true+fixmodel+lowlr!+nolpips+onlyflow+velocitylocal+fromscratch)/checkpoint-epoch_0_4768.pth",
+        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/new_all_freezehead/checkpoint-epoch_0_1329.pth",
         help="Path to the pretrained model checkpoint.",
     )
     parser.add_argument(
@@ -71,7 +65,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./results_flow_52448",
+        default="./results",
         help="value for tempfile.tempdir",
     )
     parser.add_argument(
@@ -137,7 +131,7 @@ def prepare_output(preds, vggt_batch):
     from src.dust3r.utils.geometry import geotrf
     from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
-    conf = preds["depth_conf"] > 10
+    conf = preds["depth_conf"] > 0.0
     interval = 2
 
 
@@ -301,15 +295,10 @@ def main():
 
     # Load and prepare the model.
     print(f"Loading model from {args.model_path}...")
-    model = VGGT(img_size=518, patch_size=14, embed_dim=1024)
+    model = VGGT(img_size=518, patch_size=14, embed_dim=1024, use_sky_token=False)
     ckpt = torch.load(args.model_path, map_location=device)['model']
     ckpt = {k.replace("module.", ""): v for k, v in ckpt.items()}
     model.load_state_dict(ckpt, strict=False)
-    del ckpt
-    ckpt = torch.load(args.model_velocity_path, map_location=device)['model']
-    ckpt = {k.replace("module.", ""): v for k, v in ckpt.items()}
-    ckpt = {k.replace("velocity_head.", ""): v for k, v in ckpt.items()}
-    model.velocity_head.load_state_dict(ckpt, strict=False)
     del ckpt
 
 

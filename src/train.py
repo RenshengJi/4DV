@@ -26,8 +26,9 @@ import sys
 # 添加vggt路径
 sys.path.append(os.path.join(os.path.dirname(__file__), 'vggt'))
 from vggt.vggt.models.vggt import VGGT
-from vggt.training.loss import camera_loss, depth_loss, point_loss, cross_render_and_loss, flow_loss, self_render_and_loss, velocity_loss
+from vggt.training.loss import camera_loss, depth_loss, point_loss, cross_render_and_loss, flow_loss, self_render_and_loss, velocity_loss, sky_opacity_loss, sky_color_loss, vggt_distillation_loss
 from vggt.utils.auxiliary import RAFTCfg, calc_flow
+from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
 # ===== SAM2相关导入 =====
 # 添加sam2路径
@@ -219,11 +220,6 @@ def train(args):
         ckpt = {k.replace("module.", ""): v for k, v in ckpt.items()}
         model.load_state_dict(ckpt, strict=False)
         del ckpt
-        ckpt = torch.load(args.pretrained_init, map_location=device)['model']
-        ckpt = {k.replace("module.", ""): v for k, v in ckpt.items()}
-        ckpt = {k.replace("velocity_head.", ""): v for k, v in ckpt.items()}
-        model.velocity_head.load_state_dict(ckpt, strict=False)
-        del ckpt
         
 
     auxiliary_model_configs = getattr(args, "auxiliary_models", None)
@@ -327,6 +323,43 @@ def train(args):
                 except Exception as e:
                     printer.warning(f"Failed to load DAM2 model {model_name}: {e}")
                     printer.info("Skipping DAM2 model loading due to error")
+            # 检查是否是VGGT teacher模型
+            elif "VGGT" in model_config:
+                try:
+                    # 解析VGGT配置
+                    path_match = re.search(r"path\s*=\s*\"([^\"]+)\"", model_config)
+                    offload_match = re.search(r"offload\s*=\s*(\"True\"|False)\b", model_config, re.IGNORECASE)
+                    
+                    if path_match:
+                        ckpt_path = path_match.group(1)
+                        offload = offload_match.group(1).lower() == "true" if offload_match else False
+                        
+                        # 构建VGGT teacher模型
+                        teacher_model = VGGT(img_size=518, patch_size=14, embed_dim=1024)
+                        
+                        # 加载checkpoint
+                        state_dict = torch.load(ckpt_path, map_location="cpu" if offload else device)
+                        if "model" in state_dict:
+                            state_dict = state_dict["model"]
+                        state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+                        
+                        missing_keys, unexpected_keys = teacher_model.load_state_dict(state_dict, strict=False)
+                        printer.info(f"Unexpected key numbers in VGGT teacher {model_name}: {len(unexpected_keys)}")
+                        printer.info(f"Missing key numbers in VGGT teacher {model_name}: {len(missing_keys)}")
+                        
+                        if not offload:
+                            teacher_model.to(device)
+                        
+                        teacher_model.eval()
+                        teacher_model.requires_grad_(False)
+                        
+                        auxiliary_models[model_name] = teacher_model
+                        printer.info(f"successfully load VGGT teacher model: {model_name}")
+                    else:
+                        printer.warning(f"Missing path for VGGT teacher model: {model_name}")
+                except Exception as e:
+                    printer.warning(f"Failed to load VGGT teacher model {model_name}: {e}")
+                    printer.info("Skipping VGGT teacher model loading due to error")
             else:
                 # 原有的RAFT模型加载逻辑
                 auxiliary_model = eval(model_config)
@@ -406,9 +439,61 @@ def train(args):
                 if data_iter_step % args.accum_iter == 0:
                     misc.adjust_learning_rate(optimizer, epoch_f, args)
                 vggt_batch = cut3r_batch_to_vggt(batch)
-                preds = model(vggt_batch["images"])
+
+                if "dam2" in auxiliary_models and vggt_batch.get("images") is not None:
+                    sky_masks = dam2_sky_mask_generation(
+                        vggt_batch["images"], 
+                        auxiliary_models["dam2"],
+                        device=device
+                    )
+                    # 将sky masks添加到vggt_batch中，供后续使用
+                    vggt_batch["sky_masks"] = sky_masks
+
+                preds = model(
+                    vggt_batch["images"],
+                    compute_sky_color_loss=True,
+                    sky_masks=vggt_batch["sky_masks"],
+                    gt_images=vggt_batch["images"],
+                    # pose_enc=preds["pose_enc"].detach()
+                )
+
                 loss = 0.0
                 loss_dict = {}
+                
+                # VGGT teacher distillation
+                if "vggt_teacher" in auxiliary_models and vggt_batch.get("images") is not None:
+                    try:
+                        with torch.no_grad():
+                            teacher_preds = auxiliary_models["vggt_teacher"](
+                                vggt_batch["images"],
+                                compute_sky_color_loss=False,
+                                sky_masks=vggt_batch.get("sky_masks"),
+                                gt_images=vggt_batch["images"],
+                            )
+                        
+                        # 计算蒸馏损失
+                        distillation_loss_dict = vggt_distillation_loss(
+                            student_preds=preds,
+                            teacher_preds=teacher_preds,
+                            weight_pose=1.0,  # 可以根据需要调整权重
+                            weight_depth=1.0,  # 可以根据需要调整权重
+                            weight_depth_conf=1.0  # 可以根据需要调整权重
+                        )
+                        
+                        # 将蒸馏损失添加到总损失中
+                        loss += distillation_loss_dict["loss_pose_distillation"] + distillation_loss_dict["loss_depth_distillation"] + distillation_loss_dict["loss_depth_conf_distillation"]
+                        loss_dict.update(distillation_loss_dict)
+                        
+                    except Exception as e:
+                        print(f"Error in VGGT teacher distillation: {e}")
+                        # 添加零损失作为fallback
+                        loss_dict.update({
+                            "loss_pose_distillation": torch.tensor(0.0, device=device, requires_grad=True),
+                            "loss_depth_distillation": torch.tensor(0.0, device=device, requires_grad=True),
+                            "loss_depth_conf_distillation": torch.tensor(0.0, device=device, requires_grad=True),
+                        })
+                
+                
 
                 interval = 2
 
@@ -454,20 +539,20 @@ def train(args):
                 #             "loss_render_depth": torch.tensor(0.0, device=device, requires_grad=True),
                 #         })
 
-                # # self render loss (self)
-                # if vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
-                #     try:
-                #         self_loss_dict, _ = self_render_and_loss(preds["depth"].detach(), preds["gaussian_params"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"])
-                #         loss += self_loss_dict.get("loss_self_render_rgb", 0.0) + 0.0 * self_loss_dict.get("loss_self_render_lpips", 0.0) + self_loss_dict.get("loss_self_render_depth", 0.0)
-                #         loss_dict.update(self_loss_dict)
-                #     except Exception as e:
-                #         print(f"Error in self render loss computation: {e}")
-                #         # 添加零损失作为fallback
-                #         loss_dict.update({
-                #             "loss_self_render_rgb": torch.tensor(0.0, device=device, requires_grad=True),
-                #             "loss_self_render_lpips": torch.tensor(0.0, device=device, requires_grad=True),
-                #             "loss_self_render_depth": torch.tensor(0.0, device=device, requires_grad=True),
-                #         })
+                # self render loss (self)
+                if vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
+                    try:
+                        self_loss_dict, _ = self_render_and_loss(preds["depth"].detach(), preds["gaussian_params"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"])
+                        loss += self_loss_dict.get("loss_self_render_rgb", 0.0) + 0.0 * self_loss_dict.get("loss_self_render_lpips", 0.0) + self_loss_dict.get("loss_self_render_depth", 0.0)
+                        loss_dict.update(self_loss_dict)
+                    except Exception as e:
+                        print(f"Error in self render loss computation: {e}")
+                        # 添加零损失作为fallback
+                        loss_dict.update({
+                            "loss_self_render_rgb": torch.tensor(0.0, device=device, requires_grad=True),
+                            "loss_self_render_lpips": torch.tensor(0.0, device=device, requires_grad=True),
+                            "loss_self_render_depth": torch.tensor(0.0, device=device, requires_grad=True),
+                        })
 
                 # optical flow -> velocity loss
                 if vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
@@ -497,39 +582,46 @@ def train(args):
                             "loss_velocity": torch.tensor(0.0, device=device, requires_grad=True),
                         })
                 
-                # SAM2 mask-based velocity consistency loss
-                if "sam2" in auxiliary_models and vggt_batch.get("images") is not None:
-                    try:
-                        sam2_velocity_loss_dict = sam2_velocity_consistency_loss(
-                            vggt_batch["images"], 
-                            preds["velocity"], 
-                            auxiliary_models["sam2"],
-                            device=device
-                        )
-                        loss += sam2_velocity_loss_dict.get("sam2_velocity_consistency_loss", 0.0)
-                        loss_dict.update(sam2_velocity_loss_dict)
-                    except Exception as e:
-                        print(f"Error in SAM2 loss computation: {e}")
-                        # 添加零损失作为fallback
-                        loss_dict.update({
-                            "sam2_velocity_consistency_loss": torch.tensor(0.0, device=device, requires_grad=True),
-                        })
-                
-                # # DAM2 sky mask generation
-                # if "dam2" in auxiliary_models and vggt_batch.get("images") is not None:
+                # # SAM2 mask-based velocity consistency loss
+                # if "sam2" in auxiliary_models and vggt_batch.get("images") is not None:
                 #     try:
-                #         sky_masks = dam2_sky_mask_generation(
+                #         sam2_velocity_loss_dict = sam2_velocity_consistency_loss(
                 #             vggt_batch["images"], 
-                #             auxiliary_models["dam2"],
+                #             preds["velocity"], 
+                #             auxiliary_models["sam2"],
                 #             device=device
                 #         )
-                #         # 将sky masks添加到vggt_batch中，供后续使用
-                #         vggt_batch["sky_masks"] = sky_masks
+                #         loss += sam2_velocity_loss_dict.get("sam2_velocity_consistency_loss", 0.0)
+                #         loss_dict.update(sam2_velocity_loss_dict)
                 #     except Exception as e:
-                #         print(f"Error in DAM2 sky mask generation: {e}")
-                #         # 添加空的sky masks作为fallback
-                #         B, S, C, H, W = vggt_batch["images"].shape
-                #         vggt_batch["sky_masks"] = torch.zeros(B, S, H, W, device=device)
+                #         print(f"Error in SAM2 loss computation: {e}")
+                #         # 添加零损失作为fallback
+                #         loss_dict.update({
+                #             "sam2_velocity_consistency_loss": torch.tensor(0.0, device=device, requires_grad=True),
+                #         })
+                
+                # DAM2 sky mask generation and sky loss                    
+                # Sky opacity loss: 鼓励sky区域的gaussian opacity为0
+                if preds.get("gaussian_params") is not None:
+                    sky_opacity_loss_dict = sky_opacity_loss(
+                        preds["gaussian_params"], 
+                        sky_masks, 
+                        weight=1.0
+                    )
+                    loss += sky_opacity_loss_dict.get("sky_opacity_loss", 0.0)
+                    loss_dict.update(sky_opacity_loss_dict)
+                    
+                    # 计算sky color loss
+                    sky_color_loss_dict = sky_color_loss(
+                        preds["pred_sky_colors"], 
+                        vggt_batch["images"], 
+                        sky_masks, 
+                        weight=1.0
+                    )
+                    loss += sky_color_loss_dict.get("sky_color_loss", 0.0)
+                    loss_dict.update(sky_color_loss_dict)
+
+            
                 
                 loss_value = float(loss)
                 
@@ -778,7 +870,7 @@ def train_one_epoch(
                 # for name, imgs_stacked in imgs_stacked_dict.items():
                 #     log_writer.add_images(
                 #         "train" + "/" + name, imgs_stacked, step, dataformats="HWC"
-                #     )
+                # )
                 # del batch
 
         if (

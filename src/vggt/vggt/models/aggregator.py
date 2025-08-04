@@ -67,6 +67,7 @@ class Aggregator(nn.Module):
         qk_norm=True,
         rope_freq=100,
         init_values=0.01,
+        use_sky_token=True,
     ):
         super().__init__()
 
@@ -126,8 +127,14 @@ class Aggregator(nn.Module):
         self.camera_token = nn.Parameter(torch.randn(1, 2, 1, embed_dim))
         self.register_token = nn.Parameter(torch.randn(1, 2, num_register_tokens, embed_dim))
 
-        # The patch tokens start after the camera and register tokens
-        self.patch_start_idx = 1 + num_register_tokens
+        # Sky token support
+        self.use_sky_token = use_sky_token
+        if self.use_sky_token:
+            self.sky_token = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
+            # The patch tokens start after the sky token, the camera and register tokens
+            self.patch_start_idx = 1 + 1 + num_register_tokens
+        else:
+            self.patch_start_idx = 1 + num_register_tokens
 
         # Initialize parameters with small values
         nn.init.normal_(self.camera_token, std=1e-6)
@@ -212,8 +219,14 @@ class Aggregator(nn.Module):
         camera_token = slice_expand_and_flatten(self.camera_token, B, S)
         register_token = slice_expand_and_flatten(self.register_token, B, S)
 
-        # Concatenate special tokens with patch tokens
-        tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
+        # Add sky token if enabled
+        if self.use_sky_token:
+            sky_token = self.sky_token.repeat(B * S, 1, 1)
+            # Concatenate special tokens with patch tokens
+            tokens = torch.cat([sky_token, camera_token, register_token, patch_tokens], dim=1)
+        else:
+            # Concatenate special tokens with patch tokens
+            tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
 
         pos = None
         if self.rope is not None:

@@ -13,6 +13,14 @@ from vggt.heads.camera_head import CameraHead
 from vggt.heads.dpt_head import DPTHead
 from vggt.heads.gs_head import DPTGSHead
 from vggt.heads.track_head import TrackHead
+from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+
+# 直接引用storm中的组件
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '../../../storm'))
+from storm.models.decoder import ModulatedLinearLayer
+from storm.models.embedders import PluckerEmbedder
 
 from contextlib import contextmanager
 from einops import reduce
@@ -41,15 +49,27 @@ def freeze_all_params(modules):
 
 
 class VGGT(nn.Module, PyTorchModelHubMixin):
-    def __init__(self, img_size=518, patch_size=14, embed_dim=1024):
+    def __init__(self, img_size=518, patch_size=14, embed_dim=1024, use_sky_token=True):
         super().__init__()
-        self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim)
+        self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim, use_sky_token=use_sky_token)
         self.camera_head = CameraHead(dim_in=2 * embed_dim)
         self.point_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log", conf_activation="expp1")
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1")
         self.gaussian_head = DPTGSHead(dim_in=2 * embed_dim, output_dim=15, activation="linear", conf_activation="expp1")
         self.velocity_head = DPTGSHead(dim_in=2 * embed_dim, output_dim=4, activation="linear", conf_activation="expp1")
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size)
+        
+        # Sky token support
+        self.use_sky_token = use_sky_token
+        if self.use_sky_token:
+            self.plucker_embedder = PluckerEmbedder(img_size=img_size)
+            self.sky_head = ModulatedLinearLayer(
+                3,  # input channels (ray directions)
+                hidden_channels=512,
+                condition_channels=embed_dim*2,
+                out_channels=3,  # RGB output
+            )
+        
         self.set_freeze(freeze="vggt_wo_gaussian_and_velocity")
 
     def set_freeze(self, freeze):
@@ -100,10 +120,10 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 self.velocity_head,
             ],
             "vggt_wo_gaussian_and_velocity": [
-                self.aggregator,
+                # self.aggregator,
                 self.camera_head,
                 self.point_head,
-                # self.gaussian_head,
+                self.gaussian_head,
                 self.depth_head,
                 # self.velocity_head,
             ],
@@ -129,7 +149,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         for module in modules:
             set_gradient_checkpointing(module)
 
-    def forward(self, images: torch.Tensor, query_points: torch.Tensor = None):
+    def forward(self, images: torch.Tensor, query_points: torch.Tensor = None, compute_sky_color_loss=False, sky_masks=None, gt_images=None):
         """
         Forward pass of the VGGT model.
 
@@ -208,4 +228,79 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
 
         predictions["images"] = images
 
+        # Add sky token processing if enabled
+        if self.use_sky_token:
+            # Extract sky token from the first aggregated tokens (last iteration)
+            sky_token = aggregated_tokens_list[-1][:, :, :1]  # [B, S,1, embed_dim]
+            predictions["sky_token"] = sky_token
+
+        if compute_sky_color_loss and sky_masks is not None and gt_images is not None:
+            pred_extrinsics, pred_intrinsics = pose_encoding_to_extri_intri(
+                predictions["pose_enc"].detach(), (images.shape[-2], images.shape[-1])
+            )
+            pred_extrinsics = torch.cat([pred_extrinsics, torch.tensor([0, 0, 0, 1], device=pred_extrinsics.device)[None,None,None,:].repeat(1,pred_extrinsics.shape[1],1,1)], dim=-2)
+            ray_directions = self.generate_ray_directions(
+                pred_intrinsics, pred_extrinsics, image_size=(images.shape[-2], images.shape[-1])
+            )
+            pred_sky_colors = self.generate_sky_color(
+                ray_directions.view(-1, ray_directions.shape[-3], ray_directions.shape[-2], 3),
+                predictions["sky_token"].view(-1, 1, predictions["sky_token"].shape[-1])
+            )
+            B, S = images.shape[:2]
+            H, W = pred_sky_colors.shape[1:3]
+            pred_sky_colors = pred_sky_colors.view(B, S, H, W, 3)
+            predictions["pred_sky_colors"] = pred_sky_colors
+
         return predictions
+
+    def generate_sky_color(self, ray_directions, sky_token):
+        """
+        Generate sky color using sky_head and sky_token.
+        
+        Args:
+            ray_directions (torch.Tensor): Ray directions with shape [B, H, W, 3]
+            sky_token (torch.Tensor): Sky token with shape [B, 1, embed_dim]
+            
+        Returns:
+            torch.Tensor: Sky colors with shape [B, H, W, 3]
+        """
+        if not self.use_sky_token:
+            return None
+        
+        # Reshape ray_directions for sky_head
+        B, H, W, _ = ray_directions.shape
+        ray_dirs_flat = ray_directions.view(B, H * W, 3)
+        
+        # Generate sky colors using sky_head
+        sky_colors = self.sky_head(ray_dirs_flat, sky_token)  # [B, H*W, 3]
+        sky_colors = sky_colors.view(B, H, W, 3)
+        
+        return sky_colors
+
+    def generate_ray_directions(self, intrinsics, camtoworlds, image_size=None):
+        """
+        Generate ray directions using PluckerEmbedder.
+        
+        Args:
+            intrinsics (torch.Tensor): Camera intrinsics with shape [B, S, 3, 3]
+            camtoworlds (torch.Tensor): Camera poses with shape [B, S, 4, 4]
+            image_size (tuple, optional): Image size (H, W)
+            
+        Returns:
+            torch.Tensor: Ray directions with shape [B, S, H, W, 3]
+        """
+        if not self.use_sky_token:
+            return None
+        
+        B, S = intrinsics.shape[:2]
+        ray_directions = []
+        
+        for s in range(S):
+            ray_dict = self.plucker_embedder(
+                intrinsics[:, s],  # [B, 3, 3]
+                camtoworlds[:, s],  # [B, 4, 4]
+                image_size=image_size
+            )
+            ray_directions.append(ray_dict["dirs"])  # [B, H, W, 3]
+        
+        return torch.stack(ray_directions, dim=1)  # [B, S, H, W, 3]

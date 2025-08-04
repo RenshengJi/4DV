@@ -637,6 +637,76 @@ def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic,
         return self_loss_dict, img_dict
 
 
+def sky_opacity_loss(gaussian_params, sky_masks, weight=1.0):
+    """
+    Loss to encourage gaussian opacity to be 0 in sky regions and 1 in non-sky regions.
+    
+    Args:
+        gaussian_params (torch.Tensor): Gaussian parameters [B, S, H, W, 15]
+        sky_masks (torch.Tensor): Sky masks [B, S, H, W] where 1 indicates sky regions
+        weight (float): Loss weight
+        
+    Returns:
+        dict: Loss dictionary containing sky_opacity_loss
+    """
+    # Extract opacity from gaussian parameters
+    opacity = gaussian_params[..., 13:14].sigmoid()
+
+    # Create non-sky mask (inverse of sky mask)
+    non_sky_masks = 1.0 - sky_masks  # [B, S, H, W]
+    
+    # Apply sky mask to get opacity values in sky regions
+    sky_opacity = opacity * sky_masks.unsqueeze(-1)  # [B, S, H, W, 1]
+    
+    # Apply non-sky mask to get opacity values in non-sky regions
+    non_sky_opacity = opacity * non_sky_masks.unsqueeze(-1)  # [B, S, H, W, 1]
+    
+    # Compute L1 loss to encourage sky opacity to be 0
+    sky_loss = torch.mean(torch.abs(sky_opacity))
+    
+    # Compute L1 loss to encourage non-sky opacity to be 1
+    non_sky_loss = torch.mean(torch.abs(non_sky_opacity - 1.0))
+    
+    # Combine both losses
+    total_loss = sky_loss + non_sky_loss
+    
+    return {
+        "sky_opacity_loss": total_loss * weight
+    }
+
+
+def sky_color_loss(pred_sky_colors, gt_images, sky_masks, weight=1.0):
+    """
+    Loss to encourage predicted sky colors to match GT images in sky regions.
+    
+    Args:
+        pred_sky_colors (torch.Tensor): Predicted sky colors [B, S, H, W, 3]
+        gt_images (torch.Tensor): Ground truth images [B, S, 3, H, W] in range [0, 1]
+        sky_masks (torch.Tensor): Sky masks [B, S, H, W] where 1 indicates sky regions
+        weight (float): Loss weight
+        
+    Returns:
+        dict: Loss dictionary containing sky_color_loss
+    """
+    # Convert GT images to [B, S, H, W, 3] format
+    gt_images = gt_images.permute(0, 1, 3, 4, 2)  # [B, S, H, W, 3]
+    
+    # Apply sky mask to get GT colors in sky regions
+    gt_sky_colors = gt_images * sky_masks.unsqueeze(-1)  # [B, S, H, W, 3]
+    pred_sky_colors_masked = pred_sky_colors * sky_masks.unsqueeze(-1)  # [B, S, H, W, 3]
+    
+    # Compute L1 loss between predicted and GT sky colors
+    color_loss = torch.mean(torch.abs(pred_sky_colors_masked - gt_sky_colors))
+    
+    # Optional: Add L2 loss for smoother gradients
+    color_loss_l2 = torch.mean((pred_sky_colors_masked - gt_sky_colors) ** 2)
+    
+    total_loss = color_loss + 0.1 * color_loss_l2
+    
+    return {
+        "sky_color_loss": total_loss * weight
+    }
+
 
 
 def check_and_fix_inf_nan(loss_tensor, loss_name, hard_max = 100):
@@ -1262,5 +1332,53 @@ def torch_quantile(
         return out.squeeze(dim)
 
     return out
+
+
+
+
+
+def vggt_distillation_loss(student_preds, teacher_preds, weight_pose=1.0, weight_depth=1.0, weight_depth_conf=1.0):
+    """
+    VGGT teacher-student distillation loss for pose_enc, depth, and depth_conf.
+    
+    Args:
+        student_preds (dict): Student model predictions containing 'pose_enc', 'depth', and 'depth_conf'
+        teacher_preds (dict): Teacher model predictions containing 'pose_enc', 'depth', and 'depth_conf'
+        weight_pose (float): Weight for pose distillation loss
+        weight_depth (float): Weight for depth distillation loss
+        weight_depth_conf (float): Weight for depth confidence distillation loss
+        
+    Returns:
+        dict: Loss dictionary containing distillation losses
+    """
+    loss_dict = {}
+    
+    # Pose encoding distillation loss
+    if "pose_enc" in student_preds and "pose_enc" in teacher_preds:
+        pose_loss = F.mse_loss(student_preds["pose_enc"], teacher_preds["pose_enc"])
+        pose_loss = check_and_fix_inf_nan(pose_loss, "pose_distillation_loss")
+        loss_dict["loss_pose_distillation"] = pose_loss * weight_pose
+    else:
+        loss_dict["loss_pose_distillation"] = torch.tensor(0.0, device=student_preds.get("pose_enc", torch.tensor(0.0)).device, requires_grad=True)
+    
+    # Depth distillation loss
+    if "depth" in student_preds and "depth" in teacher_preds:
+        depth_loss = F.mse_loss(student_preds["depth"], teacher_preds["depth"])
+        depth_loss = check_and_fix_inf_nan(depth_loss, "depth_distillation_loss")
+        loss_dict["loss_depth_distillation"] = depth_loss * weight_depth
+    else:
+        loss_dict["loss_depth_distillation"] = torch.tensor(0.0, device=student_preds.get("depth", torch.tensor(0.0)).device, requires_grad=True)
+    
+    # Depth confidence distillation loss
+    if "depth_conf" in student_preds and "depth_conf" in teacher_preds:
+        depth_conf_loss = F.mse_loss(student_preds["depth_conf"], teacher_preds["depth_conf"])
+        depth_conf_loss = check_and_fix_inf_nan(depth_conf_loss, "depth_conf_distillation_loss")
+        loss_dict["loss_depth_conf_distillation"] = depth_conf_loss * weight_depth_conf
+    else:
+        loss_dict["loss_depth_conf_distillation"] = torch.tensor(0.0, device=student_preds.get("depth_conf", torch.tensor(0.0)).device, requires_grad=True)
+    
+    return loss_dict
+
+
 
 
