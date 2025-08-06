@@ -152,6 +152,7 @@ def cross_render_and_loss(conf, interval, forward_consist_mask, backward_consist
         velocity = velocity.squeeze(0).reshape(-1, image_height * image_width, 3)  # [S, H*W, 3]
         velocity = torch.sign(velocity) * (torch.exp(torch.abs(velocity)) - 1)
         velocity = velocity_local_to_global(velocity.reshape(-1, 3), extrinsic_inv).reshape(S, image_height * image_width, 3)
+
         gaussian_params = gaussian_params.reshape(1, -1, image_height * image_width, 14)  # [S, H*W, 14]
         scale = gaussian_params[0, ..., 3:6]
         scale = (0.05 * torch.exp(scale)).clamp_max(0.3)  # [S, H*W, 3]
@@ -195,7 +196,7 @@ def cross_render_and_loss(conf, interval, forward_consist_mask, backward_consist
                 sh_degree=0, render_mode="RGB+ED",
                 radius_clip=0, near_plane=0.0001,
                 far_plane=1000.0,
-                eps2d=0.0,
+                eps2d=0.3,
             )
             render_colors.append(render_color[0])
             gt_colors.append(gt_rgb[0,i+interval])
@@ -318,7 +319,7 @@ def flow_loss(conf, interval, forward_flow, backward_flow, forward_consist_mask,
             "forward",
             interval=interval
         )
-        forward_loss = F.l1_loss(warped_means, target_means)
+        forward_loss = F.smooth_l1_loss(warped_means, target_means)
         forward_loss = check_and_fix_inf_nan(forward_loss, "forward_loss")
 
         # backward loss
@@ -331,7 +332,7 @@ def flow_loss(conf, interval, forward_flow, backward_flow, forward_consist_mask,
             "backward",
             interval=interval
         )
-        backward_loss = F.l1_loss(warped_means, target_means)
+        backward_loss = F.smooth_l1_loss(warped_means, target_means)
         backward_loss = check_and_fix_inf_nan(backward_loss, "backward_loss")
 
         flow_loss_dict = {
@@ -588,7 +589,7 @@ def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic,
                 sh_degree=0, render_mode="RGB+ED",
                 radius_clip=0, near_plane=0.0001,
                 far_plane=1000.0,
-                eps2d=0.0,
+                eps2d=0.3,
             )
             render_colors.append(render_color[0])
             gt_colors.append(gt_rgb[0, i])

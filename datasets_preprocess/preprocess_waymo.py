@@ -36,6 +36,9 @@ from src.dust3r.utils.geometry import geotrf, inv
 from src.dust3r.utils.image import imread_cv2
 from src.dust3r.utils.parallel import parallel_processes as parallel_map
 from datasets_preprocess.utils import cropping
+
+# 导入SAM预处理模块
+from sam_preprocessing import SAMPreprocessor
 # from src.dust3r.viz import show_raw_pointcloud
 
 
@@ -48,12 +51,19 @@ def get_parser():
     parser.add_argument("--precomputed_pairs")
     parser.add_argument("--output_dir", default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/val")
     parser.add_argument("--workers", type=int, default=100)
+    parser.add_argument("--enable_sam", action="store_true", help="Enable SAM mask generation")
+    parser.add_argument("--sam_model_type", default="sam2", choices=["sam2", "sam"], help="SAM model type")
+    parser.add_argument("--sam_device", default="cuda", help="Device for SAM model")
+    parser.add_argument("--sam_config_file", help="SAM2 config file")
+    parser.add_argument("--sam_ckpt_path", help="SAM model checkpoint path")
     return parser
 
 
-def main(waymo_root, pairs_path, output_dir, workers=1):
+def main(waymo_root, pairs_path, output_dir, workers=1, enable_sam=False, sam_model_type="sam2", 
+         sam_device="cuda", sam_config_file=None, sam_ckpt_path=None):
     extract_frames(waymo_root, output_dir, workers=workers)
-    make_crops(output_dir, workers=args.workers)
+    make_crops(output_dir, workers=args.workers, enable_sam=enable_sam, sam_model_type=sam_model_type,
+               sam_device=sam_device, sam_config_file=sam_config_file, sam_ckpt_path=sam_ckpt_path)
 
     # # make sure all pairs are there
     # with np.load(pairs_path) as data:
@@ -186,19 +196,35 @@ def extract_frames_one_seq(filename):
     return calib, frames
 
 
-def make_crops(output_dir, workers=16, **kw):
+def make_crops(output_dir, workers=16, enable_sam=False, sam_model_type="sam2", 
+               sam_device="cuda", sam_config_file=None, sam_ckpt_path=None, **kw):
     tmp_dir = osp.join(output_dir, "tmp")
     sequences = _list_sequences(tmp_dir)
-    args = [(tmp_dir, output_dir, seq) for seq in sequences]
+    args = [(tmp_dir, output_dir, seq, enable_sam, sam_model_type, sam_device, sam_config_file, sam_ckpt_path) for seq in sequences]
     parallel_map(crop_one_seq, args, star_args=True, workers=workers, front_num=0)
 
 
-def crop_one_seq(input_dir, output_dir, seq, resolution=512):
+def crop_one_seq(input_dir, output_dir, seq, enable_sam=False, sam_model_type="sam2", 
+                 sam_device="cuda", sam_config_file=None, sam_ckpt_path=None, resolution=512):
     seq_dir = osp.join(input_dir, seq)
     out_dir = osp.join(output_dir, seq)
     if osp.isfile(osp.join(out_dir, "00100_1.jpg")):
         return
     os.makedirs(out_dir, exist_ok=True)
+    
+    # 初始化SAM预处理器
+    sam_preprocessor = None
+    if enable_sam:
+        try:
+            sam_preprocessor = SAMPreprocessor(
+                model_type=sam_model_type,
+                device=sam_device,
+                config_file=sam_config_file,
+                ckpt_path=sam_ckpt_path
+            )
+        except Exception as e:
+            print(f"Failed to initialize SAM preprocessor for sequence {seq}: {e}")
+            enable_sam = False
 
     # load calibration file
     try:
@@ -273,6 +299,22 @@ def crop_one_seq(input_dir, output_dir, seq, resolution=512):
             cam2world=cam2world,
             distortion=cam_distortion[cam_idx],
         )
+        
+        # 生成SAM掩码
+        if enable_sam and sam_preprocessor is not None:
+            try:
+                # 创建SAM掩码输出目录
+                sam_output_dir = osp.join(out_dir, "sam_masks")
+                os.makedirs(sam_output_dir, exist_ok=True)
+                
+                # 生成SAM掩码文件路径
+                sam_output_path = osp.join(sam_output_dir, frame + "json")
+                
+                if not osp.exists(sam_output_path):  # 避免重复处理
+                    masks = sam_preprocessor.generate_masks(image)
+                    sam_preprocessor.save_masks(masks, sam_output_path)
+            except Exception as e:
+                print(f"Error generating SAM masks for {seq}/{frame}: {e}")
 
         # viz.add_rgbd(np.asarray(image), depthmap, intrinsics2, cam2world)
     # viz.show()
@@ -281,4 +323,6 @@ def crop_one_seq(input_dir, output_dir, seq, resolution=512):
 if __name__ == "__main__":
     parser = get_parser()
     args = parser.parse_args()
-    main(args.waymo_dir, args.precomputed_pairs, args.output_dir, workers=args.workers)
+    main(args.waymo_dir, args.precomputed_pairs, args.output_dir, workers=args.workers,
+         enable_sam=args.enable_sam, sam_model_type=args.sam_model_type, sam_device=args.sam_device,
+         sam_config_file=args.sam_config_file, sam_ckpt_path=args.sam_ckpt_path)

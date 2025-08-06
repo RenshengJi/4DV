@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, Union, List, Dict, Any
-import torch.utils.checkpoint as checkpoint
+from torch.utils.checkpoint import checkpoint
 from vggt.layers import PatchEmbed
 from vggt.layers.block import Block
 from vggt.layers.rope import RotaryPositionEmbedding2D, PositionGetter
@@ -284,11 +284,12 @@ class Aggregator(nn.Module):
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
-            # if self.training:
-            #     tokens = checkpoint(self.frame_blocks[frame_idx], tokens, pos, use_reentrant=self.use_reentrant)
-            # else:
-            tokens = self.frame_blocks[frame_idx](tokens, pos=pos)
-            frame_idx += 1
+            block_to_run = self.frame_blocks[frame_idx]
+            if self.training:
+                tokens = checkpoint(block_to_run, tokens, pos, use_reentrant=self.use_reentrant)
+            else:
+                tokens = block_to_run(tokens, pos=pos)
+            frame_idx += 1  
             intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, frame_idx, intermediates
@@ -307,10 +308,11 @@ class Aggregator(nn.Module):
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
-            # if self.training:
-            #     tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
-            # else:
-            tokens = self.global_blocks[global_idx](tokens, pos=pos)
+            block_to_run = self.global_blocks[global_idx]
+            if self.training:
+                tokens = checkpoint(block_to_run, tokens, pos, use_reentrant=self.use_reentrant)
+            else:
+                tokens = block_to_run(tokens, pos=pos)
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 

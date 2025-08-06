@@ -1,6 +1,7 @@
 # debug: True
 model: "VGGT(img_size=518, patch_size=14, embed_dim=1024)"
-pretrained: /mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(true+fixmodel+lowlr!+nolpips+onlyflow+velocitylocal+fromscratch)/checkpoint-epoch_2_17880.pth
+# pretrained: /mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(true+fixmodel+lowlr!+nolpips+onlyflow+velocitylocal+fromscratch)/checkpoint-epoch_2_17880.pth
+pretrained: /mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/new_all_nodistill_8views/checkpoint-epoch_0_40362.pth
 
 
 auxiliary_models:
@@ -19,7 +20,7 @@ long_context: True
 fixed_length: False
 resume: null
 benchmark: False
-num_views : 4
+num_views : 8
 num_test_views : 16
 n_corres_train: 0
 n_corres_test: 0
@@ -64,7 +65,7 @@ save_dir: 'checkpoints/waymo'
 # exp_name: 'step2(fix_mask+nometric+fixgs+depth+fixlpips+lowvelocity+fixrepeat+l1loss+onlyforward+novelocityreg+finetune10conf)'
 # exp_name: 'step2(onlyflow+lr+interval)'
 # exp_name: 'flow-samweight1'
-exp_name: 'new_all_freezehead'
+exp_name: 'new_all_nodistill_8views_smoothl1'
 # exp_name: 'step2(true+fixmodel+lowlr!+nolpips+onlyflow+velocitylocal+fromscratch)'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs

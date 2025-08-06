@@ -20,6 +20,8 @@ from dust3r.utils.misc import tf32_off
 from training.loss import cross_render_and_loss
 # Import model and inference functions after adding the ckpt path.
 from src.dust3r.inference import inference
+# Import cut3r_batch_to_vggt function
+from src.train import cut3r_batch_to_vggt
 
 import re
 import torch.multiprocessing
@@ -41,8 +43,14 @@ def parse_args():
     parser.add_argument(
         "--model_path",
         type=str,
-        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/new_all_freezehead/checkpoint-epoch_0_1329.pth",
+        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/new_all_nodistill_8views_smoothl1/checkpoint-epoch_0_5208.pth",
         help="Path to the pretrained model checkpoint.",
+    )
+    parser.add_argument(
+        "--teacher_model_path",
+        type=str,
+        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/model.pt",
+        help="Path to the teacher model checkpoint. If provided, will use teacher predictions for depth and pose_enc.",
     )
     parser.add_argument(
         "--device",
@@ -65,7 +73,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./results",
+        default="./results_36456_8views",
         help="value for tempfile.tempdir",
     )
     parser.add_argument(
@@ -176,12 +184,13 @@ def parse_seq_path(p):
 
 
 
-def run_inference(dataset, model, device, args):
+def run_inference(dataset, model, device, args, teacher_model=None):
     """
     Execute the full inference and visualization pipeline.
 
     Args:
         args: Parsed command-line arguments.
+        teacher_model: Optional teacher model for generating depth and pose_enc.
     """
     
     # Prepare input views.
@@ -201,6 +210,33 @@ def run_inference(dataset, model, device, args):
     print(
         f"Inference completed in {total_time:.2f} seconds (average {per_frame_time:.2f} s per frame)."
     )
+
+    # 如果提供了teacher模型，使用teacher的预测结果替换depth和pose_enc
+    if teacher_model is not None:
+        print("Using teacher model for depth and pose_enc predictions...")
+        try:
+            with torch.no_grad():
+                # 将batch转换为vggt格式
+                vggt_batch = cut3r_batch_to_vggt(views)
+                
+                # 使用teacher模型进行推理
+                teacher_preds = teacher_model(
+                    vggt_batch["images"],
+                    compute_sky_color_loss=False,
+                    sky_masks=vggt_batch.get("sky_masks"),
+                    gt_images=vggt_batch["images"],
+                )
+                
+                # 替换outputs中的depth和pose_enc为teacher的预测结果
+                outputs["depth"] = teacher_preds["depth"]
+                outputs["depth_conf"] = teacher_preds["depth_conf"]
+                outputs["pose_enc"] = teacher_preds["pose_enc"]
+                print("Successfully replaced depth and pose_enc with teacher predictions")
+        except Exception as e:
+            print(f"Error in teacher model inference: {e}")
+            print("Falling back to student model predictions")
+    else:
+        print("No teacher model provided, using student model predictions")
 
     # Process outputs for visualization.
     print("Preparing output for visualization...")
@@ -301,15 +337,36 @@ def main():
     model.load_state_dict(ckpt, strict=False)
     del ckpt
 
-
     model.eval()
     model = model.to(device)
+    
+    # Load teacher model if provided
+    teacher_model = None
+    if args.teacher_model_path is not None:
+        print(f"Loading teacher model from {args.teacher_model_path}...")
+        try:
+            teacher_model = VGGT(img_size=518, patch_size=14, embed_dim=1024, use_sky_token=False)
+            teacher_ckpt = torch.load(args.teacher_model_path, map_location=device)
+            if "model" in teacher_ckpt:
+                teacher_ckpt = teacher_ckpt["model"]
+            teacher_ckpt = {k.replace("module.", ""): v for k, v in teacher_ckpt.items()}
+            teacher_model.load_state_dict(teacher_ckpt, strict=False)
+            del teacher_ckpt
+            
+            teacher_model.eval()
+            teacher_model = teacher_model.to(device)
+            teacher_model.requires_grad_(False)
+            print("Teacher model loaded successfully")
+        except Exception as e:
+            print(f"Error loading teacher model: {e}")
+            print("Continuing without teacher model")
+            teacher_model = None
     
     idx = 0
     while True:
         print(f"\n========== Running inference for idx={idx} ==========")
         args.idx = idx
-        run_inference(dataset, model, device, args)
+        run_inference(dataset, model, device, args, teacher_model)
         # try:
         #     run_inference(dataset, model, device, args)
         # except Exception as e:

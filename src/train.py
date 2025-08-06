@@ -30,18 +30,9 @@ from vggt.training.loss import camera_loss, depth_loss, point_loss, cross_render
 from vggt.utils.auxiliary import RAFTCfg, calc_flow
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
-# ===== SAM2相关导入 =====
-# 添加sam2路径
-sys.path.append(os.path.join(os.path.dirname(__file__), 'sam2'))
-# 延迟导入SAM2，避免Hydra冲突
-# from sam2.build_sam import build_sam2
-# from sam2.modeling.sam2_base import SAM2Base
 
-# ===== DAM2相关导入 =====
-# 添加dam2路径
+sys.path.append(os.path.join(os.path.dirname(__file__), 'sam2'))
 sys.path.append(os.path.join(os.path.dirname(__file__), 'dam2'))
-# 延迟导入DAM2，避免Hydra冲突
-# from depth_anything_v2.dpt import DepthAnythingV2
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -460,7 +451,8 @@ def train(args):
                 loss = 0.0
                 loss_dict = {}
                 
-                # VGGT teacher distillation
+                # VGGT teacher predictions (without distillation loss)
+                teacher_preds = None
                 if "vggt_teacher" in auxiliary_models and vggt_batch.get("images") is not None:
                     try:
                         with torch.no_grad():
@@ -470,30 +462,19 @@ def train(args):
                                 sky_masks=vggt_batch.get("sky_masks"),
                                 gt_images=vggt_batch["images"],
                             )
-                        
-                        # 计算蒸馏损失
-                        distillation_loss_dict = vggt_distillation_loss(
-                            student_preds=preds,
-                            teacher_preds=teacher_preds,
-                            weight_pose=1.0,  # 可以根据需要调整权重
-                            weight_depth=1.0,  # 可以根据需要调整权重
-                            weight_depth_conf=1.0  # 可以根据需要调整权重
-                        )
-                        
-                        # 将蒸馏损失添加到总损失中
-                        loss += distillation_loss_dict["loss_pose_distillation"] + distillation_loss_dict["loss_depth_distillation"] + distillation_loss_dict["loss_depth_conf_distillation"]
-                        loss_dict.update(distillation_loss_dict)
-                        
                     except Exception as e:
-                        print(f"Error in VGGT teacher distillation: {e}")
-                        # 添加零损失作为fallback
-                        loss_dict.update({
-                            "loss_pose_distillation": torch.tensor(0.0, device=device, requires_grad=True),
-                            "loss_depth_distillation": torch.tensor(0.0, device=device, requires_grad=True),
-                            "loss_depth_conf_distillation": torch.tensor(0.0, device=device, requires_grad=True),
-                        })
+                        print(f"Error in VGGT teacher inference: {e}")
+                        teacher_preds = None
                 
-                
+                # 使用teacher的预测结果替换student的预测结果（如果teacher可用）
+                if teacher_preds is not None:
+                    # 替换depth、depth_conf、pose_enc为teacher的预测结果
+                    preds["depth"] = teacher_preds["depth"]
+                    preds["depth_conf"] = teacher_preds["depth_conf"]
+                    preds["pose_enc"] = teacher_preds["pose_enc"]
+                    print("Using teacher predictions for depth, depth_conf, and pose_enc")
+                else:
+                    print("Teacher not available, using student predictions")
 
                 interval = 2
 

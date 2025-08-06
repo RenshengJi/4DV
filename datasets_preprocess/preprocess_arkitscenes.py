@@ -12,6 +12,9 @@ from scipy import interpolate
 import cv2
 from tqdm import tqdm
 
+# 导入SAM预处理模块
+from sam_preprocessing import SAMPreprocessor
+
 
 def get_parser():
     parser = argparse.ArgumentParser()
@@ -27,6 +30,11 @@ def get_parser():
         "--output_dir",
         default="data/dust3r_data/processed_arkitscenes",
     )
+    parser.add_argument("--enable_sam", action="store_true", help="Enable SAM mask generation")
+    parser.add_argument("--sam_model_type", default="sam2", choices=["sam2", "sam"], help="SAM model type")
+    parser.add_argument("--sam_device", default="cuda", help="Device for SAM model")
+    parser.add_argument("--sam_config_file", help="SAM2 config file")
+    parser.add_argument("--sam_ckpt_path", help="SAM model checkpoint path")
     return parser
 
 
@@ -97,8 +105,25 @@ def read_traj(traj_path):
     return timestamps, poses, quaternions, poses_p_to_w
 
 
-def main(rootdir, pairsdir, outdir):
+def main(rootdir, pairsdir, outdir, enable_sam=False, sam_model_type="sam2", 
+         sam_device="cuda", sam_config_file=None, sam_ckpt_path=None):
     os.makedirs(outdir, exist_ok=True)
+    
+    # 初始化SAM预处理器
+    sam_preprocessor = None
+    if enable_sam:
+        try:
+            sam_preprocessor = SAMPreprocessor(
+                model_type=sam_model_type,
+                device=sam_device,
+                config_file=sam_config_file,
+                ckpt_path=sam_ckpt_path
+            )
+            print(f"Initialized SAM preprocessor with model type: {sam_model_type}")
+        except Exception as e:
+            print(f"Failed to initialize SAM preprocessor: {e}")
+            print("Continuing without SAM preprocessing")
+            enable_sam = False
 
     subdirs = ["Test", "Training"]
     for subdir in subdirs:
@@ -192,6 +217,11 @@ def main(rootdir, pairsdir, outdir):
                 if not all_exist:
                     continue
 
+                # 创建SAM掩码输出目录
+                if enable_sam:
+                    sam_output_dir = os.path.join(out_scene_subdir, "sam_masks")
+                    os.makedirs(sam_output_dir, exist_ok=True)
+                
                 for basename in images:
                     img_out = os.path.join(
                         out_scene_subdir, "vga_wide", basename.replace(".png", ".jpg")
@@ -237,6 +267,19 @@ def main(rootdir, pairsdir, outdir):
                         depth_out
                     ):  # avoid destroying the base dataset when you mess up the paths
                         cv2.imwrite(depth_out, depth)
+                    
+                    # 生成SAM掩码
+                    if enable_sam and sam_preprocessor is not None:
+                        try:
+                            # 生成SAM掩码文件路径
+                            sam_filename = basename.replace(".png", ".json")
+                            sam_output_path = os.path.join(sam_output_dir, sam_filename)
+                            
+                            if not os.path.exists(sam_output_path):  # 避免重复处理
+                                masks = sam_preprocessor.generate_masks(img)
+                                sam_preprocessor.save_masks(masks, sam_output_path)
+                        except Exception as e:
+                            print(f"Error generating SAM masks for {scene_subdir}/{basename}: {e}")
 
                 # save at the end
                 np.savez(
@@ -442,4 +485,7 @@ def find_scene_orientation(poses_cam_to_world):
 if __name__ == "__main__":
     parser = get_parser()
     args = parser.parse_args()
-    main(args.arkitscenes_dir, args.precomputed_pairs, args.output_dir)
+    main(args.arkitscenes_dir, args.precomputed_pairs, args.output_dir,
+         enable_sam=args.enable_sam, sam_model_type=args.sam_model_type, 
+         sam_device=args.sam_device, sam_config_file=args.sam_config_file,
+         sam_ckpt_path=args.sam_ckpt_path)

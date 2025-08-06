@@ -26,6 +26,9 @@ import matplotlib.pyplot as plt
 import path_to_root  # noqa
 import datasets_preprocess.utils.cropping as cropping  # noqa
 
+# 导入SAM预处理模块
+from sam_preprocessing import SAMPreprocessor
+
 
 CATEGORIES = [
     "apple",
@@ -98,6 +101,11 @@ def get_parser():
     )
     parser.add_argument("--output_dir", type=str, default="data/co3d_processed")
     parser.add_argument("--co3d_dir", type=str, required=True)
+    parser.add_argument("--enable_sam", action="store_true", help="Enable SAM mask generation")
+    parser.add_argument("--sam_model_type", default="sam2", choices=["sam2", "sam"], help="SAM model type")
+    parser.add_argument("--sam_device", default="cuda", help="Device for SAM model")
+    parser.add_argument("--sam_config_file", help="SAM2 config file")
+    parser.add_argument("--sam_ckpt_path", help="SAM model checkpoint path")
     parser.add_argument("--num_sequences_per_object", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -194,6 +202,8 @@ def prepare_sequences(
     max_num_sequences_per_object,
     seed,
     is_single_sequence_subset=False,
+    enable_sam=False,
+    sam_preprocessor=None,
 ):
     random.seed(seed)
     category_dir = osp.join(co3d_dir, category)
@@ -336,6 +346,23 @@ def prepare_sequences(
             camera_pose=camera_pose,
             maximum_depth=np.max(input_depthmap),
         )
+        
+        # 生成SAM掩码
+        if enable_sam and sam_preprocessor is not None:
+            try:
+                # 创建SAM掩码输出目录
+                sam_output_dir = os.path.join(os.path.dirname(save_img_path), "sam_masks")
+                os.makedirs(sam_output_dir, exist_ok=True)
+                
+                # 生成SAM掩码文件路径
+                sam_filename = os.path.basename(save_img_path).replace(".jpg", ".json")
+                sam_output_path = os.path.join(sam_output_dir, sam_filename)
+                
+                if not os.path.exists(sam_output_path):  # 避免重复处理
+                    masks = sam_preprocessor.generate_masks(input_rgb_image)
+                    sam_preprocessor.save_masks(masks, sam_output_path)
+            except Exception as e:
+                print(f"Error generating SAM masks for {filepath}: {e}")
 
     return selected_sequences_numbers_dict
 
@@ -352,6 +379,22 @@ if __name__ == "__main__":
     else:
         categories = [args.category]
     os.makedirs(args.output_dir, exist_ok=True)
+    
+    # 初始化SAM预处理器
+    sam_preprocessor = None
+    if args.enable_sam:
+        try:
+            sam_preprocessor = SAMPreprocessor(
+                model_type=args.sam_model_type,
+                device=args.sam_device,
+                config_file=args.sam_config_file,
+                ckpt_path=args.sam_ckpt_path
+            )
+            print(f"Initialized SAM preprocessor with model type: {args.sam_model_type}")
+        except Exception as e:
+            print(f"Failed to initialize SAM preprocessor: {e}")
+            print("Continuing without SAM preprocessing")
+            args.enable_sam = False
 
     for split in ["train", "test"]:
         selected_sequences_path = os.path.join(
@@ -377,6 +420,8 @@ if __name__ == "__main__":
                     co3d_dir=args.co3d_dir,
                     output_dir=args.output_dir,
                     img_size=args.img_size,
+                    enable_sam=args.enable_sam,
+                    sam_preprocessor=sam_preprocessor,
                     split=split,
                     min_quality=args.min_quality,
                     max_num_sequences_per_object=args.num_sequences_per_object,

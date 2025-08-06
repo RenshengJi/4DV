@@ -17,16 +17,24 @@ import shutil
 import path_to_root  # noqa
 import datasets_preprocess.utils.cropping as cropping  # noqa
 
+# 导入SAM预处理模块
+from sam_preprocessing import SAMPreprocessor
+
 
 def get_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--scannet_dir", default="data/data_scannet")
     parser.add_argument("--output_dir", default="data/dust3r_data/processed_scannet")
+    parser.add_argument("--enable_sam", action="store_true", help="Enable SAM mask generation")
+    parser.add_argument("--sam_model_type", default="sam2", choices=["sam2", "sam"], help="SAM model type")
+    parser.add_argument("--sam_device", default="cuda", help="Device for SAM model")
+    parser.add_argument("--sam_config_file", help="SAM2 config file")
+    parser.add_argument("--sam_ckpt_path", help="SAM model checkpoint path")
     return parser
 
 
 def process_scene(args):
-    rootdir, outdir, split, scene = args
+    rootdir, outdir, split, scene, enable_sam, sam_preprocessor = args
     frame_dir = osp.join(rootdir, split, scene)
     rgb_dir = osp.join(frame_dir, "color")
     depth_dir = osp.join(frame_dir, "depth")
@@ -45,6 +53,11 @@ def process_scene(args):
     out_rgb_dir = osp.join(outdir, split, scene, "color")
     out_depth_dir = osp.join(outdir, split, scene, "depth")
     out_cam_dir = osp.join(outdir, split, scene, "cam")
+    
+    # 创建SAM掩码输出目录
+    if enable_sam:
+        out_sam_dir = osp.join(outdir, split, scene, "sam_masks")
+        os.makedirs(out_sam_dir, exist_ok=True)
 
     os.makedirs(out_rgb_dir, exist_ok=True)
     os.makedirs(out_depth_dir, exist_ok=True)
@@ -67,11 +80,39 @@ def process_scene(args):
         np.savez(out_cam_path, intrinsics=depth_intrinsic, pose=pose)
         rgb.save(out_rgb_path)
         cv2.imwrite(out_depth_path, depth)
+        
+        # 生成SAM掩码
+        if enable_sam and sam_preprocessor is not None:
+            try:
+                out_sam_path = osp.join(out_sam_dir, f"{i:05d}.json")
+                if not osp.exists(out_sam_path):  # 避免重复处理
+                    masks = sam_preprocessor.generate_masks(rgb)
+                    sam_preprocessor.save_masks(masks, out_sam_path)
+            except Exception as e:
+                print(f"Error generating SAM masks for {scene}/{i}: {e}")
 
 
-def main(rootdir, outdir):
+def main(rootdir, outdir, enable_sam=False, sam_model_type="sam2", sam_device="cuda", 
+         sam_config_file=None, sam_ckpt_path=None):
     os.makedirs(outdir, exist_ok=True)
     splits = ["scans_test", "scans_train"]
+    
+    # 初始化SAM预处理器
+    sam_preprocessor = None
+    if enable_sam:
+        try:
+            sam_preprocessor = SAMPreprocessor(
+                model_type=sam_model_type,
+                device=sam_device,
+                config_file=sam_config_file,
+                ckpt_path=sam_ckpt_path
+            )
+            print(f"Initialized SAM preprocessor with model type: {sam_model_type}")
+        except Exception as e:
+            print(f"Failed to initialize SAM preprocessor: {e}")
+            print("Continuing without SAM preprocessing")
+            enable_sam = False
+    
     pool = multiprocessing.Pool(processes=multiprocessing.cpu_count())
 
     for split in splits:
@@ -80,7 +121,7 @@ def main(rootdir, outdir):
             for f in os.listdir(os.path.join(rootdir, split))
             if os.path.isdir(osp.join(rootdir, split, f))
         ]
-        pool.map(process_scene, [(rootdir, outdir, split, scene) for scene in scenes])
+        pool.map(process_scene, [(rootdir, outdir, split, scene, enable_sam, sam_preprocessor) for scene in scenes])
     pool.close()
     pool.join()
 
@@ -88,4 +129,9 @@ def main(rootdir, outdir):
 if __name__ == "__main__":
     parser = get_parser()
     args = parser.parse_args()
-    main(args.scannet_dir, args.output_dir)
+    main(args.scannet_dir, args.output_dir, 
+         enable_sam=args.enable_sam,
+         sam_model_type=args.sam_model_type,
+         sam_device=args.sam_device,
+         sam_config_file=args.sam_config_file,
+         sam_ckpt_path=args.sam_ckpt_path)
