@@ -1,8 +1,9 @@
-# debug: True
+debug: True
 model: "VGGT(img_size=518, patch_size=14, embed_dim=1024)"
-# pretrained: /mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(true+fixmodel+lowlr!+nolpips+onlyflow+velocitylocal+fromscratch)/checkpoint-epoch_2_17880.pth
-pretrained: /mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/new_all_nodistill_8views/checkpoint-epoch_0_40362.pth
+pretrained: /mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(true+fixmodel+lowlr!+nolpips+onlyflow+velocitylocal+fromscratch)/checkpoint-epoch_2_17880.pth
+# pretrained: /mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/new_all_nodistill_8views/checkpoint-epoch_0_40362.pth
 
+use_preprocessed_sam: True
 
 auxiliary_models:
   flow: RAFT(RAFTCfg(name="kitti-M", dataset="kitti", path="Tartan-C-T-TSKH-kitti432x960-M.pth",
@@ -31,7 +32,7 @@ test_criterion: RenderLoss(MSE, shape="BHWC")
 resolution: [(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)]
 
 allow_repeat: False
-train_dataset: Waymo_Multi(allow_repeat=${allow_repeat}, split=None, ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train", img_ray_mask_p=[1.0, 0.0, 0.0], valid_camera_id_list=["1", "2", "3"], aug_crop=16, resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], transform=ImgNorm, num_views=${num_views}, n_corres=${n_corres_train}, seq_aug_crop=True)
+train_dataset: Waymo_Multi(allow_repeat=${allow_repeat}, split=None, ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/test", img_ray_mask_p=[1.0, 0.0, 0.0], valid_camera_id_list=["1", "2", "3"], aug_crop=0, resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], transform=ImgNorm, num_views=${num_views}, n_corres=${n_corres_train}, seq_aug_crop=True, load_sam_masks=True)
 test_dataset: 1000 @ Waymo_Multi(split=None, ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train", img_ray_mask_p=[1.0, 0.0, 0.0], valid_camera_id_list=["1", "2", "3"], resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], num_views=${num_test_views}, seed=42, n_corres=${n_corres_test}, seq_aug_crop=True)
 
 seed: 0
@@ -65,7 +66,7 @@ save_dir: 'checkpoints/waymo'
 # exp_name: 'step2(fix_mask+nometric+fixgs+depth+fixlpips+lowvelocity+fixrepeat+l1loss+onlyforward+novelocityreg+finetune10conf)'
 # exp_name: 'step2(onlyflow+lr+interval)'
 # exp_name: 'flow-samweight1'
-exp_name: 'new_all_nodistill_8views_smoothl1'
+exp_name: 'debug'
 # exp_name: 'step2(true+fixmodel+lowlr!+nolpips+onlyflow+velocitylocal+fromscratch)'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs

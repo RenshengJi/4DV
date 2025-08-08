@@ -12,13 +12,15 @@ from dust3r.utils.image import imread_cv2
 class Waymo_Multi(BaseMultiViewDataset):
     """Dataset of outdoor street scenes, 5 images each time"""
 
-    def __init__(self, *args, ROOT, img_ray_mask_p=[0.85, 0.10, 0.05], valid_camera_id_list=["1", "2", "3"], **kwargs):
+    def __init__(self, *args, ROOT, img_ray_mask_p=[0.85, 0.10, 0.05], valid_camera_id_list=["1", "2", "3"], 
+                 load_sam_masks=False, **kwargs):
         self.ROOT = ROOT
         self.img_ray_mask_p = img_ray_mask_p
         self.max_interval = 8
         self.video = True
         self.is_metric = True
         self.valid_camera_id_list = valid_camera_id_list
+        self.load_sam_masks = load_sam_masks  # 新增：是否加载SAM掩码
         super().__init__(*args, **kwargs)
         assert self.split is None
         self._load_data()
@@ -112,6 +114,26 @@ class Waymo_Multi(BaseMultiViewDataset):
     def get_stats(self):
         return f"{len(self)} groups of views"
 
+    def _load_sam_masks(self, scene_dir, impath):
+        """加载预处理的SAM掩码"""
+        try:
+            # SAM掩码文件路径：与图像同目录，扩展名为.npy
+            sam_mask_path = osp.join(scene_dir, impath + ".npy")
+            if osp.exists(sam_mask_path):
+                sam_masks = np.load(sam_mask_path)
+                # 确保掩码是3D数组 (num_masks, height, width)
+                if sam_masks.ndim == 2:
+                    sam_masks = sam_masks[np.newaxis, :, :]
+                elif sam_masks.ndim == 0 or sam_masks.size == 0:
+                    # 空数组，返回None
+                    return None
+                return sam_masks
+            else:
+                return None
+        except Exception as e:
+            print(f"Error loading SAM masks from {sam_mask_path}: {e}")
+            return None
+
     def _get_views(self, idx, resolution, rng, num_views):
         start_id = self.start_img_ids[idx]
         all_image_ids = self.scene_img_list[self.sceneids[start_id]]
@@ -157,25 +179,34 @@ class Waymo_Multi(BaseMultiViewDataset):
                 self.is_metric, v, rng, p=self.img_ray_mask_p
             )
 
-            views.append(
-                dict(
-                    img=image,
-                    depthmap=depthmap,
-                    camera_pose=camera_pose,  # cam2world
-                    camera_intrinsics=intrinsics,
-                    dataset="Waymo",
-                    label=osp.relpath(scene_dir, self.ROOT),
-                    is_metric=self.is_metric,
-                    instance=osp.join(scene_dir, impath + ".jpg"),
-                    is_video=ordered_video,
-                    quantile=np.array(0.98, dtype=np.float32),
-                    img_mask=img_mask,
-                    ray_mask=ray_mask,
-                    camera_only=False,
-                    depth_only=False,
-                    single_view=False,
-                    reset=False,
-                )
+            # 加载SAM掩码（如果启用）
+            sam_masks = None
+            if self.load_sam_masks:
+                sam_masks = self._load_sam_masks(scene_dir, impath)
+
+            view_dict = dict(
+                img=image,
+                depthmap=depthmap,
+                camera_pose=camera_pose,  # cam2world
+                camera_intrinsics=intrinsics,
+                dataset="Waymo",
+                label=osp.relpath(scene_dir, self.ROOT),
+                is_metric=self.is_metric,
+                instance=osp.join(scene_dir, impath + ".jpg"),
+                is_video=ordered_video,
+                quantile=np.array(0.98, dtype=np.float32),
+                img_mask=img_mask,
+                ray_mask=ray_mask,
+                camera_only=False,
+                depth_only=False,
+                single_view=False,
+                reset=False,
             )
+            
+            # 如果加载了SAM掩码，添加到view_dict中
+            if sam_masks is not None:
+                view_dict["sam_masks"] = sam_masks
+
+            views.append(view_dict)
 
         return views

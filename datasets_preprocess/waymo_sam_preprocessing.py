@@ -40,8 +40,8 @@ from sam_preprocessing import SAMPreprocessor
 
 def get_parser():
     parser = argparse.ArgumentParser(description="SAM preprocessing for WayMo dataset")
-    parser.add_argument("--waymo_dir", default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/test", help="Path to WayMo dataset directory")
-    parser.add_argument("--output_dir", default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/test", help="Output directory for processed data")
+    parser.add_argument("--waymo_dir", default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train", help="Path to WayMo dataset directory")
+    parser.add_argument("--output_dir", default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train", help="Output directory for processed data")
     parser.add_argument("--workers", type=int, default=40, help="Number of parallel workers")
     parser.add_argument("--resolution", type=int, default=512, help="Output image resolution")
     

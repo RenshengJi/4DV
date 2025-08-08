@@ -213,6 +213,12 @@ def train(args):
         del ckpt
         
 
+    # 检查是否使用预处理的SAM掩码
+    # use_preprocessed_sam = getattr(args, "use_preprocessed_sam", False)
+    # if use_preprocessed_sam:
+    #     printer.info("Using preprocessed SAM masks - skipping SAM model loading")
+    #     auxiliary_models = dict()
+    # else:
     auxiliary_model_configs = getattr(args, "auxiliary_models", None)
     auxiliary_models = dict()
     if auxiliary_model_configs is not None:
@@ -563,44 +569,66 @@ def train(args):
                             "loss_velocity": torch.tensor(0.0, device=device, requires_grad=True),
                         })
                 
-                # # SAM2 mask-based velocity consistency loss
-                # if "sam2" in auxiliary_models and vggt_batch.get("images") is not None:
-                #     try:
-                #         sam2_velocity_loss_dict = sam2_velocity_consistency_loss(
-                #             vggt_batch["images"], 
-                #             preds["velocity"], 
-                #             auxiliary_models["sam2"],
-                #             device=device
-                #         )
-                #         loss += sam2_velocity_loss_dict.get("sam2_velocity_consistency_loss", 0.0)
-                #         loss_dict.update(sam2_velocity_loss_dict)
-                #     except Exception as e:
-                #         print(f"Error in SAM2 loss computation: {e}")
-                #         # 添加零损失作为fallback
-                #         loss_dict.update({
-                #             "sam2_velocity_consistency_loss": torch.tensor(0.0, device=device, requires_grad=True),
-                #         })
+                # SAM2 mask-based velocity consistency loss
+                # 使用预处理的SAM掩码或在线推理
+                use_preprocessed_sam = getattr(args, "use_preprocessed_sam", False)
+                if use_preprocessed_sam:
+                    # 使用预加载的SAM掩码
+                    if vggt_batch.get("images") is not None and vggt_batch.get("sam_masks") is not None:
+                        try:
+                            sam2_velocity_loss_dict = sam2_velocity_consistency_loss_with_preprocessed_masks(
+                                vggt_batch["images"], 
+                                preds["velocity"], 
+                                vggt_batch["sam_masks"],
+                                device=device
+                            )
+                            loss += sam2_velocity_loss_dict.get("sam2_velocity_consistency_loss", 0.0)
+                            loss_dict.update(sam2_velocity_loss_dict)
+                        except Exception as e:
+                            print(f"Error in preprocessed SAM2 loss computation: {e}")
+                            # 添加零损失作为fallback
+                            loss_dict.update({
+                                "sam2_velocity_consistency_loss": torch.tensor(0.0, device=device, requires_grad=True),
+                            })
+                else:
+                    # 使用在线SAM推理
+                    if "sam2" in auxiliary_models and vggt_batch.get("images") is not None:
+                        try:
+                            sam2_velocity_loss_dict = sam2_velocity_consistency_loss(
+                                vggt_batch["images"], 
+                                preds["velocity"], 
+                                auxiliary_models["sam2"],
+                                device=device
+                            )
+                            loss += sam2_velocity_loss_dict.get("sam2_velocity_consistency_loss", 0.0)
+                            loss_dict.update(sam2_velocity_loss_dict)
+                        except Exception as e:
+                            print(f"Error in SAM2 loss computation: {e}")
+                            # 添加零损失作为fallback
+                            loss_dict.update({
+                                "sam2_velocity_consistency_loss": torch.tensor(0.0, device=device, requires_grad=True),
+                            })
                 
                 # DAM2 sky mask generation and sky loss                    
                 # Sky opacity loss: 鼓励sky区域的gaussian opacity为0
-                if preds.get("gaussian_params") is not None:
-                    sky_opacity_loss_dict = sky_opacity_loss(
-                        preds["gaussian_params"], 
-                        sky_masks, 
-                        weight=1.0
-                    )
-                    loss += sky_opacity_loss_dict.get("sky_opacity_loss", 0.0)
-                    loss_dict.update(sky_opacity_loss_dict)
+                # if preds.get("gaussian_params") is not None:
+                #     sky_opacity_loss_dict = sky_opacity_loss(
+                #         preds["gaussian_params"], 
+                #         sky_masks, 
+                #         weight=1.0
+                #     )
+                #     loss += sky_opacity_loss_dict.get("sky_opacity_loss", 0.0)
+                #     loss_dict.update(sky_opacity_loss_dict)
                     
-                    # 计算sky color loss
-                    sky_color_loss_dict = sky_color_loss(
-                        preds["pred_sky_colors"], 
-                        vggt_batch["images"], 
-                        sky_masks, 
-                        weight=1.0
-                    )
-                    loss += sky_color_loss_dict.get("sky_color_loss", 0.0)
-                    loss_dict.update(sky_color_loss_dict)
+                #     # 计算sky color loss
+                #     sky_color_loss_dict = sky_color_loss(
+                #         preds["pred_sky_colors"], 
+                #         vggt_batch["images"], 
+                #         sky_masks, 
+                #         weight=1.0
+                #     )
+                #     loss += sky_color_loss_dict.get("sky_color_loss", 0.0)
+                #     loss_dict.update(sky_color_loss_dict)
 
             
                 
@@ -1235,6 +1263,24 @@ def sam2_velocity_consistency_loss(images, velocity, sam2_model, device):
     return sam2_velocity_consistency_loss_impl(images, velocity, sam2_model, device)
 
 
+def sam2_velocity_consistency_loss_with_preprocessed_masks(images, velocity, sam_masks, device):
+    """
+    Compute velocity consistency loss using preprocessed SAM masks.
+    
+    Args:
+        images: [B, S, 3, H, W] - input images
+        velocity: [B, S, H, W, 3] - predicted velocity
+        sam_masks: [B, S, num_masks, H, W] - preprocessed SAM masks
+        device: torch device
+    
+    Returns:
+        dict: loss dictionary containing sam2_velocity_consistency_loss
+    """
+    from vggt.training.loss import sam2_velocity_consistency_loss_with_masks_impl
+    
+    return sam2_velocity_consistency_loss_with_masks_impl(images, velocity, sam_masks, device)
+
+
 def dam2_sky_mask_generation(images, dam2_model, device):
     """
     Generate sky masks using DAM2 depth predictions.
@@ -1303,19 +1349,54 @@ def cut3r_batch_to_vggt(views):
         'world_points': torch.stack([v['pts3d'] for v in views], dim=0) if 'pts3d' in views[0] else None,
     }
 
+    # 处理SAM掩码（如果存在）
+    if 'sam_masks' in views[0]:
+        sam_masks_list = []
+        for v in views:
+            if v['sam_masks'] is not None:
+                # 确保SAM掩码是tensor格式
+                if isinstance(v['sam_masks'], np.ndarray):
+                    sam_masks = torch.from_numpy(v['sam_masks']).float()
+                else:
+                    sam_masks = v['sam_masks'].float()
+                
+                # 处理形状为 (1, num_mask, h, w) 的情况
+                if sam_masks.dim() == 4 and sam_masks.shape[0] == 1:
+                    sam_masks = sam_masks.squeeze(0)  # 移除batch维度，变成 (num_mask, h, w)
+                
+                sam_masks_list.append(sam_masks)
+            else:
+                # 如果没有SAM掩码，创建空的tensor
+                sam_masks_list.append(torch.zeros(0, v['img'].shape[1], v['img'].shape[2]))
+        
+        # 找到最大数量的掩码
+        max_num_masks = max(masks.shape[0] for masks in sam_masks_list)
+        
+        # 填充到相同数量的掩码
+        padded_sam_masks = []
+        for masks in sam_masks_list:
+            if masks.shape[0] < max_num_masks:
+                # 用零填充
+                padding = torch.zeros(max_num_masks - masks.shape[0], masks.shape[1], masks.shape[2]).to(masks.device)
+                masks = torch.cat([masks, padding], dim=0)
+            padded_sam_masks.append(masks)
+        
+        vggt_batch['sam_masks'] = torch.stack(padded_sam_masks, dim=0)  # [S, num_masks, H, W]
+
     with tf32_off(), torch.amp.autocast("cuda", enabled=False):
         # 转换world points的坐标系到第一帧相机坐标系
-        B, S, H, W, _ = vggt_batch['world_points'].shape
-        world_points = vggt_batch['world_points'].reshape(B, S, H*W, 3)
-        world_points = torch.matmul(torch.linalg.inv(vggt_batch['extrinsics'][0])[:, :3, :3], world_points.transpose(-1, -2)).transpose(-1, -2) + \
-                                   torch.linalg.inv(vggt_batch['extrinsics'][0])[:, :3, 3:4].transpose(-1, -2)
-        vggt_batch['world_points'] = world_points.reshape(B, S, H, W, 3)
+        if vggt_batch['world_points'] is not None:
+            B, S, H, W, _ = vggt_batch['world_points'].shape
+            world_points = vggt_batch['world_points'].reshape(B, S, H*W, 3)
+            world_points = torch.matmul(torch.linalg.inv(vggt_batch['extrinsics'][0])[:, :3, :3], world_points.transpose(-1, -2)).transpose(-1, -2) + \
+                                       torch.linalg.inv(vggt_batch['extrinsics'][0])[:, :3, 3:4].transpose(-1, -2)
+            vggt_batch['world_points'] = world_points.reshape(B, S, H, W, 3)
 
-        # 转换extrinsics的坐标系到第一帧相机坐标系
-        vggt_batch['extrinsics'] = torch.matmul(
-                torch.linalg.inv(vggt_batch['extrinsics']),
-                vggt_batch['extrinsics'][0]
-            )
+            # 转换extrinsics的坐标系到第一帧相机坐标系
+            vggt_batch['extrinsics'] = torch.matmul(
+                    torch.linalg.inv(vggt_batch['extrinsics']),
+                    vggt_batch['extrinsics'][0]
+                )
 
     vggt_batch['images'] = vggt_batch['images'].permute(1, 0, 2, 3, 4).contiguous()
     vggt_batch['depths'] = vggt_batch['depths'].permute(1, 0, 2, 3).contiguous() if vggt_batch['depths'] is not None else None
@@ -1323,6 +1404,11 @@ def cut3r_batch_to_vggt(views):
     vggt_batch['extrinsics'] = vggt_batch['extrinsics'].permute(1, 0, 2, 3).contiguous() if vggt_batch['extrinsics'] is not None else None
     vggt_batch['point_masks'] = vggt_batch['point_masks'].permute(1, 0, 2, 3).contiguous() if vggt_batch['point_masks'] is not None else None
     vggt_batch['world_points'] = vggt_batch['world_points'].permute(1, 0, 2, 3, 4).contiguous() if vggt_batch['world_points'] is not None else None
+    
+    # 处理SAM掩码的维度转换
+    if 'sam_masks' in vggt_batch:
+        # 从 [S, num_masks, H, W] 转换为 [B, S, num_masks, H, W]，其中B=1
+        vggt_batch['sam_masks'] = vggt_batch['sam_masks'].unsqueeze(0).contiguous()  # [B, S, num_masks, H, W]
 
     return vggt_batch
 

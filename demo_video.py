@@ -43,7 +43,7 @@ def parse_args():
     parser.add_argument(
         "--model_path",
         type=str,
-        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/new_all_nodistill_8views_smoothl1/checkpoint-epoch_0_5208.pth",
+        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/new_all_nodistill_8views_smoothl1/checkpoint-epoch_0_26040.pth",
         help="Path to the pretrained model checkpoint.",
     )
     parser.add_argument(
@@ -73,7 +73,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./results_36456_8views",
+        default="./results_26040_8views_true",
         help="value for tempfile.tempdir",
     )
     parser.add_argument(
@@ -196,7 +196,7 @@ def run_inference(dataset, model, device, args, teacher_model=None):
     # Prepare input views.
     print("Preparing input views...")
     idx = args.idx
-    num_views = 24
+    num_views = 8
     views = dataset.__getitem__((idx, 2, num_views))
 
     

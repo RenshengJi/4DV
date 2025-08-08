@@ -319,7 +319,7 @@ def flow_loss(conf, interval, forward_flow, backward_flow, forward_consist_mask,
             "forward",
             interval=interval
         )
-        forward_loss = F.smooth_l1_loss(warped_means, target_means)
+        forward_loss = F.l1_loss(warped_means, target_means)
         forward_loss = check_and_fix_inf_nan(forward_loss, "forward_loss")
 
         # backward loss
@@ -332,7 +332,7 @@ def flow_loss(conf, interval, forward_flow, backward_flow, forward_consist_mask,
             "backward",
             interval=interval
         )
-        backward_loss = F.smooth_l1_loss(warped_means, target_means)
+        backward_loss = F.l1_loss(warped_means, target_means)
         backward_loss = check_and_fix_inf_nan(backward_loss, "backward_loss")
 
         flow_loss_dict = {
@@ -1379,6 +1379,82 @@ def vggt_distillation_loss(student_preds, teacher_preds, weight_pose=1.0, weight
         loss_dict["loss_depth_conf_distillation"] = torch.tensor(0.0, device=student_preds.get("depth_conf", torch.tensor(0.0)).device, requires_grad=True)
     
     return loss_dict
+
+
+
+
+
+def sam2_velocity_consistency_loss_with_masks_impl(images, velocity, sam_masks, device):
+    """
+    Compute velocity consistency loss using preprocessed SAM masks.
+    
+    Args:
+        images: [B, S, 3, H, W] - input images in [0, 1] range
+        velocity: [B, S, H, W, 3] - predicted velocity
+        sam_masks: [B, S, num_masks, H, W] - preprocessed SAM masks
+        device: torch device
+    
+    Returns:
+        dict: loss dictionary containing sam2_velocity_consistency_loss
+    """
+    B, S, C, H, W = images.shape
+    
+    # Reshape for batch processing
+    velocity_flat = velocity.reshape(-1, H, W, 3)  # [B*S, H, W, 3]
+    sam_masks_flat = sam_masks.reshape(-1, sam_masks.shape[2], H, W)  # [B*S, num_masks, H, W]
+    
+    total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    total_masks = 0
+    
+    # Process all frames
+    for batch_idx in range(velocity_flat.shape[0]):
+        frame_velocity = velocity_flat[batch_idx]  # [H, W, 3]
+        frame_masks = sam_masks_flat[batch_idx]  # [num_masks, H, W]
+        
+        if frame_masks.shape[0] == 0:
+            continue
+            
+        # Filter masks by size
+        mask_sizes = frame_masks.sum(dim=(1, 2))  # [num_masks]
+        valid_mask_indices = mask_sizes >= 10  # Filter small masks
+        
+        if not valid_mask_indices.any():
+            continue
+            
+        # Get valid masks
+        valid_masks = frame_masks[valid_mask_indices]  # [valid_num_masks, H, W]
+        
+        # Vectorized velocity consistency computation
+        # Expand velocity to match all valid masks
+        velocity_expanded = frame_velocity.unsqueeze(0).expand(valid_masks.shape[0], -1, -1, -1)  # [valid_num_masks, H, W, 3]
+        
+        # Compute consistency for all masks at once
+        # For each mask, compute the variance of velocity within the mask
+        mask_expanded = valid_masks.unsqueeze(-1)  # [valid_num_masks, H, W, 1]
+        
+        # Apply mask to velocity
+        masked_velocity = velocity_expanded * mask_expanded  # [valid_num_masks, H, W, 3]
+        
+        # Compute mean velocity for each mask
+        mask_sizes_expanded = valid_masks.sum(dim=(1, 2), keepdim=True).unsqueeze(-1)  # [valid_num_masks, 1, 1, 1]
+        mean_velocity = masked_velocity.sum(dim=(1, 2)) / (mask_sizes_expanded.squeeze(-1) + 1e-8)  # [valid_num_masks, 3]
+        
+        # Compute variance of velocity within each mask
+        velocity_diff = masked_velocity - mean_velocity.unsqueeze(1).unsqueeze(2)  # [valid_num_masks, H, W, 3]
+        velocity_variance = (velocity_diff ** 2 * mask_expanded).sum(dim=(1, 2)) / (mask_sizes_expanded.squeeze(-1) + 1e-8)  # [valid_num_masks, 3]
+        
+        # Loss is the mean variance across all masks and dimensions
+        frame_loss = velocity_variance.mean()
+        total_loss = total_loss + frame_loss
+        total_masks += valid_masks.shape[0]
+    
+    # Compute average loss
+    if total_masks > 0:
+        avg_loss = total_loss / total_masks
+    else:
+        avg_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    
+    return {"sam2_velocity_consistency_loss": avg_loss}
 
 
 
