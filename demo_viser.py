@@ -29,10 +29,12 @@ except ImportError:
 import sys
 # 添加vggt路径
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src/vggt'))
+sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.geometry import closed_form_inverse_se3, unproject_depth_map_to_point_map, unproject_depth_map_to_point_map_batch, homo_matrix_inverse
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+from vggt.training.loss import velocity_local_to_global
 sys.path.append(os.path.join(os.path.dirname(__file__), "src/SEA-RAFT/core"))
 from raft import RAFT
 from vggt.utils.auxiliary import RAFTCfg, calc_flow
@@ -410,50 +412,26 @@ def get_next_pts(preds, pred_pts=False):
 
     velocity = preds.pop("velocity")
     velocity = torch.sign(velocity) * (torch.exp(torch.abs(velocity)) - 1)
-    velocity = torch.zeros_like(velocity) #TODO: remove this
+    # velocity = torch.zeros_like(velocity) #TODO: remove this
 
-    pts_in_next = world_points + velocity
+    # 使用velocity_local_to_global函数将velocity从局部坐标系转换到全局坐标系
+    # velocity shape: (B, S, H, W, 3) -> 需要重塑为 (N, 3) 其中 N = B*S*H*W
+    velocity_reshaped = velocity.reshape(-1, 3)  # (B*S*H*W, 3)
+    
+    # 使用velocity_local_to_global函数进行坐标系转换
+    extrinsic_inv = torch.linalg.inv(extrinsic)
+    velocity_global = velocity_local_to_global(velocity_reshaped, extrinsic_inv)  # (B*S*H*W, 3)
+    
+    # 重塑回原始形状
+    velocity_global = velocity_global.reshape(B, S, H, W, 3)  # (B, S, H, W, 3)
+
+    pts_in_next = world_points + velocity_global
     pts_in_next = pts_in_next[:, :-1]  # remove the last frame
     pts_in_next_mask = torch.ones_like(pts_in_next[..., 0], dtype=torch.bool)
     preds["pts_in_next_frame"] = pts_in_next
     preds["pts_in_next_frame_mask"] = pts_in_next_mask
     return preds
 
-
-def get_next_pts_by_flow(preds, forward_flow, forward_consist_mask, pred_pts=False):
-    images = preds["images"]
-    depthmaps = preds["depth"]
-    extrinsic, intrinsic = pose_encoding_to_extri_intri(preds["pose_enc"], images.shape[-2:])
-    pad_row = torch.tensor([0, 0, 0, 1], device=images.device)[None, None, None].expand(*extrinsic.shape[:-2], -1, -1)
-    extrinsic = torch.cat([extrinsic, pad_row], dim=-2)
-    B, S, H, W, _ = depthmaps.shape
-    world_points, _, world_points_mask = unproject_depth_map_to_point_map_batch(
-        depthmaps.reshape(B * S, H, W, -1),
-        extrinsic.reshape(B * S, 4, 4),
-        intrinsic.reshape(B * S, 3, 3),
-    )
-    world_points = world_points.reshape(B, S, H, W, 3)
-    world_points_mask = world_points_mask.reshape(B, S, H, W)
-
-
-    forward_consist_mask = torch.ones_like(forward_consist_mask, dtype=torch.bool)
-    inds = torch.nonzero(forward_consist_mask, as_tuple=True)
-    init_pos_b, init_pos_t, _, init_pos_h, init_pos_w = inds
-    flow = forward_flow[init_pos_b, init_pos_t, :, init_pos_h, init_pos_w]
-
-    warped_pos_b = init_pos_b
-    T = world_points.shape[1]
-    warped_pos_t = (init_pos_t + 2).clamp(min=0, max=T-1)
-
-    warped_pos_h = (init_pos_h + flow[:, 1]).clamp(min=0, max=H-1).round().long()
-    warped_pos_w = (init_pos_w + flow[:, 0]).clamp(min=0, max=W-1).round().long()
-    world_points = world_points[warped_pos_b, warped_pos_t, warped_pos_h, warped_pos_w, :]
-
-
-    pts_in_next_mask = torch.ones_like(world_points[..., 0], dtype=torch.bool)
-    preds["pts_in_next_frame"] = world_points.unsqueeze(0)
-    preds["pts_in_next_frame_mask"] = pts_in_next_mask.unsqueeze(0)
-    return preds
 
 
 
@@ -527,7 +505,7 @@ def main():
     # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(fix_mask+nometric+fixgs+depth+fixlpips+lowvelocity+fixrepeat+l1loss+onlyforward+novelocityreg)/checkpoint-epoch_0_30992.pth", map_location=device)['model']
     # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(fix_mask+nometric+fixgs+depth+fixlpips+lowvelocity+fixrepeat+l1loss+onlyforward+novelocityreg+finetune10conf)/checkpoint-epoch_1_7152.pth", map_location=device)['model']
     # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(onlyflow+lr)/checkpoint-epoch_0_3576.pth", map_location=device)['model']
-    ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/debug_sky/checkpoint-epoch_0_8924.pth", map_location=device)['model']
+    ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(true+fixmodel+lowlr!+nolpips+onlyflow+velocitylocal+fromscratch)/checkpoint-epoch_2_17880.pth", map_location=device)['model']
     # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/flow-samweight1/checkpoint-epoch_0_7152.pth", map_location=device)['model']
     ckpt = {k.replace("module.", ""): v for k, v in ckpt.items()}
     model.load_state_dict(ckpt, strict=False)
@@ -562,56 +540,6 @@ def main():
     print(f"Preprocessed images shape: {images.shape}")
 
 
-    # 将images保存为video
-    video_path = os.path.join("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo", "video.mp4")
-    
-    print(f"图像形状: {images.shape}")
-    print(f"图像数据类型: {images.dtype}")
-    print(f"图像值范围: [{images.min():.3f}, {images.max():.3f}]")
-    
-    try:
-        # 准备视频帧数据
-        video_frames = []
-        for i, image in enumerate(images):
-            # 确保图像格式正确：从 (C, H, W) 转换为 (H, W, C)
-            img_np = image.cpu().numpy().transpose(1, 2, 0)
-            
-            # 确保像素值在0-255范围内
-            if img_np.max() <= 1.0:
-                img_np = (img_np * 255).astype(np.uint8)
-            else:
-                img_np = img_np.astype(np.uint8)
-            
-            # 检查图像数据是否有效
-            if img_np.shape[0] == 0 or img_np.shape[1] == 0:
-                print(f"跳过无效图像帧 {i}")
-                continue
-            
-            video_frames.append(img_np)
-        
-        # 使用imageio保存视频，确保浏览器兼容性
-        if video_frames:
-            imageio.mimsave(video_path, video_frames, fps=5, codec='libx264')
-            print(f"成功保存视频到 {video_path}")
-            
-            # 验证文件是否成功创建
-            if os.path.exists(video_path):
-                file_size = os.path.getsize(video_path)
-                print(f"视频文件大小: {file_size} 字节")
-                if file_size == 0:
-                    print("警告: 视频文件大小为0，可能损坏")
-            else:
-                print("错误: 视频文件未创建")
-        else:
-            print("没有有效的视频帧可保存")
-            
-    except Exception as e:
-        print(f"保存视频时出错: {e}")
-        import traceback
-        traceback.print_exc()
-
-
-
     print("Running inference...")
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
@@ -626,15 +554,6 @@ def main():
     
     predictions = get_next_pts(predictions, pred_pts=args.pred_pts)
 
-    # interval = 2
-    # forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, forward_in_bound_mask, backward_in_bound_mask = calc_flow(
-    #                 images.unsqueeze(0), auxiliary_models["flow"],
-    #                 check_consistency=True,
-    #                 geo_thresh=auxiliary_models["flow"].args.geo_thresh,
-    #                 photo_thresh=auxiliary_models["flow"].args.photo_thresh,
-    #                 interval=interval,
-    #             )
-    # predictions = get_next_pts_by_flow(predictions, forward_flow, forward_consist_mask, pred_pts=args.pred_pts)
 
     print("Processing model outputs...")
     for key in predictions.keys():

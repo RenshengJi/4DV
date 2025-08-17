@@ -21,4 +21,5 @@ h5py
 accelerate
 transformers
 scikit-learn
+open3d
 git+https://github.com/rmurai0610/diff-gaussian-rasterization-w-pose.git
