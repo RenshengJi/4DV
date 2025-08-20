@@ -154,9 +154,10 @@ class OpticalFlowRegistration:
                                    depth: torch.Tensor,
                                    intrinsic: torch.Tensor,
                                    image_shape: Tuple[int, int],
-                                   extrinsic: torch.Tensor = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                                   extrinsic: torch.Tensor = None,
+                                   image_rgb: torch.Tensor = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
-        提取物体在2D图像和3D空间中的点
+        提取物体在2D图像和3D空间中的点，以及对应的颜色信息
         
         Args:
             clustering_result: 聚类结果
@@ -164,23 +165,38 @@ class OpticalFlowRegistration:
             intrinsic: 相机内参 [3, 3]
             image_shape: 图像尺寸 (H, W)
             extrinsic: 相机外参 [3, 4]，可选
+            image_rgb: RGB图像 [3, H, W] 或 [H, W, 3]，可选
             
         Returns:
             points_2d: 2D点坐标 [N, 2]
             points_3d: 3D点坐标 [N, 3]
             point_indices: 点在原始图像中的索引 [N]
+            colors: RGB颜色 [N, 3]
         """
         H, W = image_shape
         
         # 获取物体的点索引
         cluster_indices = clustering_result.get('cluster_indices', [])
         if not cluster_indices:
-            return np.array([]), np.array([]), np.array([])
+            return np.array([]), np.array([]), np.array([]), np.array([])
         
         all_points_2d = []
         all_points_3d = []
         all_indices = []
+        all_colors = []
         
+        # 处理RGB图像，确保格式正确
+        rgb_image = None
+        if image_rgb is not None:
+            if isinstance(image_rgb, torch.Tensor):
+                rgb_np = image_rgb.cpu().numpy()
+                # 检查图像格式并转换为 [H, W, 3]
+                if rgb_np.shape[0] == 3:  # [3, H, W] -> [H, W, 3]
+                    rgb_np = rgb_np.transpose(1, 2, 0)
+                rgb_image = rgb_np
+            else:
+                rgb_image = image_rgb
+                
         for cluster_idx, point_indices in enumerate(cluster_indices):
             if not point_indices:
                 continue
@@ -201,14 +217,29 @@ class OpticalFlowRegistration:
                         # 3D点坐标（相机坐标系）
                         point_3d = self._pixel_to_3d(x, y, depth_val, intrinsic, extrinsic)
                         
+                        # 提取颜色信息
+                        if rgb_image is not None:
+                            # 确保坐标在有效范围内
+                            color = rgb_image[y, x]
+                            # 如果颜色值在[0,1]范围内，转换到[0,255]
+                            if color.max() <= 1.0:
+                                color = (color * 255).astype(np.uint8)
+                            else:
+                                color = color.astype(np.uint8)
+                        else:
+                            # 如果没有RGB图像，使用基于cluster_idx的默认颜色
+                            hue = (cluster_idx * 137.5) % 360
+                            color = (self._hsv_to_rgb(hue, 0.8, 0.9) * 255).astype(np.uint8)
+                        
                         all_points_2d.append(point_2d)
                         all_points_3d.append(point_3d)
                         all_indices.append(idx)
+                        all_colors.append(color)
         
         if not all_points_2d:
-            return np.array([]), np.array([]), np.array([])
+            return np.array([]), np.array([]), np.array([]), np.array([])
         
-        return np.array(all_points_2d), np.array(all_points_3d), np.array(all_indices)
+        return np.array(all_points_2d), np.array(all_points_3d), np.array(all_indices), np.array(all_colors)
     
     def _pixel_to_3d(self, x: float, y: float, depth: float, intrinsic: torch.Tensor, extrinsic: torch.Tensor = None) -> np.ndarray:
         """
@@ -262,6 +293,72 @@ class OpticalFlowRegistration:
             return point_world_homo[:3]
         
         return point_camera
+    
+    def _extract_colors_for_points(self,
+                                 clustering_result: Dict,
+                                 cluster_idx: int,
+                                 frame_idx: int,
+                                 preds: Dict,
+                                 vggt_batch: Dict) -> Optional[np.ndarray]:
+        """
+        为特定聚类的点提取颜色信息
+        
+        Args:
+            clustering_result: 聚类结果
+            cluster_idx: 聚类索引
+            frame_idx: 帧索引
+            preds: 模型预测结果
+            vggt_batch: 输入数据批次
+            
+        Returns:
+            colors: RGB颜色数组 [N, 3] 或 None
+        """
+        try:
+            # 获取图像数据
+            if 'images' not in vggt_batch:
+                return None
+                
+            # 获取RGB图像 [B, S, C, H, W]
+            images = vggt_batch['images']
+            if frame_idx >= images.shape[1]:
+                return None
+                
+            image = images[0, frame_idx]  # [C, H, W]
+            
+            # 获取聚类点的索引
+            cluster_indices = clustering_result.get('cluster_indices', [])
+            if cluster_idx >= len(cluster_indices):
+                return None
+                
+            point_indices = cluster_indices[cluster_idx]
+            if not point_indices:
+                return None
+                
+            # 提取颜色
+            H, W = image.shape[1], image.shape[2]
+            colors = []
+            
+            for idx in point_indices:
+                y = idx // W
+                x = idx % W
+                
+                if 0 <= y < H and 0 <= x < W:
+                    # 提取RGB值 [C] -> [3]
+                    color = image[:, y, x].cpu().numpy()
+                    
+                    # 确保颜色值在[0, 255]范围内
+                    if color.max() <= 1.0:
+                        color = (color * 255).astype(np.uint8)
+                    else:
+                        color = color.astype(np.uint8)
+                    
+                    colors.append(color)
+            
+            return np.array(colors) if colors else None
+            
+        except Exception as e:
+            print(f"提取颜色信息失败: {e}")
+            return None
     
     def estimate_transformation_3d_pnp(self, 
                                      points_3d_src: np.ndarray, 
@@ -611,10 +708,10 @@ class OpticalFlowRegistration:
         """
         H, W = depth_src.shape
         
-        # 提取物体的2D和3D点
-        points_2d_src, points_3d_src, indices_src = self.extract_object_points_2d_3d(
+        # 提取物体的2D和3D点（暂时不需要颜色信息用于变换计算）
+        points_2d_src, points_3d_src, indices_src, _ = self.extract_object_points_2d_3d(
             clustering_src, depth_src, intrinsic_src, (H, W), extrinsic_src)
-        points_2d_dst, points_3d_dst, indices_dst = self.extract_object_points_2d_3d(
+        points_2d_dst, points_3d_dst, indices_dst, _ = self.extract_object_points_2d_3d(
             clustering_dst, depth_dst, intrinsic_dst, (H, W), extrinsic_dst)
         
         if len(points_2d_src) == 0 or len(points_2d_dst) == 0:
@@ -690,7 +787,7 @@ class OpticalFlowRegistration:
         middle_frame_idx = object_frames[len(object_frames) // 2]
         print(f"物体 {global_id}: 聚合到中间帧 {middle_frame_idx} (总帧数: {len(object_frames)})")
         
-        # 获取中间帧的物体点云
+        # 获取中间帧的物体点云和颜色
         middle_result = clustering_results[middle_frame_idx]
         middle_cluster_idx = middle_result['global_ids'].index(global_id)
         middle_points = middle_result['points']
@@ -705,10 +802,21 @@ class OpticalFlowRegistration:
             middle_object_points_cpu = middle_object_points.cpu().numpy()
         else:
             middle_object_points_cpu = middle_object_points
+            
+        # 提取中间帧的颜色信息
+        middle_colors = self._extract_colors_for_points(
+            middle_result, middle_cluster_idx, middle_frame_idx, preds, vggt_batch)
+        if middle_colors is None:
+            # 如果无法提取颜色，使用默认颜色
+            middle_colors = np.tile(
+                (self._hsv_to_rgb((global_id * 137.5) % 360, 0.8, 0.9) * 255).astype(np.uint8),
+                (len(middle_object_points_cpu), 1)
+            )
         
         # 存储所有帧的变换
         transformations = {}
         aggregated_points = [middle_object_points_cpu]
+        aggregated_colors = [middle_colors]
         
         # 对其他帧进行链式变换
         for frame_idx in object_frames:
@@ -739,6 +847,17 @@ class OpticalFlowRegistration:
                     current_object_points, chain_transformation)
                 aggregated_points.append(transformed_points)
                 
+                # 提取当前帧的颜色信息
+                current_colors = self._extract_colors_for_points(
+                    current_result, current_cluster_idx, frame_idx, preds, vggt_batch)
+                if current_colors is None:
+                    # 如果无法提取颜色，使用默认颜色
+                    current_colors = np.tile(
+                        (self._hsv_to_rgb((global_id * 137.5) % 360, 0.8, 0.9) * 255).astype(np.uint8),
+                        (len(current_object_points), 1)
+                    )
+                aggregated_colors.append(current_colors)
+                
                 print(f"  帧 {frame_idx} -> {middle_frame_idx}: 链式变换成功")
             else:
                 print(f"  帧 {frame_idx} -> {middle_frame_idx}: 链式变换失败")
@@ -747,14 +866,16 @@ class OpticalFlowRegistration:
             print(f"物体 {global_id}: 没有成功的变换")
             return None
         
-        # 合并所有点云
+        # 合并所有点云和颜色
         all_points = np.concatenate(aggregated_points, axis=0)
+        all_colors = np.concatenate(aggregated_colors, axis=0)
         
         return {
             'global_id': global_id,
             'middle_frame': middle_frame_idx,
             'object_frames': object_frames,
             'aggregated_points': all_points,
+            'aggregated_colors': all_colors,
             'transformations': transformations,
             'num_frames': len(object_frames),
             'num_points': len(all_points)
@@ -857,13 +978,14 @@ class OpticalFlowRegistration:
         # 为每个物体保存点云
         for global_id, result in aggregation_results.items():
             aggregated_points = result['aggregated_points']
+            aggregated_colors = result.get('aggregated_colors', None)
             
             # 创建点云文件名
             pointcloud_filename = f"object_{global_id}_aggregated.ply"
             pointcloud_path = os.path.join(pointcloud_dir, pointcloud_filename)
             
-            # 保存为PLY格式
-            self._save_points_as_ply(aggregated_points, pointcloud_path, global_id)
+            # 保存为PLY格式，使用真实颜色
+            self._save_points_as_ply_with_colors(aggregated_points, pointcloud_path, global_id, aggregated_colors)
             
             print(f"  物体 {global_id}: 保存 {len(aggregated_points)} 个点到 {pointcloud_filename}")
         
@@ -907,6 +1029,46 @@ class OpticalFlowRegistration:
         hue = (object_id * 137.5) % 360  # 黄金角度
         rgb = self._hsv_to_rgb(hue, 0.8, 0.9)
         colors[:] = (rgb * 255).astype(np.uint8)
+        
+        # 写入PLY文件
+        with open(filepath, 'w') as f:
+            # PLY头部
+            f.write("ply\n")
+            f.write("format ascii 1.0\n")
+            f.write(f"element vertex {len(points)}\n")
+            f.write("property float x\n")
+            f.write("property float y\n")
+            f.write("property float z\n")
+            f.write("property uchar red\n")
+            f.write("property uchar green\n")
+            f.write("property uchar blue\n")
+            f.write("end_header\n")
+            
+            # 写入点云数据
+            for i in range(len(points)):
+                x, y, z = points[i]
+                r, g, b = colors[i]
+                f.write(f"{x:.6f} {y:.6f} {z:.6f} {r} {g} {b}\n")
+                
+    def _save_points_as_ply_with_colors(self, points: np.ndarray, filepath: str, object_id: int, colors: np.ndarray = None):
+        """
+        将点云和颜色保存为PLY格式
+        
+        Args:
+            points: 点云数据 [N, 3]
+            filepath: 保存路径
+            object_id: 物体ID
+            colors: RGB颜色数据 [N, 3]，可选
+        """
+        # 如果没有提供颜色，使用基于物体ID的默认颜色
+        if colors is None:
+            colors = np.zeros((len(points), 3), dtype=np.uint8)
+            hue = (object_id * 137.5) % 360  # 黄金角度
+            rgb = self._hsv_to_rgb(hue, 0.8, 0.9)
+            colors[:] = (rgb * 255).astype(np.uint8)
+        else:
+            # 确保颜色格式正确
+            colors = colors.astype(np.uint8)
         
         # 写入PLY文件
         with open(filepath, 'w') as f:
