@@ -1242,7 +1242,7 @@ class PointCloudLoader:
         sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
         from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-        from training.loss import depth_to_world_points, velocity_local_to_global
+        from vggt.training.loss import depth_to_world_points, velocity_local_to_global
 
         with tf32_off():
             # 获取相机参数

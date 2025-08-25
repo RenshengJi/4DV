@@ -499,12 +499,7 @@ class ARCroco3DStereo(CroCoNet):
                 self.decoder_embed,
                 self.dec_norm,
                 self.dec_norm_state,
-                self.downstream_head.dpt_self,
-                self.downstream_head.final_transform,
-                self.downstream_head.dpt_cross,
-                self.downstream_head.dpt_rgb,
-                self.downstream_head.pose_head,
-            ],
+            ] + [getattr(self.downstream_head, attr) for attr in ['dpt_self', 'final_transform', 'dpt_cross', 'dpt_rgb', 'pose_head'] if hasattr(self.downstream_head, attr)],
             "cut3r_wo_rgb": [
                 self.patch_embed,
                 self.patch_embed_ray_map,
@@ -523,11 +518,7 @@ class ARCroco3DStereo(CroCoNet):
                 self.decoder_embed,
                 self.dec_norm,
                 self.dec_norm_state,
-                self.downstream_head.dpt_self,
-                self.downstream_head.final_transform,
-                self.downstream_head.dpt_cross,
-                self.downstream_head.pose_head,
-            ],
+            ] + [getattr(self.downstream_head, attr) for attr in ['dpt_self', 'final_transform', 'dpt_cross', 'pose_head'] if hasattr(self.downstream_head, attr)],
             "encoder_and_decoder_and_pose": [
                 self.patch_embed,
                 self.patch_embed_ray_map,
@@ -546,9 +537,7 @@ class ARCroco3DStereo(CroCoNet):
                 self.decoder_embed,
                 self.dec_norm,
                 self.dec_norm_state,
-                self.downstream_head.final_transform,
-                self.downstream_head.pose_head,
-            ]
+            ] + [getattr(self.downstream_head, attr) for attr in ['final_transform', 'pose_head'] if hasattr(self.downstream_head, attr)]
         }
         freeze_all_params(to_be_frozen[freeze])
 

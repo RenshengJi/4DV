@@ -68,6 +68,12 @@ exp_name: 'train_first_stage'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/
+# ========== Stage1数据提取配置 ==========
+stage1_save_frequency: 50                    # 每N个iteration保存一次数据
+enable_optical_flow_aggregation: true        # 是否启用光流聚合
+min_object_size: 100                          # 最小物体尺寸（像素数）
+max_objects_per_frame: 15                     # 每帧最大物体数量
+
 hydra:
   verbose: True
   run:

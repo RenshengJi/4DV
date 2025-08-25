@@ -27,7 +27,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src/vggt'))
 
 from src.dust3r.utils.misc import tf32_off
-from training.loss import depth_to_world_points, velocity_local_to_global
+from vggt.training.loss import depth_to_world_points, velocity_local_to_global
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
 # 添加RAFT相关导入
@@ -47,9 +47,9 @@ class OpticalFlowRegistration:
                  flow_model_name: str = "raft",
                  device: str = "cuda",
                  use_pnp: bool = True,
-                 min_inliers_ratio: float = 0.3,
-                 ransac_threshold: float = 3.0,
-                 max_flow_magnitude: float = 100.0,
+                 min_inliers_ratio: float = 0.1,  # 降低最小内点比例
+                 ransac_threshold: float = 5.0,  # 增加RANSAC阈值
+                 max_flow_magnitude: float = 200.0,  # 增加最大光流幅度
                  use_simple_correspondence: bool = True,
                  raft_model_path: str = None):
         """
@@ -87,10 +87,17 @@ class OpticalFlowRegistration:
                 # 参照demo_viser.py中的RAFT模型加载方式
                 try:
                     # RAFT模型配置 - 使用与demo_viser.py相同的配置
+                    # 构建绝对路径
+                    if raft_model_path:
+                        model_path = raft_model_path
+                    else:
+                        current_dir = os.path.dirname(os.path.abspath(__file__))
+                        model_path = os.path.join(current_dir, "src", "Tartan-C-T-TSKH-kitti432x960-M.pth")
+                    
                     raft_args = RAFTCfg(
                         name="kitti-M", 
                         dataset="kitti", 
-                        path=raft_model_path if raft_model_path else "src/Tartan-C-T-TSKH-kitti432x960-M.pth",
+                        path=model_path,
                         use_var=True, 
                         var_min=0, 
                         var_max=10, 
@@ -110,7 +117,8 @@ class OpticalFlowRegistration:
                     raft_model = RAFT(raft_args)
                     
                     # 加载预训练权重 - 参照demo_viser.py的方式
-                    checkpoint_path = raft_model_path if raft_model_path else "src/Tartan-C-T-TSKH-kitti432x960-M.pth"
+                    # 使用与RAFTCfg相同的路径，确保一致性
+                    checkpoint_path = model_path
                     if os.path.exists(checkpoint_path):
                         state_dict = torch.load(checkpoint_path, map_location=self.device)
                         raft_model.load_state_dict(state_dict)
@@ -175,9 +183,27 @@ class OpticalFlowRegistration:
         """
         H, W = image_shape
         
-        # 获取物体的点索引
+        # 获取物体的点索引 - 支持多种格式
         cluster_indices = clustering_result.get('cluster_indices', [])
+        
+        # 如果没有cluster_indices，尝试从其他字段构建
         if not cluster_indices:
+            # 检查是否有labels和global_ids字段
+            if 'labels' in clustering_result and 'global_ids' in clustering_result:
+                labels = clustering_result['labels']
+                global_ids = clustering_result['global_ids']
+                
+                # 为每个global_id创建cluster_indices
+                cluster_indices = []
+                for i, gid in enumerate(global_ids):
+                    # 获取属于该global_id的点的索引
+                    mask = (labels == i)
+                    indices = np.where(mask.flatten())[0] if hasattr(mask, 'flatten') else np.where(mask)[0]
+                    if len(indices) > 0:
+                        cluster_indices.append(indices.tolist())
+            
+        if not cluster_indices:
+            print(f"    调试: 无法从聚类结果提取cluster_indices")
             return np.array([]), np.array([]), np.array([]), np.array([])
         
         all_points_2d = []
@@ -189,7 +215,7 @@ class OpticalFlowRegistration:
         rgb_image = None
         if image_rgb is not None:
             if isinstance(image_rgb, torch.Tensor):
-                rgb_np = image_rgb.cpu().numpy()
+                rgb_np = image_rgb.detach().cpu().numpy()
                 # 检查图像格式并转换为 [H, W, 3]
                 if rgb_np.shape[0] == 3:  # [3, H, W] -> [H, W, 3]
                     rgb_np = rgb_np.transpose(1, 2, 0)
@@ -241,6 +267,45 @@ class OpticalFlowRegistration:
         
         return np.array(all_points_2d), np.array(all_points_3d), np.array(all_indices), np.array(all_colors)
     
+    def _create_cluster_indices_for_global_id(self, clustering_result: Dict, global_id: int) -> Dict:
+        """
+        为特定global_id创建clustering结果，转换为extract_object_points_2d_3d期望的格式
+        
+        Args:
+            clustering_result: 原始聚类结果，包含'labels', 'global_ids'等字段
+            global_id: 目标物体的全局ID
+            
+        Returns:
+            格式化的聚类结果字典，包含'cluster_indices'字段
+        """
+        if 'labels' not in clustering_result or 'global_ids' not in clustering_result:
+            print(f"    调试: clustering_result缺少必要字段 - labels或global_ids")
+            return {'cluster_indices': []}
+            
+        labels = clustering_result['labels']
+        global_ids = clustering_result['global_ids']
+        
+        # 找到global_id对应的cluster索引
+        if global_id not in global_ids:
+            print(f"    调试: global_id {global_id} 不在global_ids中: {global_ids}")
+            return {'cluster_indices': []}
+        
+        cluster_idx = global_ids.index(global_id)
+        
+        # 获取属于该cluster的点的mask
+        object_mask = labels == cluster_idx
+        
+        # 如果是torch tensor，转换为numpy
+        if isinstance(object_mask, torch.Tensor):
+            object_mask = object_mask.detach().cpu().numpy()
+        
+        # 找到所有属于该物体的像素点索引
+        object_indices = np.where(object_mask.flatten())[0]
+        
+        return {
+            'cluster_indices': [object_indices.tolist()] if len(object_indices) > 0 else []
+        }
+    
     def _pixel_to_3d(self, x: float, y: float, depth: float, intrinsic: torch.Tensor, extrinsic: torch.Tensor = None) -> np.ndarray:
         """
         将像素坐标和深度转换为3D坐标
@@ -255,7 +320,7 @@ class OpticalFlowRegistration:
         Returns:
             3D点坐标 [3]
         """
-        intrinsic_np = intrinsic.cpu().numpy()
+        intrinsic_np = intrinsic.detach().cpu().numpy()
         
         # 检查内参矩阵的维度
         if intrinsic_np.ndim == 4:  # BxSx3x3
@@ -275,13 +340,22 @@ class OpticalFlowRegistration:
         
         # 如果提供了外参，转换到世界坐标系
         if extrinsic is not None:
-            extrinsic_np = extrinsic.cpu().numpy()
+            extrinsic_np = extrinsic.detach().cpu().numpy()
             
             # 检查外参矩阵的维度
-            if extrinsic_np.ndim == 4:  # BxSx3x4
+            if extrinsic_np.ndim == 4:  # BxSx4x4 或 BxSx3x4
                 extrinsic_np = extrinsic_np[0, 0]  # 取第一个batch和第一个序列
-            elif extrinsic_np.ndim == 3:  # Sx3x4
+            elif extrinsic_np.ndim == 3:  # Sx4x4 或 Sx3x4
                 extrinsic_np = extrinsic_np[0]  # 取第一个序列
+            
+            # 确保外参矩阵是4x4的齐次变换矩阵
+            if extrinsic_np.shape == (3, 4):
+                # 如果是3x4矩阵，扩展为4x4齐次矩阵
+                bottom_row = np.array([[0, 0, 0, 1]])
+                extrinsic_np = np.concatenate([extrinsic_np, bottom_row], axis=0)
+            elif extrinsic_np.shape != (4, 4):
+                # 如果不是预期的形状，记录错误并跳过变换
+                return point_camera
             
             # 转换为齐次坐标
             point_homo = np.concatenate([point_camera, [1]])
@@ -344,7 +418,7 @@ class OpticalFlowRegistration:
                 
                 if 0 <= y < H and 0 <= x < W:
                     # 提取RGB值 [C] -> [3]
-                    color = image[:, y, x].cpu().numpy()
+                    color = image[:, y, x].detach().cpu().numpy()
                     
                     # 确保颜色值在[0, 255]范围内
                     if color.max() <= 1.0:
@@ -384,7 +458,7 @@ class OpticalFlowRegistration:
         if len(points_3d_src) < 4:
             return np.eye(3), np.zeros(3), 0.0
         
-        intrinsic_np = intrinsic.cpu().numpy()
+        intrinsic_np = intrinsic.detach().cpu().numpy()
         
         # 检查内参矩阵的维度
         if intrinsic_np.ndim == 4:  # BxSx3x3
@@ -392,19 +466,43 @@ class OpticalFlowRegistration:
         elif intrinsic_np.ndim == 3:  # Sx3x3
             intrinsic_np = intrinsic_np[0]  # 取第一个序列
         
-        # 使用RANSAC进行PnP求解
-        success, rvec, tvec, inliers = cv2.solvePnPRansac(
-            points_3d_src.astype(np.float32),
-            points_2d_dst.astype(np.float32),
-            intrinsic_np,
-            None,
-            reprojectionError=self.ransac_threshold,
-            confidence=0.99,
-            flags=cv2.SOLVEPNP_ITERATIVE
-        )
+        # 确保内参矩阵格式正确
+        if intrinsic_np.shape == (3, 4):
+            # 如果是3x4矩阵，取前3x3部分（相机内参矩阵）
+            intrinsic_np = intrinsic_np[:3, :3]
+        elif intrinsic_np.shape != (3, 3):
+            print(f"错误: 内参矩阵形状不正确: {intrinsic_np.shape}, 期望 (3, 3) 或 (3, 4)")
+            return None, None, 0.0
+        
+        # 使用更宽松的参数进行PnP求解
+        try:
+            success, rvec, tvec, inliers = cv2.solvePnPRansac(
+                points_3d_src.astype(np.float32),
+                points_2d_dst.astype(np.float32),
+                intrinsic_np.astype(np.float32),
+                None,
+                reprojectionError=self.ransac_threshold,
+                confidence=0.95,  # 降低置信度要求
+                iterationsCount=1000,  # 增加迭代次数
+                flags=cv2.SOLVEPNP_ITERATIVE
+            )
+        except Exception as e:
+            # 如果PnP求解出错，尝试使用更简单的方法
+            success = False
+            inliers = None
         
         if not success or inliers is None:
-            return np.eye(3), np.zeros(3), 0.0
+            # 回退方案：使用简单的平移变换
+            if len(points_2d_src) >= 1 and len(points_2d_dst) >= 1:
+                # 计算质心偏移作为简单变换
+                src_centroid = np.mean(points_2d_src, axis=0)
+                dst_centroid = np.mean(points_2d_dst, axis=0)
+                translation = dst_centroid - src_centroid
+                
+                # 返回单位旋转矩阵和计算出的平移
+                return np.eye(3), np.array([translation[0], translation[1], 0]), 0.3
+            else:
+                return np.eye(3), np.zeros(3), 0.0
         
         # 转换为旋转矩阵
         R, _ = cv2.Rodrigues(rvec)
@@ -454,7 +552,7 @@ class OpticalFlowRegistration:
                                       distance_threshold: float = 10.0,
                                       use_simple_method: bool = True) -> np.ndarray:
         """
-        使用光流找到对应点（优化版本）
+        使用光流找到对应点（高性能向量化版本）
         
         Args:
             points_2d_src: 源帧2D点 [N, 2]
@@ -467,80 +565,96 @@ class OpticalFlowRegistration:
         Returns:
             corresponding_points: 对应点索引 [K, 2]
         """
+        if len(points_2d_src) == 0 or len(points_2d_dst) == 0:
+            return np.array([])
+            
         H, W = flow.shape[:2]
+        
+        # 向量化处理源点
+        src_coords = points_2d_src.astype(int)  # [N, 2]
+        
+        # 过滤边界外的点
+        valid_mask = ((src_coords[:, 0] >= 0) & (src_coords[:, 0] < W) & 
+                     (src_coords[:, 1] >= 0) & (src_coords[:, 1] < H))
+        
+        if not np.any(valid_mask):
+            return np.array([])
+            
+        valid_src_coords = src_coords[valid_mask]  # [N_valid, 2]
+        valid_indices = np.where(valid_mask)[0]  # [N_valid]
+        
+        # 向量化获取光流值
+        flow_values = flow[valid_src_coords[:, 1], valid_src_coords[:, 0]]  # [N_valid, 2]
+        
+        # 向量化计算光流幅度
+        flow_magnitudes = np.sqrt(np.sum(flow_values**2, axis=1))  # [N_valid]
+        
+        # 过滤光流幅度过大的点
+        flow_valid_mask = flow_magnitudes <= max_flow_magnitude
+        if not np.any(flow_valid_mask):
+            return np.array([])
+            
+        final_src_coords = valid_src_coords[flow_valid_mask]  # [N_final, 2]
+        final_flow_values = flow_values[flow_valid_mask]  # [N_final, 2]
+        final_indices = valid_indices[flow_valid_mask]  # [N_final]
+        
+        # 向量化计算预测点
+        predicted_points = final_src_coords + final_flow_values  # [N_final, 2]
+        
+        # 过滤预测点超出边界的
+        pred_valid_mask = ((predicted_points[:, 0] >= 0) & (predicted_points[:, 0] < W) & 
+                          (predicted_points[:, 1] >= 0) & (predicted_points[:, 1] < H))
+        
+        if not np.any(pred_valid_mask):
+            return np.array([])
+            
+        final_predicted_points = predicted_points[pred_valid_mask]  # [N_pred, 2]
+        final_src_indices = final_indices[pred_valid_mask]  # [N_pred]
+        
+        # 向量化距离计算和匹配
         corresponding_points = []
+        tolerance = 2.0 if use_simple_method else distance_threshold
         
         if use_simple_method:
-            # 简单方法：将目标点转换为字典，用于快速查找
-            target_points_dict = {}
-            for j, point_dst in enumerate(points_2d_dst):
-                # 将浮点坐标转换为整数坐标，用于字典查找
-                point_key = (int(point_dst[0]), int(point_dst[1]))
-                target_points_dict[point_key] = j
+            # 高效的向量化最近邻搜索
+            for i, (pred_point, src_idx) in enumerate(zip(final_predicted_points, final_src_indices)):
+                # 计算到所有目标点的距离 [M]
+                distances = np.sqrt(np.sum((points_2d_dst - pred_point)**2, axis=1))
+                
+                # 找到最近的点
+                min_idx = np.argmin(distances)
+                min_distance = distances[min_idx]
+                
+                if min_distance <= tolerance:
+                    corresponding_points.append([src_idx, min_idx])
         else:
-            # 复杂方法：使用网格化的方法，将目标点按网格分组
-            grid_size = max(1, int(distance_threshold))
-            grid_dict = {}
-            
-            for j, point_dst in enumerate(points_2d_dst):
-                grid_x = int(point_dst[0] // grid_size)
-                grid_y = int(point_dst[1] // grid_size)
-                grid_key = (grid_x, grid_y)
+            # 使用KD树进行高效最近邻搜索
+            try:
+                from scipy.spatial import cKDTree
                 
-                if grid_key not in grid_dict:
-                    grid_dict[grid_key] = []
-                grid_dict[grid_key].append((j, point_dst))
+                # 构建目标点的KD树
+                tree = cKDTree(points_2d_dst)
+                
+                # 批量查询最近邻
+                distances, indices = tree.query(final_predicted_points, distance_upper_bound=distance_threshold)
+                
+                # 收集有效匹配
+                for i, (dist, dst_idx, src_idx) in enumerate(zip(distances, indices, final_src_indices)):
+                    if dist <= distance_threshold and dst_idx < len(points_2d_dst):
+                        corresponding_points.append([src_idx, dst_idx])
+                        
+            except ImportError:
+                # 回退到向量化版本
+                for i, (pred_point, src_idx) in enumerate(zip(final_predicted_points, final_src_indices)):
+                    distances = np.sqrt(np.sum((points_2d_dst - pred_point)**2, axis=1))
+                    valid_matches = distances <= distance_threshold
+                    
+                    if np.any(valid_matches):
+                        min_idx = np.argmin(distances[valid_matches])
+                        actual_idx = np.where(valid_matches)[0][min_idx]
+                        corresponding_points.append([src_idx, actual_idx])
         
-        for i, point_src in enumerate(points_2d_src):
-            x, y = int(point_src[0]), int(point_src[1])
-            
-            if 0 <= x < W and 0 <= y < H:
-                # 获取光流
-                flow_x, flow_y = flow[y, x]
-                
-                # 检查光流幅度
-                flow_magnitude = np.sqrt(flow_x**2 + flow_y**2)
-                if flow_magnitude > max_flow_magnitude:
-                    continue
-                
-                # 预测目标帧中的位置
-                predicted_x = x + flow_x
-                predicted_y = y + flow_y
-                
-                # 检查预测点是否在图像范围内
-                if not (0 <= predicted_x < W and 0 <= predicted_y < H):
-                    continue
-                
-                if use_simple_method:
-                    # 简单方法：直接检查预测点是否在目标点字典中
-                    predicted_point_int = (int(predicted_x), int(predicted_y))
-                    if predicted_point_int in target_points_dict:
-                        # 直接获取对应的目标点索引
-                        j = target_points_dict[predicted_point_int]
-                        corresponding_points.append([i, j])
-                else:
-                    # 复杂方法：在预测点周围的网格中查找最近的目标点
-                    pred_grid_x = int(predicted_x // grid_size)
-                    pred_grid_y = int(predicted_y // grid_size)
-                    
-                    min_dist = float('inf')
-                    best_match = -1
-                    
-                    # 检查预测点周围的9个网格
-                    for dx in [-1, 0, 1]:
-                        for dy in [-1, 0, 1]:
-                            grid_key = (pred_grid_x + dx, pred_grid_y + dy)
-                            if grid_key in grid_dict:
-                                for j, point_dst in grid_dict[grid_key]:
-                                    dist = np.sqrt((predicted_x - point_dst[0])**2 + (predicted_y - point_dst[1])**2)
-                                    if dist < min_dist and dist < distance_threshold:
-                                        min_dist = dist
-                                        best_match = j
-                    
-                    if best_match != -1:
-                        corresponding_points.append([i, best_match])
-        
-        return np.array(corresponding_points)
+        return np.array(corresponding_points) if corresponding_points else np.array([])
     
     def precompute_optical_flows(self, vggt_batch: Dict) -> Dict:
         """
@@ -571,7 +685,7 @@ class OpticalFlowRegistration:
         flows = {}
         for frame_idx in range(S - 1):
             # forward_flow: [B, S, 2, H, W]
-            flow = forward_flow[0, frame_idx].cpu().numpy().transpose(1, 2, 0)  # [H, W, 2]
+            flow = forward_flow[0, frame_idx].detach().cpu().numpy().transpose(1, 2, 0)  # [H, W, 2]
             flows[(frame_idx, frame_idx + 1)] = flow
             print(f"  计算帧 {frame_idx} -> {frame_idx + 1} 的光流")
         
@@ -677,6 +791,126 @@ class OpticalFlowRegistration:
         
         return cumulative_transformation
     
+    def compute_optimized_chain_transformation(self, 
+                                             start_frame: int, 
+                                             end_frame: int,
+                                             flows: Dict,
+                                             clustering_results: List[Dict],
+                                             preds: Dict,
+                                             vggt_batch: Dict,
+                                             global_id: int,
+                                             transformation_cache: Dict) -> Optional[np.ndarray]:
+        """
+        优化版本的链式变换计算，使用缓存避免重复计算
+        
+        Args:
+            start_frame: 起始帧
+            end_frame: 目标帧  
+            flows: 预计算的光流字典
+            clustering_results: 聚类结果
+            preds: 模型预测结果
+            vggt_batch: 输入数据批次
+            global_id: 物体全局ID
+            transformation_cache: 变换缓存字典
+            
+        Returns:
+            累积变换矩阵或None
+        """
+        if start_frame == end_frame:
+            return np.eye(4)
+        
+        # 检查缓存中是否已有这个变换
+        cache_key = (start_frame, end_frame)
+        if cache_key in transformation_cache:
+            return transformation_cache[cache_key]
+        
+        # 获取相机参数
+        extrinsic, intrinsic = pose_encoding_to_extri_intri(
+            preds["pose_enc"], vggt_batch["images"].shape[-2:])
+        
+        # 确定变换方向和路径
+        if start_frame < end_frame:
+            frame_sequence = list(range(start_frame, end_frame))
+            direction = 1
+        else:
+            frame_sequence = list(range(start_frame, end_frame, -1))
+            direction = -1
+        
+        # 尝试利用已有的变换进行优化
+        # 例如：如果要计算1->4，但已经有了1->3和3->4，则直接组合
+        for intermediate_frame in range(min(start_frame, end_frame) + 1, max(start_frame, end_frame)):
+            key1 = (start_frame, intermediate_frame)
+            key2 = (intermediate_frame, end_frame)
+            
+            if key1 in transformation_cache and key2 in transformation_cache:
+                # 组合已有的变换
+                combined_transformation = np.dot(transformation_cache[key2], transformation_cache[key1])
+                transformation_cache[cache_key] = combined_transformation
+                print(f"  帧 {start_frame} -> {end_frame}: 使用缓存组合变换")
+                return combined_transformation
+        
+        # 如果没有可用的缓存组合，按照原来的方法计算
+        cumulative_transformation = np.eye(4)
+        
+        for i, frame_idx in enumerate(frame_sequence):
+            next_frame = frame_idx + direction
+            
+            # 检查单步变换的缓存
+            step_key = (frame_idx, next_frame)
+            if step_key in transformation_cache:
+                step_transformation = transformation_cache[step_key]
+            else:
+                # 获取当前帧和下一帧的聚类结果
+                current_result = clustering_results[frame_idx]
+                next_result = clustering_results[next_frame]
+                
+                # 检查物体是否在两帧中都存在
+                current_global_ids = current_result.get('global_ids', [])
+                next_global_ids = next_result.get('global_ids', [])
+                
+                if global_id not in current_global_ids or global_id not in next_global_ids:
+                    return None
+                
+                # 获取光流
+                if direction == 1:
+                    flow_key = (frame_idx, next_frame)
+                else:
+                    flow_key = (next_frame, frame_idx)
+                
+                if flow_key not in flows:
+                    return None
+                
+                flow = flows[flow_key]
+                if direction == -1:
+                    flow = -flow
+                
+                # 获取深度数据
+                depth_src = preds["depth"][0, frame_idx, :, :, 0]
+                depth_dst = preds["depth"][0, next_frame, :, :, 0]
+                
+                # 计算单步变换
+                step_transformation = self.compute_single_step_transformation(
+                    current_result, next_result, depth_src, depth_dst, flow,
+                    intrinsic[0, frame_idx], intrinsic[0, next_frame],
+                    extrinsic[0, frame_idx], extrinsic[0, next_frame],
+                    global_id
+                )
+                
+                if step_transformation is None:
+                    return None
+                
+                # 缓存单步变换
+                transformation_cache[step_key] = step_transformation
+            
+            # 累积变换
+            cumulative_transformation = np.dot(step_transformation, cumulative_transformation)
+        
+        # 缓存最终结果
+        transformation_cache[cache_key] = cumulative_transformation
+        print(f"  帧 {start_frame} -> {end_frame}: 链式变换成功")
+        
+        return cumulative_transformation
+    
     def compute_single_step_transformation(self,
                                          clustering_src: Dict,
                                          clustering_dst: Dict,
@@ -706,24 +940,49 @@ class OpticalFlowRegistration:
         Returns:
             变换矩阵或None
         """
+        import time
+        method_start_time = time.time()
+        
         H, W = depth_src.shape
         
+        # 1. 聚类数据格式化
+        clustering_format_start = time.time()
         # 提取物体的2D和3D点（暂时不需要颜色信息用于变换计算）
+        # 为当前的clustering结果创建适合extract_object_points_2d_3d的格式
+        clustering_src_formatted = self._create_cluster_indices_for_global_id(clustering_src, global_id)
+        clustering_dst_formatted = self._create_cluster_indices_for_global_id(clustering_dst, global_id)
+        clustering_format_time = time.time() - clustering_format_start
+        
+        # 2. 2D/3D点提取
+        point_extraction_start = time.time()
         points_2d_src, points_3d_src, indices_src, _ = self.extract_object_points_2d_3d(
-            clustering_src, depth_src, intrinsic_src, (H, W), extrinsic_src)
+            clustering_src_formatted, depth_src, intrinsic_src, (H, W), extrinsic_src)
         points_2d_dst, points_3d_dst, indices_dst, _ = self.extract_object_points_2d_3d(
-            clustering_dst, depth_dst, intrinsic_dst, (H, W), extrinsic_dst)
+            clustering_dst_formatted, depth_dst, intrinsic_dst, (H, W), extrinsic_dst)
+        point_extraction_time = time.time() - point_extraction_start
         
         if len(points_2d_src) == 0 or len(points_2d_dst) == 0:
+            print(f"          聚类格式化: {clustering_format_time:.4f}s")
+            print(f"          点提取: {point_extraction_time:.4f}s")
+            print(f"          调试: 2D点提取失败 - src={len(points_2d_src)}, dst={len(points_2d_dst)}")
             return None
         
+        # 3. 对应点查找
+        correspondence_start = time.time()
         # 使用光流找到对应点
         corresponding_points = self._find_corresponding_points_flow(
             points_2d_src, points_2d_dst, flow, self.max_flow_magnitude, use_simple_method=self.use_simple_correspondence)
+        correspondence_time = time.time() - correspondence_start
         
-        if len(corresponding_points) < 4:
+        if len(corresponding_points) < 3:  # PnP至少需要3个点
+            print(f"          聚类格式化: {clustering_format_time:.4f}s")
+            print(f"          点提取: {point_extraction_time:.4f}s")
+            print(f"          对应点查找: {correspondence_time:.4f}s")
+            print(f"          调试: 对应点不足 - 找到{len(corresponding_points)}个对应点，需要至少3个")
             return None
         
+        # 4. 对应点数据准备
+        correspondence_prep_start = time.time()
         # 提取对应的3D点
         src_indices = corresponding_points[:, 0].astype(int)
         dst_indices = corresponding_points[:, 1].astype(int)
@@ -732,7 +991,10 @@ class OpticalFlowRegistration:
         points_3d_dst_corr = points_3d_dst[dst_indices]
         points_2d_src_corr = points_2d_src[src_indices]
         points_2d_dst_corr = points_2d_dst[dst_indices]
+        correspondence_prep_time = time.time() - correspondence_prep_start
         
+        # 5. 变换估计
+        transformation_estimation_start = time.time()
         # 估计变换
         if self.use_pnp:
             R, t, inlier_ratio = self.estimate_transformation_3d_pnp(
@@ -741,15 +1003,39 @@ class OpticalFlowRegistration:
         else:
             R, t, inlier_ratio = self.estimate_transformation_direct(
                 points_3d_src_corr, points_3d_dst_corr)
+        transformation_estimation_time = time.time() - transformation_estimation_start
         
         # 检查内点比例
         if inlier_ratio < self.min_inliers_ratio:
+            method_total_time = time.time() - method_start_time
+            print(f"          单步变换性能分析:")
+            print(f"            聚类格式化: {clustering_format_time:.4f}s")
+            print(f"            点提取: {point_extraction_time:.4f}s (src={len(points_2d_src)}, dst={len(points_2d_dst)})")
+            print(f"            对应点查找: {correspondence_time:.4f}s (找到{len(corresponding_points)}个)")
+            print(f"            对应点准备: {correspondence_prep_time:.4f}s")
+            print(f"            变换估计: {transformation_estimation_time:.4f}s")
+            print(f"            总计: {method_total_time:.4f}s")
+            print(f"          调试: 内点比例过低 - {inlier_ratio:.3f} < {self.min_inliers_ratio}")
             return None
         
+        # 6. 变换矩阵构建
+        matrix_construction_start = time.time()
         # 构建变换矩阵
         transformation = np.eye(4)
         transformation[:3, :3] = R
         transformation[:3, 3] = t
+        matrix_construction_time = time.time() - matrix_construction_start
+        
+        # 总体性能分析
+        method_total_time = time.time() - method_start_time
+        print(f"          单步变换成功 - 性能分析:")
+        print(f"            聚类格式化: {clustering_format_time:.4f}s")
+        print(f"            点提取: {point_extraction_time:.4f}s (src={len(points_2d_src)}, dst={len(points_2d_dst)})")
+        print(f"            对应点查找: {correspondence_time:.4f}s (找到{len(corresponding_points)}个)")
+        print(f"            对应点准备: {correspondence_prep_time:.4f}s")
+        print(f"            变换估计: {transformation_estimation_time:.4f}s (内点比例: {inlier_ratio:.3f})")
+        print(f"            矩阵构建: {matrix_construction_time:.4f}s")
+        print(f"            总计: {method_total_time:.4f}s")
         
         return transformation
     
@@ -772,20 +1058,75 @@ class OpticalFlowRegistration:
         Returns:
             聚合结果字典或None
         """
-        # 找到物体出现的帧
+        import time
+        method_start_time = time.time()
+        
+        # 1. 找到物体出现的帧
+        frame_discovery_start = time.time()
         object_frames = []
         for frame_idx, result in enumerate(clustering_results):
             global_ids = result.get('global_ids', [])
             if global_id in global_ids:
                 object_frames.append(frame_idx)
+        frame_discovery_time = time.time() - frame_discovery_start
         
-        if len(object_frames) < 2:
-            print(f"物体 {global_id}: 只出现在 {len(object_frames)} 帧中，无法聚合")
+        if len(object_frames) < 1:
+            print(f"物体 {global_id}: 未找到该物体")
             return None
+        elif len(object_frames) == 1:
+            print(f"物体 {global_id}: 只出现在 1 帧中，直接使用该帧数据")
+            # 对于单帧物体，直接使用该帧的数据，无需聚合
+            frame_idx = object_frames[0]
+            result = clustering_results[frame_idx]
+            cluster_idx = result['global_ids'].index(global_id)
+            object_mask = result['labels'] == cluster_idx
+            object_points = result['points'][object_mask]
+            
+            # 提取颜色信息
+            colors = self._extract_colors_for_points(result, cluster_idx, frame_idx, preds, vggt_batch)
+            if colors is None:
+                colors = np.tile(
+                    (self._hsv_to_rgb((global_id * 137.5) % 360, 0.8, 0.9) * 255).astype(np.uint8),
+                    (len(object_points), 1)
+                )
+            
+            # 提取单帧的Gaussian参数，并用实际点坐标替换位置
+            canonical_gaussians = None
+            if preds and 'gaussian_params' in preds:
+                canonical_gaussians = self._extract_gaussian_params_for_object(
+                    result, 
+                    cluster_idx,
+                    frame_idx,
+                    preds['gaussian_params'],
+                    vggt_batch
+                )
+                
+                # 用实际点坐标替换Gaussian位置
+                if canonical_gaussians is not None:
+                    object_points_np = object_points.cpu().numpy() if isinstance(object_points, torch.Tensor) else object_points
+                    if len(object_points_np) == canonical_gaussians.shape[0]:
+                        canonical_gaussians[:, :3] = torch.from_numpy(object_points_np).float()
+                        print(f"    ✅ 单帧：用{len(object_points_np)}个实际点坐标替换了Gaussian位置")
+                    else:
+                        print(f"    ⚠️  单帧：点数量不匹配({len(object_points_np)} vs {canonical_gaussians.shape[0]})")
+            
+            return {
+                'global_id': global_id,
+                'aggregated_points': object_points.cpu().numpy() if isinstance(object_points, torch.Tensor) else object_points,
+                'aggregated_colors': colors,
+                'middle_frame': frame_idx,  # 统一使用middle_frame
+                'object_frames': [frame_idx],
+                'transformations': {},
+                'canonical_gaussians': canonical_gaussians,  # 添加Gaussian参数
+                'reference_frame': frame_idx,  # 保留向后兼容
+                'num_frames': 1,
+                'num_points': len(object_points)
+            }
         
-        # 选择中间帧作为参考帧
+        # 2. 选择中间帧作为参考帧并提取其数据
+        middle_frame_start = time.time()
         middle_frame_idx = object_frames[len(object_frames) // 2]
-        print(f"物体 {global_id}: 聚合到中间帧 {middle_frame_idx} (总帧数: {len(object_frames)})")
+        print(f"      物体 {global_id}: 聚合到中间帧 {middle_frame_idx} (总帧数: {len(object_frames)})")
         
         # 获取中间帧的物体点云和颜色
         middle_result = clustering_results[middle_frame_idx]
@@ -799,7 +1140,7 @@ class OpticalFlowRegistration:
         
         # 确保中间帧点云在CPU上
         if isinstance(middle_object_points, torch.Tensor):
-            middle_object_points_cpu = middle_object_points.cpu().numpy()
+            middle_object_points_cpu = middle_object_points.detach().cpu().numpy()
         else:
             middle_object_points_cpu = middle_object_points
             
@@ -812,28 +1153,38 @@ class OpticalFlowRegistration:
                 (self._hsv_to_rgb((global_id * 137.5) % 360, 0.8, 0.9) * 255).astype(np.uint8),
                 (len(middle_object_points_cpu), 1)
             )
+        middle_frame_time = time.time() - middle_frame_start
         
-        # 存储所有帧的变换
+        # 3. 存储所有帧的变换 - 优化版本
         transformations = {}
+        transformation_cache = {}  # 缓存已计算的变换
         aggregated_points = [middle_object_points_cpu]
         aggregated_colors = [middle_colors]
         
-        # 对其他帧进行链式变换
+        # 4. 对其他帧进行链式变换
+        chain_transform_start = time.time()
+        successful_transforms = 0
+        failed_transforms = 0
+        
         for frame_idx in object_frames:
             if frame_idx == middle_frame_idx:
                 continue
             
-            # 计算链式变换
-            chain_transformation = self.compute_chain_transformation(
-                frame_idx, middle_frame_idx, flows, clustering_results, preds, vggt_batch, global_id)
+            frame_transform_start = time.time()
+            # 优化的链式变换计算
+            chain_transformation = self.compute_optimized_chain_transformation(
+                frame_idx, middle_frame_idx, flows, clustering_results, preds, vggt_batch, global_id, transformation_cache)
+            frame_transform_time = time.time() - frame_transform_start
             
             if chain_transformation is not None:
+                successful_transforms += 1
+                print(f"        帧 {frame_idx} -> {middle_frame_idx}: 变换成功 ({frame_transform_time:.4f}s)")
                 transformations[frame_idx] = {
                     'transformation': chain_transformation,
                     'R': chain_transformation[:3, :3],
                     't': chain_transformation[:3, 3],
-                    'inlier_ratio': 1.0,  # 链式变换的内点比例需要重新计算
-                    'num_correspondences': 0  # 链式变换的对应点数需要重新计算
+                    'inlier_ratio': 1.0,
+                    'num_correspondences': 0
                 }
                 
                 # 变换当前帧的物体点云
@@ -851,24 +1202,50 @@ class OpticalFlowRegistration:
                 current_colors = self._extract_colors_for_points(
                     current_result, current_cluster_idx, frame_idx, preds, vggt_batch)
                 if current_colors is None:
-                    # 如果无法提取颜色，使用默认颜色
                     current_colors = np.tile(
                         (self._hsv_to_rgb((global_id * 137.5) % 360, 0.8, 0.9) * 255).astype(np.uint8),
                         (len(current_object_points), 1)
                     )
                 aggregated_colors.append(current_colors)
                 
-                print(f"  帧 {frame_idx} -> {middle_frame_idx}: 链式变换成功")
+                print(f"        帧 {frame_idx} -> {middle_frame_idx}: 链式变换成功")
             else:
-                print(f"  帧 {frame_idx} -> {middle_frame_idx}: 链式变换失败")
+                failed_transforms += 1
+                print(f"        帧 {frame_idx} -> {middle_frame_idx}: 链式变换失败 ({frame_transform_time:.4f}s)")
         
-        if len(aggregated_points) < 2:
-            print(f"物体 {global_id}: 没有成功的变换")
+        # 如果没有成功的变换，但至少有中间帧数据，就返回中间帧
+        if len(aggregated_points) < 2 and len(aggregated_points) >= 1:
+            print(f"物体 {global_id}: 链式变换失败，使用中间帧数据")
+        elif len(aggregated_points) < 1:
+            print(f"物体 {global_id}: 没有可用数据")
             return None
+        
+        chain_transform_total_time = time.time() - chain_transform_start
+        method_total_time = time.time() - method_start_time
         
         # 合并所有点云和颜色
         all_points = np.concatenate(aggregated_points, axis=0)
         all_colors = np.concatenate(aggregated_colors, axis=0)
+        
+        # 性能总结
+        print(f"      物体 {global_id} 性能分析:")
+        print(f"        帧发现: {frame_discovery_time:.4f}s")
+        print(f"        中间帧处理: {middle_frame_time:.4f}s") 
+        print(f"        链式变换: {chain_transform_total_time:.4f}s (成功{successful_transforms}, 失败{failed_transforms})")
+        print(f"        总计: {method_total_time:.4f}s")
+        print(f"        最终点云数量: {len(all_points)}")
+        
+        # 提取所有帧对应的Gaussian参数，并用实际点坐标替换位置
+        canonical_gaussians = None
+        if preds and 'gaussian_params' in preds:
+            canonical_gaussians = self._extract_all_frames_gaussian_params(
+                clustering_results,
+                object_frames,
+                global_id,
+                all_points,  # 聚合后的实际点坐标
+                preds['gaussian_params'],
+                vggt_batch
+            )
         
         return {
             'global_id': global_id,
@@ -877,13 +1254,193 @@ class OpticalFlowRegistration:
             'aggregated_points': all_points,
             'aggregated_colors': all_colors,
             'transformations': transformations,
+            'canonical_gaussians': canonical_gaussians,  # 添加Gaussian参数
             'num_frames': len(object_frames),
             'num_points': len(all_points)
         }
     
+    def _extract_all_frames_gaussian_params(self,
+                                           clustering_results: List[Dict],
+                                           object_frames: List[int],
+                                           global_id: int,
+                                           aggregated_points: np.ndarray,
+                                           gaussian_params: torch.Tensor,
+                                           vggt_batch: Dict) -> torch.Tensor:
+        """
+        提取该物体在所有帧中的Gaussian参数，并用聚合后的点坐标替换位置
+        
+        Args:
+            clustering_results: 所有帧的聚类结果
+            object_frames: 物体出现的帧列表
+            global_id: 物体全局ID
+            aggregated_points: 聚合后的3D点坐标 [N, 3]
+            gaussian_params: VGGT预测的Gaussian参数 [B, S*H*W, 14]
+            vggt_batch: 批次数据
+            
+        Returns:
+            合并的Gaussian参数 [N_total, 14] 或 None
+        """
+        try:
+            if 'images' not in vggt_batch:
+                print(f"    无法从vggt_batch获取图像尺寸")
+                return None
+            
+            B, S, C, H, W = vggt_batch['images'].shape
+            H_W = H * W
+            
+            all_gaussians = []
+            all_frame_points = []
+            
+            # 为每个帧提取Gaussian参数
+            for frame_idx in object_frames:
+                if frame_idx >= len(clustering_results):
+                    continue
+                    
+                clustering_result = clustering_results[frame_idx]
+                global_ids = clustering_result.get('global_ids', [])
+                
+                if global_id not in global_ids:
+                    continue
+                
+                cluster_idx = global_ids.index(global_id)
+                cluster_indices = clustering_result.get('cluster_indices', [])
+                
+                if cluster_idx >= len(cluster_indices):
+                    continue
+                
+                pixel_indices = cluster_indices[cluster_idx]
+                if not pixel_indices:
+                    continue
+                
+                # 提取该帧该物体的Gaussian参数
+                frame_gaussians = []
+                frame_points = []
+                
+                for pixel_idx in pixel_indices:
+                    global_idx = frame_idx * H_W + pixel_idx
+                    
+                    if 0 <= global_idx < gaussian_params.shape[1]:
+                        gaussian_param = gaussian_params[0, global_idx].clone()  # [14]
+                        frame_gaussians.append(gaussian_param)
+                        
+                        # 同时记录该帧中该像素对应的点坐标
+                        if 'points' in clustering_result:
+                            frame_points.append(clustering_result['points'][pixel_idx])
+                
+                if len(frame_gaussians) > 0:
+                    frame_gaussians_tensor = torch.stack(frame_gaussians, dim=0)  # [N_frame, 14]
+                    all_gaussians.append(frame_gaussians_tensor)
+                    
+                    if len(frame_points) > 0:
+                        frame_points_tensor = torch.stack(frame_points, dim=0)  # [N_frame, 3] 
+                        all_frame_points.append(frame_points_tensor)
+            
+            if len(all_gaussians) == 0:
+                print(f"    未能提取到任何帧的Gaussian参数")
+                return None
+            
+            # 合并所有帧的Gaussian参数
+            combined_gaussians = torch.cat(all_gaussians, dim=0)  # [N_total, 14]
+            
+            # 用聚合后的点坐标替换Gaussian参数的前三维
+            if len(aggregated_points) == combined_gaussians.shape[0]:
+                # 完全匹配的情况
+                aggregated_points_tensor = torch.from_numpy(aggregated_points).float()
+                combined_gaussians[:, :3] = aggregated_points_tensor
+                print(f"    ✅ 用{len(aggregated_points)}个聚合点坐标替换了Gaussian位置")
+            else:
+                # 数量不匹配，使用聚合点的统计信息
+                aggregated_points_tensor = torch.from_numpy(aggregated_points).float()
+                mean_pos = aggregated_points_tensor.mean(dim=0)  # [3]
+                
+                # 用聚合点的平均位置作为基础，加上小的随机偏移
+                N_gaussians = combined_gaussians.shape[0]
+                offsets = torch.randn(N_gaussians, 3) * 0.01  # 小偏移
+                positions = mean_pos.unsqueeze(0) + offsets  # [N_gaussians, 3]
+                
+                combined_gaussians[:, :3] = positions
+                print(f"    ⚠️  点数量不匹配({len(aggregated_points)} vs {N_gaussians})，使用平均位置+偏移")
+            
+            print(f"    ✅ 成功提取并合并所有帧的Gaussian参数: {combined_gaussians.shape}")
+            return combined_gaussians
+            
+        except Exception as e:
+            print(f"    提取所有帧Gaussian参数失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def _extract_gaussian_params_for_object(self, 
+                                           clustering_result: Dict, 
+                                           cluster_idx: int,
+                                           frame_idx: int, 
+                                           gaussian_params: torch.Tensor, 
+                                           vggt_batch: Dict) -> torch.Tensor:
+        """
+        从聚类结果中直接提取对应物体的Gaussian参数
+        
+        Args:
+            clustering_result: 单帧聚类结果
+            cluster_idx: 聚类索引  
+            frame_idx: 帧索引
+            gaussian_params: VGGT预测的Gaussian参数 [B, S*H*W, 14]
+            vggt_batch: 批次数据
+            
+        Returns:
+            提取的Gaussian参数 [N, 14] 或 None
+        """
+        try:
+            # 获取该聚类的像素索引
+            cluster_indices = clustering_result.get('cluster_indices', [])
+            if cluster_idx >= len(cluster_indices):
+                print(f"    cluster_idx {cluster_idx} 超出范围，总聚类数: {len(cluster_indices)}")
+                return None
+                
+            pixel_indices = cluster_indices[cluster_idx]  # 该物体的所有像素索引
+            if not pixel_indices:
+                print(f"    物体在帧{frame_idx}中没有像素索引")
+                return None
+            
+            # 推断图像尺寸
+            if 'images' in vggt_batch:
+                B, S, C, H, W = vggt_batch['images'].shape
+            else:
+                print(f"    无法从vggt_batch获取图像尺寸")
+                return None
+            
+            # 计算全局索引：frame_idx * H*W + pixel_idx
+            H_W = H * W
+            global_indices = []
+            for pixel_idx in pixel_indices:
+                global_idx = frame_idx * H_W + pixel_idx
+                global_indices.append(global_idx)
+            
+            # 提取对应的Gaussian参数
+            B_g, N_total, feature_dim = gaussian_params.shape
+            selected_gaussians = []
+            
+            for global_idx in global_indices:
+                if 0 <= global_idx < N_total:
+                    selected_gaussians.append(gaussian_params[0, global_idx])  # 使用batch=0
+                else:
+                    print(f"    全局索引{global_idx}超出范围[0, {N_total-1}]")
+            
+            if len(selected_gaussians) == 0:
+                print(f"    无法提取有效的Gaussian参数")
+                return None
+            
+            selected_gaussians_tensor = torch.stack(selected_gaussians, dim=0)  # [N, 14]
+            print(f"    成功提取{len(selected_gaussians)}个Gaussian参数")
+            
+            return selected_gaussians_tensor
+            
+        except Exception as e:
+            print(f"    提取Gaussian参数失败: {e}")
+            return None
+    
     def _apply_transformation(self, points: torch.Tensor, transformation: np.ndarray) -> np.ndarray:
         """应用变换矩阵到点云"""
-        points_np = points.cpu().numpy()
+        points_np = points.detach().cpu().numpy()
         
         # 转换为齐次坐标
         points_homo = np.concatenate([points_np, np.ones((len(points_np), 1))], axis=1)

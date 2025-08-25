@@ -21,7 +21,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'src/vggt'))
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 from vggt.models.vggt import VGGT
 from dust3r.utils.misc import tf32_off
-from training.loss import cross_render_and_loss
+from vggt.training.loss import cross_render_and_loss
 # Import model and inference functions after adding the ckpt path.
 from src.dust3r.inference import inference
 # Import cut3r_batch_to_vggt function
@@ -206,7 +206,7 @@ def extract_and_cluster_dynamic_objects(preds, vggt_batch, conf, interval, veloc
         dict: 包含聚类可视化结果的字典
     """
     from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-    from training.loss import depth_to_world_points, velocity_local_to_global
+    from vggt.training.loss import depth_to_world_points, velocity_local_to_global
 
     with tf32_off():
         # 获取相机参数
@@ -457,8 +457,8 @@ def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, 
                 cluster_sizes.append(cluster_size)
                 valid_labels.append(label)
             else:
-                print(
-                    f"    过滤掉小聚类: 标签{label}, 大小{cluster_size} < 阈值{area_threshold}")
+                # print(
+                #     f"    过滤掉小聚类: 标签{label}, 大小{cluster_size} < 阈值{area_threshold}")
                 # 将过滤掉的聚类重新标记为静态点（-1）
                 cluster_indices = np.where(cluster_mask)[0]
                 dynamic_indices = torch.where(dynamic_mask)[0]
@@ -467,7 +467,7 @@ def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, 
 
         # 更新聚类数量
         num_clusters = len(valid_labels)
-        print(f"    初始聚类数量: {initial_num_clusters}, 过滤后聚类数量: {num_clusters}")
+        # print(f"    初始聚类数量: {initial_num_clusters}, 过滤后聚类数量: {num_clusters}")
 
         # 重新映射聚类标签，确保连续
         if num_clusters > 0:

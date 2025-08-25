@@ -30,6 +30,9 @@ from vggt.training.loss import camera_loss, depth_loss, point_loss, cross_render
 from vggt.utils.auxiliary import RAFTCfg, calc_flow
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
+# ===== 在线第二阶段训练器 =====
+from online_stage2_trainer import OnlineStage2Trainer
+
 
 sys.path.append(os.path.join(os.path.dirname(__file__), 'sam2'))
 sys.path.append(os.path.join(os.path.dirname(__file__), 'dam2'))
@@ -145,6 +148,48 @@ def train(args):
     device = accelerator.device
 
     setup_for_distributed(accelerator)
+    
+    # 初始化在线第二阶段训练器
+    stage2_config = {
+        # 模型配置
+        'input_gaussian_dim': getattr(args, 'input_gaussian_dim', 14),
+        'output_gaussian_dim': getattr(args, 'output_gaussian_dim', 11),
+        'gaussian_feature_dim': getattr(args, 'gaussian_feature_dim', 128),
+        'gaussian_num_layers': getattr(args, 'gaussian_num_layers', 2),
+        'gaussian_num_heads': getattr(args, 'gaussian_num_heads', 4),
+        'gaussian_mlp_ratio': getattr(args, 'gaussian_mlp_ratio', 2.0),
+        'pose_feature_dim': getattr(args, 'pose_feature_dim', 128),
+        'pose_num_heads': getattr(args, 'pose_num_heads', 4),
+        'pose_num_layers': getattr(args, 'pose_num_layers', 2),
+        'max_points_per_object': getattr(args, 'max_points_per_object', 2048),
+        'training_mode': getattr(args, 'stage2_training_mode', 'joint'),
+        
+        # 损失配置
+        'rgb_loss_weight': getattr(args, 'stage2_rgb_loss_weight', 0.5),
+        'depth_loss_weight': getattr(args, 'stage2_depth_loss_weight', 0.05),
+        'lpips_loss_weight': getattr(args, 'stage2_lpips_loss_weight', 0.05),
+        'consistency_loss_weight': getattr(args, 'stage2_consistency_loss_weight', 0.02),
+        'gaussian_reg_weight': getattr(args, 'stage2_gaussian_reg_weight', 0.005),
+        'pose_reg_weight': getattr(args, 'stage2_pose_reg_weight', 0.005),
+        'temporal_smooth_weight': getattr(args, 'stage2_temporal_smooth_weight', 0.002),
+        
+        # 动态处理器配置
+        'dynamic_processor': {
+            'min_object_size': getattr(args, 'min_object_size', 100),
+            'max_objects_per_frame': getattr(args, 'max_objects_per_frame', 10),
+            'velocity_threshold_percentile': getattr(args, 'velocity_threshold_percentile', 0.75),
+            'use_optical_flow_aggregation': getattr(args, 'enable_optical_flow_aggregation', True)
+        }
+    }
+    
+    online_stage2_trainer = OnlineStage2Trainer(
+        stage2_config=stage2_config,
+        device=device,
+        enable_stage2=getattr(args, 'enable_stage2', True),
+        stage2_start_epoch=getattr(args, 'stage2_start_epoch', 5),
+        stage2_frequency=getattr(args, 'stage2_frequency', 10),
+        memory_efficient=getattr(args, 'stage2_memory_efficient', True)
+    ) if accelerator.is_main_process else None
 
     printer.info("output_dir: " + args.output_dir)
     if args.output_dir:
@@ -199,7 +244,7 @@ def train(args):
     # model
     printer.info("Loading model: %s", args.model)
     model = eval(args.model)
-    model.gradient_checkpointing_enable(True)
+    model.gradient_checkpointing_enable()
     printer.info(f"All model parameters: {sum(p.numel() for p in model.parameters())}")
 
     model.to(device)
@@ -384,8 +429,31 @@ def train(args):
 
     # # following timm: set wd as 0 for bias and norm layers
     param_groups = misc.get_parameter_groups(model, args.weight_decay)
+    
+    # 添加第二阶段参数到优化器
+    if online_stage2_trainer is not None and online_stage2_trainer.enable_stage2:
+        stage2_params = online_stage2_trainer.get_stage2_parameters()
+        if stage2_params:
+            # 为第二阶段参数创建单独的参数组（使用较小的学习率）
+            stage2_lr = getattr(args, 'stage2_learning_rate', args.lr * 0.1)  # 第二阶段使用更小的学习率
+            # 直接创建参数组，stage2_params是参数列表
+            if stage2_params:  # 确保参数列表不为空
+                stage2_param_groups = [{
+                    'params': stage2_params,
+                    'lr': stage2_lr,
+                    'weight_decay': getattr(args, 'stage2_weight_decay', args.weight_decay * 0.5),
+                    'name': 'stage2_params'
+                }]
+                
+                param_groups.extend(stage2_param_groups)
+                print(f"Added {len(stage2_params)} Stage2 parameters to optimizer with lr={stage2_lr}")
+    
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
     loss_scaler = NativeScaler(accelerator=accelerator)
+    
+    # 设置第二阶段优化器
+    if online_stage2_trainer is not None:
+        online_stage2_trainer.set_optimizer(optimizer)
 
     accelerator.even_batches = True
     optimizer, model, data_loader_train = accelerator.prepare(
@@ -394,6 +462,7 @@ def train(args):
 
 
     def save_model(epoch, fname, best_so_far):
+        # 保存主模型
         misc.save_model(
             accelerator=accelerator,
             args=args,
@@ -404,10 +473,35 @@ def train(args):
             fname=fname,
             best_so_far=best_so_far,
         )
+        
+        # 保存第二阶段模型状态
+        if online_stage2_trainer is not None and online_stage2_trainer.enable_stage2:
+            if accelerator.is_main_process:
+                output_dir = Path(args.output_dir)
+                if fname is None:
+                    fname = str(epoch)
+                stage2_checkpoint_path = output_dir / ("stage2-checkpoint-%s.pth" % fname)
+                stage2_state = online_stage2_trainer.save_state_dict()
+                misc.save_on_master(accelerator, stage2_state, stage2_checkpoint_path)
+                print(f">> Saving Stage2 model to {stage2_checkpoint_path} ...")
 
+    # 加载主模型
     best_so_far = misc.load_model(
         args=args, model_without_ddp=model, optimizer=optimizer, loss_scaler=loss_scaler
     )
+    
+    # 加载第二阶段模型状态
+    if online_stage2_trainer is not None and online_stage2_trainer.enable_stage2 and args.resume is not None:
+        # 构建stage2检查点路径
+        if args.resume.endswith('.pth'):
+            stage2_resume_path = args.resume.replace('checkpoint-', 'stage2-checkpoint-')
+            if os.path.exists(stage2_resume_path):
+                print(f">> Loading Stage2 model from {stage2_resume_path} ...")
+                stage2_checkpoint = torch.load(stage2_resume_path, map_location="cpu")
+                online_stage2_trainer.load_state_dict(stage2_checkpoint)
+                print("Stage2 model loaded successfully")
+            else:
+                print(f"Stage2 checkpoint not found at {stage2_resume_path}, starting Stage2 from scratch")
     if best_so_far is None:
         best_so_far = float("inf")
     log_writer = (
@@ -437,22 +531,29 @@ def train(args):
                     misc.adjust_learning_rate(optimizer, epoch_f, args)
                 vggt_batch = cut3r_batch_to_vggt(batch)
 
+                # 初始化sky_masks
+                sky_masks = None
                 if "dam2" in auxiliary_models and vggt_batch.get("images") is not None:
                     sky_masks = dam2_sky_mask_generation(
                         vggt_batch["images"], 
                         auxiliary_models["dam2"],
                         device=device
                     )
-                    # 将sky masks添加到vggt_batch中，供后续使用
-                    vggt_batch["sky_masks"] = sky_masks
+                
+                # 将sky masks添加到vggt_batch中，供后续使用
+                vggt_batch["sky_masks"] = sky_masks
 
-                preds = model(
-                    vggt_batch["images"],
-                    compute_sky_color_loss=True,
-                    sky_masks=vggt_batch["sky_masks"],
-                    gt_images=vggt_batch["images"],
-                    # pose_enc=preds["pose_enc"].detach()
-                )
+                # For VGGT model, extract images from vggt_batch  
+                if vggt_batch.get("images") is not None:
+                    preds = model(
+                        vggt_batch["images"],
+                        compute_sky_color_loss=False,
+                        sky_masks=vggt_batch.get("sky_masks"),
+                        gt_images=vggt_batch.get("images")
+                    )
+                else:
+                    # Fallback for other models
+                    preds = model(batch)
 
                 loss = 0.0
                 loss_dict = {}
@@ -526,35 +627,35 @@ def train(args):
                 #             "loss_render_depth": torch.tensor(0.0, device=device, requires_grad=True),
                 #         })
 
-                # self render loss (self)
-                if vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
-                    try:
-                        self_loss_dict, _ = self_render_and_loss(preds["depth"].detach(), preds["gaussian_params"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"])
-                        loss += self_loss_dict.get("loss_self_render_rgb", 0.0) + 0.0 * self_loss_dict.get("loss_self_render_lpips", 0.0) + self_loss_dict.get("loss_self_render_depth", 0.0)
-                        loss_dict.update(self_loss_dict)
-                    except Exception as e:
-                        print(f"Error in self render loss computation: {e}")
-                        # 添加零损失作为fallback
-                        loss_dict.update({
-                            "loss_self_render_rgb": torch.tensor(0.0, device=device, requires_grad=True),
-                            "loss_self_render_lpips": torch.tensor(0.0, device=device, requires_grad=True),
-                            "loss_self_render_depth": torch.tensor(0.0, device=device, requires_grad=True),
-                        })
+                # # self render loss (self)
+                # if vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
+                    # try:
+                    #     self_loss_dict, _ = self_render_and_loss(preds["depth"].detach(), preds["gaussian_params"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"])
+                    #     loss += self_loss_dict.get("loss_self_render_rgb", 0.0) + 0.0 * self_loss_dict.get("loss_self_render_lpips", 0.0) + self_loss_dict.get("loss_self_render_depth", 0.0)
+                    #     loss_dict.update(self_loss_dict)
+                    # except Exception as e:
+                    #     print(f"Error in self render loss computation: {e}")
+                    #     # 添加零损失作为fallback
+                    #     loss_dict.update({
+                    #         "loss_self_render_rgb": torch.tensor(0.0, device=device, requires_grad=True),
+                    #         "loss_self_render_lpips": torch.tensor(0.0, device=device, requires_grad=True),
+                    #         "loss_self_render_depth": torch.tensor(0.0, device=device, requires_grad=True),
+                    #     })
 
-                # optical flow -> velocity loss
-                if vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
-                    conf = preds["depth_conf"] > 2
-                    try:
-                        flow_loss_dict = flow_loss(conf, interval, forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, preds["depth"], preds["velocity"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"])
-                        loss += flow_loss_dict.get("forward_loss", 0.0) # + flow_loss_dict.get("backward_loss", 0.0)
-                        loss_dict.update(flow_loss_dict)
-                    except Exception as e:
-                        print(f"Error in flow loss computation: {e}")
-                        # 添加零损失作为fallback
-                        loss_dict.update({
-                            "forward_loss": torch.tensor(0.0, device=device, requires_grad=True),
-                            "backward_loss": torch.tensor(0.0, device=device, requires_grad=True),
-                        })
+                # # optical flow -> velocity loss
+                # if vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
+                #     conf = preds["depth_conf"] > 2
+                #     try:
+                #         flow_loss_dict = flow_loss(conf, interval, forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, preds["depth"], preds["velocity"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"])
+                #         loss += flow_loss_dict.get("forward_loss", 0.0) # + flow_loss_dict.get("backward_loss", 0.0)
+                #         loss_dict.update(flow_loss_dict)
+                #     except Exception as e:
+                #         print(f"Error in flow loss computation: {e}")
+                #         # 添加零损失作为fallback
+                #         loss_dict.update({
+                #             "forward_loss": torch.tensor(0.0, device=device, requires_grad=True),
+                #             "backward_loss": torch.tensor(0.0, device=device, requires_grad=True),
+                #         })
                 
                 # velocity regularization loss
                 if vggt_batch.get("images") is not None:
@@ -569,45 +670,45 @@ def train(args):
                             "loss_velocity": torch.tensor(0.0, device=device, requires_grad=True),
                         })
                 
-                # SAM2 mask-based velocity consistency loss
-                # 使用预处理的SAM掩码或在线推理
-                use_preprocessed_sam = getattr(args, "use_preprocessed_sam", False)
-                if use_preprocessed_sam:
-                    # 使用预加载的SAM掩码
-                    if vggt_batch.get("images") is not None and vggt_batch.get("sam_masks") is not None:
-                        try:
-                            sam2_velocity_loss_dict = sam2_velocity_consistency_loss_with_preprocessed_masks(
-                                vggt_batch["images"], 
-                                preds["velocity"], 
-                                vggt_batch["sam_masks"],
-                                device=device
-                            )
-                            loss += sam2_velocity_loss_dict.get("sam2_velocity_consistency_loss", 0.0)
-                            loss_dict.update(sam2_velocity_loss_dict)
-                        except Exception as e:
-                            print(f"Error in preprocessed SAM2 loss computation: {e}")
-                            # 添加零损失作为fallback
-                            loss_dict.update({
-                                "sam2_velocity_consistency_loss": torch.tensor(0.0, device=device, requires_grad=True),
-                            })
-                else:
-                    # 使用在线SAM推理
-                    if "sam2" in auxiliary_models and vggt_batch.get("images") is not None:
-                        try:
-                            sam2_velocity_loss_dict = sam2_velocity_consistency_loss(
-                                vggt_batch["images"], 
-                                preds["velocity"], 
-                                auxiliary_models["sam2"],
-                                device=device
-                            )
-                            loss += sam2_velocity_loss_dict.get("sam2_velocity_consistency_loss", 0.0)
-                            loss_dict.update(sam2_velocity_loss_dict)
-                        except Exception as e:
-                            print(f"Error in SAM2 loss computation: {e}")
-                            # 添加零损失作为fallback
-                            loss_dict.update({
-                                "sam2_velocity_consistency_loss": torch.tensor(0.0, device=device, requires_grad=True),
-                            })
+                # # SAM2 mask-based velocity consistency loss
+                # # 使用预处理的SAM掩码或在线推理
+                # use_preprocessed_sam = getattr(args, "use_preprocessed_sam", False)
+                # if use_preprocessed_sam:
+                #     # 使用预加载的SAM掩码
+                #     if vggt_batch.get("images") is not None and vggt_batch.get("sam_masks") is not None:
+                #         try:
+                #             sam2_velocity_loss_dict = sam2_velocity_consistency_loss_with_preprocessed_masks(
+                #                 vggt_batch["images"], 
+                #                 preds["velocity"], 
+                #                 vggt_batch["sam_masks"],
+                #                 device=device
+                #             )
+                #             loss += sam2_velocity_loss_dict.get("sam2_velocity_consistency_loss", 0.0)
+                #             loss_dict.update(sam2_velocity_loss_dict)
+                #         except Exception as e:
+                #             print(f"Error in preprocessed SAM2 loss computation: {e}")
+                #             # 添加零损失作为fallback
+                #             loss_dict.update({
+                #                 "sam2_velocity_consistency_loss": torch.tensor(0.0, device=device, requires_grad=True),
+                #             })
+                # else:
+                #     # 使用在线SAM推理
+                #     if "sam2" in auxiliary_models and vggt_batch.get("images") is not None:
+                #         try:
+                #             sam2_velocity_loss_dict = sam2_velocity_consistency_loss(
+                #                 vggt_batch["images"], 
+                #                 preds["velocity"], 
+                #                 auxiliary_models["sam2"],
+                #                 device=device
+                #             )
+                #             loss += sam2_velocity_loss_dict.get("sam2_velocity_consistency_loss", 0.0)
+                #             loss_dict.update(sam2_velocity_loss_dict)
+                #         except Exception as e:
+                #             print(f"Error in SAM2 loss computation: {e}")
+                #             # 添加零损失作为fallback
+                #             loss_dict.update({
+                #                 "sam2_velocity_consistency_loss": torch.tensor(0.0, device=device, requires_grad=True),
+                #             })
                 
                 # DAM2 sky mask generation and sky loss                    
                 # Sky opacity loss: 鼓励sky区域的gaussian opacity为0
@@ -658,6 +759,42 @@ def train(args):
                             continue
                         log_writer.add_scalar("train_" + name, val, step)
 
+                # 在线第二阶段训练（仅在主进程中进行）
+                stage2_loss = None
+                stage2_loss_dict = {}
+                if online_stage2_trainer is not None:
+                    try:
+                        stage2_loss, stage2_loss_dict = online_stage2_trainer.process_stage1_outputs(
+                            preds=preds,
+                            vggt_batch=vggt_batch,
+                            auxiliary_models=auxiliary_models,
+                            epoch=epoch,
+                            iteration=data_iter_step
+                        )
+                        
+                        if stage2_loss is not None:
+                            # 将第二阶段损失添加到总损失中（使用较小的权重）
+                            stage2_weight = getattr(args, 'stage2_loss_weight', 0.1)
+                            loss += stage2_weight * stage2_loss
+                            
+                            # 更新损失字典
+                            for k, v in stage2_loss_dict.items():
+                                loss_dict[f"stage2_{k}"] = v
+                            
+                            if data_iter_step % args.print_freq == 0:
+                                printer.info(f"Stage2 training at epoch {epoch}, iter {data_iter_step}, total_loss: {float(stage2_loss):.6f}")
+                                # 单独显示每个Stage2损失项目
+                                for k, v in stage2_loss_dict.items():
+                                    if isinstance(v, (int, float)):
+                                        printer.info(f"  Stage2 {k}: {v:.6f}")
+                                    elif hasattr(v, 'item'):
+                                        printer.info(f"  Stage2 {k}: {v.item():.6f}")
+                                    else:
+                                        printer.info(f"  Stage2 {k}: {v}")
+                    
+                    except Exception as e:
+                        printer.warning(f"Stage2 training failed at epoch {epoch}, iter {data_iter_step}: {e}")
+
                 # 按照save_freq保存模型
                 if (
                     data_iter_step % int(args.save_freq * len(data_loader_train)) == 0
@@ -675,10 +812,10 @@ def train(args):
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     printer.info("Training time {}".format(total_time_str))
 
-    save_final_model(accelerator, args, args.epochs, model, best_so_far=best_so_far)
+    save_final_model(accelerator, args, args.epochs, model, online_stage2_trainer, best_so_far=best_so_far)
 
 
-def save_final_model(accelerator, args, epoch, model_without_ddp, best_so_far=None):
+def save_final_model(accelerator, args, epoch, model_without_ddp, stage2_trainer=None, best_so_far=None):
     output_dir = Path(args.output_dir)
     checkpoint_path = output_dir / "checkpoint-final.pth"
     to_save = {
@@ -694,6 +831,14 @@ def save_final_model(accelerator, args, epoch, model_without_ddp, best_so_far=No
         to_save["best_so_far"] = best_so_far
     printer.info(f">> Saving model to {checkpoint_path} ...")
     misc.save_on_master(accelerator, to_save, checkpoint_path)
+    
+    # 保存第二阶段模型最终状态
+    if stage2_trainer is not None and stage2_trainer.enable_stage2:
+        if accelerator.is_main_process:
+            stage2_final_path = output_dir / "stage2-checkpoint-final.pth"
+            stage2_state = stage2_trainer.save_state_dict()
+            misc.save_on_master(accelerator, stage2_state, stage2_final_path)
+            printer.info(f">> Saving Stage2 final model to {stage2_final_path} ...")
 
 
 def build_dataset(dataset, batch_size, num_workers, accelerator, test=False, fixed_length=False):
@@ -1423,7 +1568,7 @@ def run(cfg: OmegaConf):
     if cfg.get("debug", False):
         cfg.num_workers = 0
         import debugpy
-        debugpy.listen(5678)
+        debugpy.listen(5684)
         print("Waiting for debugger to attach...")
         debugpy.wait_for_client()
     logdir = pathlib.Path(cfg.logdir)
