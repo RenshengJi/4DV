@@ -288,8 +288,6 @@ class OnlineStage2Trainer:
             torch.tensor([0, 0, 0, 1], device=extrinsics.device)[None, None, None, :].repeat(1, extrinsics.shape[1], 1, 1)
         ], dim=-2)
         
-        # Debug: 打印张量形状
-        print(f"Debug Stage2: gt_images.shape={gt_images.shape}, intrinsics.shape={intrinsics.shape}, extrinsics.shape={extrinsics.shape}")
         
         loss_dict = self.stage2_criterion(
             refinement_results=refinement_results,

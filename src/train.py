@@ -1568,7 +1568,7 @@ def run(cfg: OmegaConf):
     if cfg.get("debug", False):
         cfg.num_workers = 0
         import debugpy
-        debugpy.listen(5684)
+        debugpy.listen(5689)
         print("Waiting for debugger to attach...")
         debugpy.wait_for_client()
     logdir = pathlib.Path(cfg.logdir)

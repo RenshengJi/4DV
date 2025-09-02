@@ -24,7 +24,6 @@ from dust3r.utils.misc import tf32_off
 def check_and_fix_inf_nan(tensor: torch.Tensor, name: str = "tensor") -> torch.Tensor:
     """检查并修复tensor中的inf和nan值"""
     if torch.isnan(tensor).any() or torch.isinf(tensor).any():
-        print(f"Warning: {name} contains inf or nan values, replacing with 0")
         tensor = torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
     return tensor
 
@@ -221,14 +220,14 @@ class Stage2RenderLoss(nn.Module):
         all_colors = []
         
         # # 静态Gaussian：所有帧都使用完整的静态背景
-        # if refined_scene.get('static_gaussians') is not None:
-        #     static_gaussians = refined_scene['static_gaussians']
-        #     if static_gaussians.shape[0] > 0:
-        #         all_means.append(static_gaussians[:, :3])
-        #         all_scales.append(static_gaussians[:, 3:6])
-        #         all_colors.append(static_gaussians[:, 6:9].unsqueeze(-2))
-        #         all_rotations.append(static_gaussians[:, 9:13])
-        #         all_opacities.append(static_gaussians[:, 13])
+        if refined_scene.get('static_gaussians') is not None:
+            static_gaussians = refined_scene['static_gaussians']
+            if static_gaussians.shape[0] > 0:
+                all_means.append(static_gaussians[:, :3])
+                all_scales.append(static_gaussians[:, 3:6])
+                all_colors.append(static_gaussians[:, 6:9].unsqueeze(-2))
+                all_rotations.append(static_gaussians[:, 9:13])
+                all_opacities.append(static_gaussians[:, 13])
         
         # 动态Gaussian：只处理在当前帧存在的物体
         dynamic_objects_data = refined_scene.get('dynamic_objects', [])
@@ -286,18 +285,6 @@ class Stage2RenderLoss(nn.Module):
             rotations = rotations[:max_gaussians]
             opacities = opacities[:max_gaussians]
         
-        # 注意：Gaussian参数已经在OnlineDynamicProcessor中经过激活处理，这里不需要再次激活
-        # 如果再次激活会导致参数异常（如双重sigmoid导致不透明度过低）
-        
-        # # 处理参数 - 已注释，因为参数已经激活过
-        # scales = (0.05 * torch.exp(scales)).clamp_max(0.3)
-        
-        # # 归一化旋转四元数 - 已注释，因为已经归一化过
-        # rotation_norms = torch.norm(rotations, dim=-1, keepdim=True)
-        # rotation_norms = torch.clamp(rotation_norms, min=1e-8)
-        # rotations = rotations / rotation_norms
-        
-        # opacities = torch.sigmoid(opacities)  # 已注释，因为已经经过sigmoid
         
         # 准备渲染参数
         viewmat = extrinsic.unsqueeze(0)  # [1, 4, 4]
@@ -341,64 +328,26 @@ class Stage2RenderLoss(nn.Module):
                     rendered_rgb = torch.zeros(3, height, width, device=device)
                     rendered_depth = torch.zeros(height, width, device=device)
                 else:
-                    # Debug: Check rendered_image and rendered_depth_raw
-                    print(f"Debug: rendered_image type: {type(rendered_image)}, shape: {rendered_image.shape if hasattr(rendered_image, 'shape') else 'No shape'}")
-                    print(f"Debug: rendered_depth_raw type: {type(rendered_depth_raw)}, shape: {rendered_depth_raw.shape if hasattr(rendered_depth_raw, 'shape') else 'No shape'}")
-                    
                     try:
                         rendered_rgb = rendered_image[0, ..., :3].permute(2, 0, 1)  # [3, H, W]
-                        print(f"Debug: Successfully extracted rendered_rgb, shape: {rendered_rgb.shape}")
                     except Exception as e:
-                        print(f"Debug: Failed to extract rendered_rgb: {e}")
                         rendered_rgb = torch.zeros(3, height, width, device=device)
                     
                     try:
-                        # Check if rendered_depth_raw is a dictionary (from gsplat.rasterization)
-                        if isinstance(rendered_depth_raw, dict):
-                            # Try common keys for depth information
-                            if 'depths' in rendered_depth_raw:
-                                rendered_depth = rendered_depth_raw['depths']
-                                # Handle different depth tensor shapes
-                                if rendered_depth.dim() == 3 and rendered_depth.shape[0] == 1:
-                                    rendered_depth = rendered_depth[0]  # Remove batch dimension
-                                elif rendered_depth.dim() == 1:
-                                    # 1D depth tensor - need to reshape or create zero tensor
-                                    print(f"Debug: 1D depth tensor with shape {rendered_depth.shape}, creating zero depth")
-                                    rendered_depth = torch.zeros(height, width, device=device)
-                                elif rendered_depth.dim() == 0:
-                                    # Scalar depth - create zero tensor
-                                    print(f"Debug: Scalar depth, creating zero depth")
-                                    rendered_depth = torch.zeros(height, width, device=device)
-                            elif 'depth' in rendered_depth_raw:
-                                rendered_depth = rendered_depth_raw['depth']
-                                if rendered_depth.dim() == 3 and rendered_depth.shape[0] == 1:
-                                    rendered_depth = rendered_depth[0]  # Remove batch dimension
-                                elif rendered_depth.dim() <= 1:
-                                    rendered_depth = torch.zeros(height, width, device=device)
-                            elif 'expected_depth' in rendered_depth_raw:
-                                rendered_depth = rendered_depth_raw['expected_depth']
-                                if rendered_depth.dim() == 3 and rendered_depth.shape[0] == 1:
-                                    rendered_depth = rendered_depth[0]  # Remove batch dimension
-                                elif rendered_depth.dim() <= 1:
-                                    rendered_depth = torch.zeros(height, width, device=device)
-                            else:
-                                print(f"Debug: Unknown depth dictionary keys: {list(rendered_depth_raw.keys())}")
-                                rendered_depth = torch.zeros(height, width, device=device)
-                        else:
-                            # Assume it's a tensor
-                            if rendered_depth_raw.dim() >= 2:
-                                rendered_depth = rendered_depth_raw[0]  # [H, W]
-                            else:
-                                rendered_depth = torch.zeros(height, width, device=device)
+                        # 正确提取depth：从rendered_image的最后一个维度
+                        # 参考cross_render_and_loss中的实现：pred_depth = render_colors[..., -1]
+                        rendered_depth = rendered_image[0, ..., -1]  # [H, W]
                         
-                        # Final safety check
+                        # 确保depth的维度正确
                         if rendered_depth.dim() != 2:
-                            print(f"Debug: Final depth check failed, shape: {rendered_depth.shape}, creating zero depth")
+                            print(f"Warning: Unexpected depth dimension: {rendered_depth.shape}")
                             rendered_depth = torch.zeros(height, width, device=device)
-                        
-                        print(f"Debug: Successfully extracted rendered_depth, shape: {rendered_depth.shape}")
+                        elif rendered_depth.shape != (height, width):
+                            print(f"Warning: Depth shape mismatch: {rendered_depth.shape} vs expected ({height}, {width})")
+                            rendered_depth = torch.zeros(height, width, device=device)
+                            
                     except Exception as e:
-                        print(f"Debug: Failed to extract rendered_depth: {e}")
+                        print(f"Warning: Failed to extract depth from rendered_image: {e}")
                         rendered_depth = torch.zeros(height, width, device=device)
             
         except Exception as e:

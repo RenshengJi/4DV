@@ -127,6 +127,14 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 self.depth_head,
                 # self.velocity_head,
             ],
+            "all": [
+                self.aggregator,
+                self.camera_head,
+                self.point_head,
+                self.gaussian_head,
+                self.depth_head,
+                self.velocity_head,
+            ],
         }
         if hasattr(self, "track_head"):
             to_be_frozen["vggt"].append(self.track_head)

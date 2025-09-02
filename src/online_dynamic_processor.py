@@ -336,11 +336,7 @@ class OnlineDynamicProcessor:
             )
             stage_times['Stage 5: 背景分离'] = time.time() - background_start
             
-            # 显示各阶段耗时
             total_time = time.time() - start_time
-            for stage_name, stage_time in stage_times.items():
-                print(f"  {stage_name}: {stage_time:.4f}s")
-            print(f"  总耗时: {total_time:.4f}s")
             
             # 更新统计信息
             self.processing_stats['total_sequences'] += 1
@@ -628,18 +624,10 @@ class OnlineDynamicProcessor:
                         clustering_results, preds, vggt_batch, global_id, flows
                     )
                     object_time = time.time() - object_start
-                    print(f"    物体 {global_id} ({i+1}/{len(all_global_ids)}) 聚合耗时: {object_time:.4f}s")
                     
                     if aggregated_object is not None:
-                        print(f"物体 {global_id}: 聚合成功，包含 {len(aggregated_object.get('aggregated_points', []))} 个点")
-                        
                         # 使用aggregate_object_to_middle_frame已经提取的canonical_gaussians
                         aggregated_gaussians = aggregated_object.get('canonical_gaussians')
-                        
-                        if aggregated_gaussians is not None:
-                            print(f"物体 {global_id}: 成功获取到 {aggregated_gaussians.shape[0]} 个Gaussian参数")
-                        else:
-                            print(f"物体 {global_id}: ⚠️ 未能获取Gaussian参数")
                         
                         # 获取变换信息
                         reference_frame = aggregated_object.get('middle_frame', 0)  # 修正：使用middle_frame
@@ -698,10 +686,6 @@ class OnlineDynamicProcessor:
             aggregation_total_time = time.time() - aggregation_start
             method_total_time = time.time() - method_start
             
-            print(f"    物体聚合总耗时: {aggregation_total_time:.4f}s")
-            print(f"    光流聚合方法总耗时: {method_total_time:.4f}s")
-            print(f"    性能分析：预计算光流({flow_time:.3f}s) + 获取ID({ids_time:.3f}s) + 物体聚合({aggregation_total_time:.3f}s)")
-            print(f"    光流聚合完成: 处理了 {len(all_global_ids)} 个物体，成功聚合 {len(dynamic_objects)} 个物体")
             return dynamic_objects
             
         except Exception as e:
@@ -1385,10 +1369,6 @@ class OnlineDynamicProcessor:
             )
             stage5_times['Step 6: 下采样和去重处理'] = time.time() - step6_start
             
-            # 显示Stage 5各步骤的详细耗时
-            print("    Stage 5详细耗时:")
-            for step_name, step_time in stage5_times.items():
-                print(f"      {step_name}: {step_time:.4f}s")
             
             return downsampled_static_gaussians
             
@@ -1431,9 +1411,7 @@ class OnlineDynamicProcessor:
         try:
             import time
             downsample_times = {}
-            print(f"        开始下采样: 输入点数={len(static_gaussians)}, max_points={max_points}, spatial_threshold={spatial_threshold}")
             if len(static_gaussians) <= max_points:
-                print(f"        跳过下采样: 点数已符合要求")
                 return static_gaussians
             
             # Step 6.1: 基于空间距离的去重
