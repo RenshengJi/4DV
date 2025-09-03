@@ -155,7 +155,7 @@ class Stage2Refiner(nn.Module):
             if self.training_mode in ["joint", "gaussian_only"]:
                 
                 # Safety check: 防止内存爆炸 - 限制最大Gaussian数量
-                max_gaussians_stage2 = 4000  # 进一步降低到4K以防内存不足
+                max_gaussians_stage2 = 1000000  # TODO:
                 if aggregated_gaussians.shape[0] > max_gaussians_stage2:
                     # print(f"Warning: Object {object_id} has too many Gaussians ({aggregated_gaussians.shape[0]}), skipping Stage2 processing")
                     # 跳过这个物体的Stage2处理

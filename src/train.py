@@ -777,10 +777,28 @@ def train(args):
                             stage2_weight = getattr(args, 'stage2_loss_weight', 0.1)
                             loss += stage2_weight * stage2_loss
                             
-                            # 更新损失字典
+                            # 更新损失字典，用于tensorboard记录
+                            stage2_loss_dict_for_log = {}
                             for k, v in stage2_loss_dict.items():
-                                loss_dict[f"stage2_{k}"] = v
+                                prefixed_key = f"stage2_{k}"
+                                loss_dict[prefixed_key] = v
+                                stage2_loss_dict_for_log[prefixed_key] = v
                             
+                            # 将Stage2损失添加到metric_logger中，使其出现在croco.utils.misc格式的日志中
+                            metric_logger.update(**stage2_loss_dict_for_log)
+                            
+                            # 将Stage2损失记录到tensorboard中
+                            if log_writer is not None:
+                                step = epoch * len(data_loader_train) + data_iter_step
+                                for name, val in stage2_loss_dict_for_log.items():
+                                    if isinstance(val, torch.Tensor):
+                                        if val.ndim > 0:
+                                            continue
+                                    if isinstance(val, dict):
+                                        continue
+                                    log_writer.add_scalar("train_" + name, val, step)
+                            
+                            # 保留原有的详细日志输出（可选）
                             if data_iter_step % args.print_freq == 0:
                                 printer.info(f"Stage2 training at epoch {epoch}, iter {data_iter_step}, total_loss: {float(stage2_loss):.6f}")
                                 # 单独显示每个Stage2损失项目
@@ -1568,7 +1586,7 @@ def run(cfg: OmegaConf):
     if cfg.get("debug", False):
         cfg.num_workers = 0
         import debugpy
-        debugpy.listen(5689)
+        debugpy.listen(5690)
         print("Waiting for debugger to attach...")
         debugpy.wait_for_client()
     logdir = pathlib.Path(cfg.logdir)

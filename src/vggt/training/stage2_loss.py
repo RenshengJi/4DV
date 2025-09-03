@@ -275,15 +275,15 @@ class Stage2RenderLoss(nn.Module):
         opacities = torch.cat(all_opacities, dim=0)  # [N]
         
         
-        # Safety check: 防止内存爆炸
-        max_gaussians = 500000  # 最大Gaussian数量限制
-        if means.shape[0] > max_gaussians:
-            # print(f"Warning: Too many Gaussians ({means.shape[0]}), clamping to {max_gaussians}")
-            means = means[:max_gaussians]
-            scales = scales[:max_gaussians]
-            colors = colors[:max_gaussians]
-            rotations = rotations[:max_gaussians]
-            opacities = opacities[:max_gaussians]
+        # # Safety check: 防止内存爆炸
+        # max_gaussians = 500000  # 最大Gaussian数量限制
+        # if means.shape[0] > max_gaussians:
+        #     # print(f"Warning: Too many Gaussians ({means.shape[0]}), clamping to {max_gaussians}")
+        #     means = means[:max_gaussians]
+        #     scales = scales[:max_gaussians]
+        #     colors = colors[:max_gaussians]
+        #     rotations = rotations[:max_gaussians]
+        #     opacities = opacities[:max_gaussians]
         
         
         # 准备渲染参数

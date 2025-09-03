@@ -27,7 +27,7 @@ stage2_memory_efficient: True
 
 # 第二阶段模型配置
 stage2_training_mode: 'joint'  # 'joint', 'gaussian_only', 'pose_only'
-stage2_learning_rate: 8.0e-06  # 针对Waymo调整的学习率
+stage2_learning_rate: 3.0e-04  # 针对Waymo调整的学习率
 
 # Gaussian细化头配置（针对Waymo场景优化）
 input_gaussian_dim: 14
@@ -101,7 +101,7 @@ dist_backend: 'nccl'
 
 # ===== 评估和保存配置 =====
 eval_freq: 2               # 每2轮评估一次
-save_freq: 5               # 每5轮保存一次
+save_freq: 1               # 每5轮保存一次
 keep_freq: 10              # 每10轮永久保存
 print_freq: 1              # 每次iteration都打印，以显示Stage2损失详情
 print_img_freq: 1000       # 减少图像打印频率

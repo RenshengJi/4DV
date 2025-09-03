@@ -1365,7 +1365,7 @@ class OnlineDynamicProcessor:
             # Step 6: 下采样和去重处理
             step6_start = time.time()
             downsampled_static_gaussians = self._downsample_static_gaussians(
-                all_static_gaussians, max_points=200000, spatial_threshold=0.01
+                all_static_gaussians, max_points=500000, spatial_threshold=0.005
             )
             stage5_times['Step 6: 下采样和去重处理'] = time.time() - step6_start
             
