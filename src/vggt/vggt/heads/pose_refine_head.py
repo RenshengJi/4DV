@@ -9,6 +9,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional, List
 import numpy as np
+import time
+import logging
+
+try:
+    from sklearn.neighbors import NearestNeighbors
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
 
 
 class PointCloudEncoder(nn.Module):
@@ -94,6 +102,165 @@ class CrossAttention(nn.Module):
         return output
 
 
+class LocalCrossAttention(nn.Module):
+    """局部跨注意力机制，使用k-NN图优化跨点云注意力计算"""
+    
+    def __init__(self, feature_dim: int, num_heads: int = 8, k_neighbors: int = 32):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.num_heads = num_heads
+        self.head_dim = feature_dim // num_heads
+        self.k_neighbors = k_neighbors
+        
+        assert feature_dim % num_heads == 0, "feature_dim must be divisible by num_heads"
+        
+        self.q_proj = nn.Linear(feature_dim, feature_dim)
+        self.k_proj = nn.Linear(feature_dim, feature_dim)
+        self.v_proj = nn.Linear(feature_dim, feature_dim)
+        self.out_proj = nn.Linear(feature_dim, feature_dim)
+        
+        self.scale = self.head_dim ** -0.5
+        
+    def _build_cross_knn_kdtree(self, query_positions: torch.Tensor, key_positions: torch.Tensor, k: int) -> torch.Tensor:
+        """使用KD-tree构建跨点云k-NN图"""
+        if not HAS_SKLEARN:
+            return self._build_cross_knn_batched(query_positions, key_positions, k)
+            
+        N_query = query_positions.shape[0]
+        N_key = key_positions.shape[0]
+        
+        # 如果key点云太小，回退到全连接
+        if N_key <= k:
+            # 返回所有key点的索引
+            return torch.arange(N_key, device=query_positions.device).unsqueeze(0).repeat(N_query, 1)
+        
+        knn_start_time = time.time()
+        
+        try:
+            # 使用KD-tree在key点云中为每个query点找k个最近邻
+            key_positions_np = key_positions.detach().cpu().numpy()
+            query_positions_np = query_positions.detach().cpu().numpy()
+            
+            nbrs = NearestNeighbors(n_neighbors=min(k, N_key), algorithm='kd_tree')
+            nbrs.fit(key_positions_np)
+            _, indices = nbrs.kneighbors(query_positions_np)
+            
+            knn_time = time.time() - knn_start_time
+            
+            
+            return torch.from_numpy(indices).to(query_positions.device)
+            
+        except Exception:
+            return self._build_cross_knn_batched(query_positions, key_positions, k)
+    
+    def _build_cross_knn_batched(self, query_positions: torch.Tensor, key_positions: torch.Tensor, k: int) -> torch.Tensor:
+        """分批构建跨点云k-NN图，避免大矩阵"""
+        N_query = query_positions.shape[0]
+        N_key = key_positions.shape[0]
+        
+        if N_key <= k:
+            return torch.arange(N_key, device=query_positions.device).unsqueeze(0).repeat(N_query, 1)
+        
+        knn_start_time = time.time()
+        batch_size = min(1000, N_query)  # 分批处理
+        knn_indices = []
+        
+        for i in range(0, N_query, batch_size):
+            end_i = min(i + batch_size, N_query)
+            query_batch = query_positions[i:end_i]  # [batch_size, 3]
+            
+            # 计算这批query点到所有key点的距离
+            distances = torch.cdist(query_batch, key_positions)  # [batch_size, N_key]
+            
+            # 找到k个最近邻
+            _, batch_indices = torch.topk(distances, min(k, N_key), dim=-1, largest=False)
+            knn_indices.append(batch_indices)
+        
+        knn_time = time.time() - knn_start_time
+        
+        
+        return torch.cat(knn_indices, dim=0)  # [N_query, k]
+    
+    def forward(self, 
+                query_features: torch.Tensor, 
+                key_features: torch.Tensor,
+                query_positions: torch.Tensor,
+                key_positions: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            query_features: [N1, feature_dim] 查询特征
+            key_features: [N2, feature_dim] 键值特征
+            query_positions: [N1, 3] 查询点3D位置
+            key_positions: [N2, 3] 键值点3D位置
+            
+        Returns:
+            attended_features: [N1, feature_dim] 注意力加权后的特征
+        """
+        infer_start_time = time.time()
+        N1 = query_features.shape[0]
+        N2 = key_features.shape[0]
+        k = min(self.k_neighbors, N2)
+        
+        # 如果k太小，使用全局注意力
+        if k < 4:
+            return self._global_cross_attention(query_features, key_features)
+        
+        # 构建k-NN图：为每个query点找到k个最近的key点
+        knn_indices = self._build_cross_knn_kdtree(query_positions, key_positions, k)  # [N1, k]
+        
+        # Project to Q, K, V
+        Q = self.q_proj(query_features).contiguous().view(N1, self.num_heads, self.head_dim)  # [N1, H, D]
+        K = self.k_proj(key_features).contiguous().view(N2, self.num_heads, self.head_dim)    # [N2, H, D]
+        V = self.v_proj(key_features).contiguous().view(N2, self.num_heads, self.head_dim)    # [N2, H, D]
+        
+        # 使用局部k-NN进行注意力计算
+        attended_features = []
+        
+        for head in range(self.num_heads):
+            q_head = Q[:, head, :]  # [N1, D]
+            k_head = K[:, head, :]  # [N2, D]
+            v_head = V[:, head, :]  # [N2, D]
+            
+            # 为每个query点收集其k个邻居的K和V
+            k_neighbors = torch.gather(k_head.unsqueeze(0).expand(N1, -1, -1),
+                                     1, knn_indices.unsqueeze(-1).expand(-1, -1, self.head_dim))  # [N1, k, D]
+            v_neighbors = torch.gather(v_head.unsqueeze(0).expand(N1, -1, -1), 
+                                     1, knn_indices.unsqueeze(-1).expand(-1, -1, self.head_dim))  # [N1, k, D]
+            
+            # 计算局部注意力分数
+            attn_scores = torch.sum(q_head.unsqueeze(1) * k_neighbors, dim=-1) * self.scale  # [N1, k]
+            attn_weights = F.softmax(attn_scores, dim=-1)  # [N1, k]
+            
+            # 应用注意力权重
+            head_output = torch.sum(attn_weights.unsqueeze(-1) * v_neighbors, dim=1)  # [N1, D]
+            attended_features.append(head_output)
+        
+        # 合并多头结果
+        attended = torch.cat(attended_features, dim=-1)  # [N1, feature_dim]
+        
+        # 输出投影
+        output = self.out_proj(attended)
+        
+        
+        return output
+    
+    def _global_cross_attention(self, query_features: torch.Tensor, key_features: torch.Tensor) -> torch.Tensor:
+        """回退到全局跨注意力"""
+        N1 = query_features.shape[0]
+        N2 = key_features.shape[0]
+        
+        Q = self.q_proj(query_features).contiguous().view(N1, self.num_heads, self.head_dim)
+        K = self.k_proj(key_features).contiguous().view(N2, self.num_heads, self.head_dim)
+        V = self.v_proj(key_features).contiguous().view(N2, self.num_heads, self.head_dim)
+        
+        attn_scores = torch.einsum('qhd,khd->qhk', Q, K) * self.scale
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attended = torch.einsum('qhk,khd->qhd', attn_weights, V)
+        attended = attended.contiguous().view(N1, self.feature_dim)
+        
+        return self.out_proj(attended)
+
+
 class PoseRefineHead(nn.Module):
     """
     位姿细化网络头
@@ -108,21 +275,30 @@ class PoseRefineHead(nn.Module):
         feature_dim: int = 256,
         num_heads: int = 8,
         num_layers: int = 3,
-        max_points: int = 8192
+        max_points: int = 8192,
+        k_neighbors: int = 32,
+        use_local_attention: bool = True
     ):
         super().__init__()
         self.input_dim = input_dim
         self.feature_dim = feature_dim
         self.max_points = max_points
+        self.k_neighbors = k_neighbors
+        self.use_local_attention = use_local_attention
         
         # 源点云和目标点云的编码器
         self.source_encoder = PointCloudEncoder(input_dim, feature_dim)
         self.target_encoder = PointCloudEncoder(input_dim, feature_dim)
         
-        # 跨注意力层
-        self.cross_attention_layers = nn.ModuleList([
-            CrossAttention(feature_dim, num_heads) for _ in range(num_layers)
-        ])
+        # 跨注意力层 - 选择局部或全局注意力
+        if use_local_attention:
+            self.cross_attention_layers = nn.ModuleList([
+                LocalCrossAttention(feature_dim, num_heads, k_neighbors) for _ in range(num_layers)
+            ])
+        else:
+            self.cross_attention_layers = nn.ModuleList([
+                CrossAttention(feature_dim, num_heads) for _ in range(num_layers)
+            ])
         
         # 特征融合层
         self.feature_fusion = nn.Sequential(
@@ -148,9 +324,16 @@ class PoseRefineHead(nn.Module):
             nn.Linear(feature_dim // 4, 6)  # [rot_x, rot_y, rot_z, trans_x, trans_y, trans_z]
         )
         
-        # Initialize pose head to predict small changes
-        nn.init.zeros_(self.pose_head[-1].weight)
-        nn.init.zeros_(self.pose_head[-1].bias)
+        # Initialize all layers with Xavier uniform
+        self._init_weights()
+        
+    def _init_weights(self):
+        """Initialize all linear layers with Xavier uniform"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
         
     def forward(
         self, 
@@ -169,9 +352,14 @@ class PoseRefineHead(nn.Module):
         Returns:
             pose_delta: [6] 位姿变化量 [rot_x, rot_y, rot_z, trans_x, trans_y, trans_z]
         """
+        total_start_time = time.time()
+        N1_orig, N2_orig = source_points.shape[0], target_points.shape[0]
+        
         # 点云采样（如果点数太多）
         source_points = self._sample_points(source_points, self.max_points)
         target_points = self._sample_points(target_points, self.max_points)
+        
+        N1_final, N2_final = source_points.shape[0], target_points.shape[0]
         
         # 编码点云特征
         source_features = self.source_encoder(source_points)  # [N1, feature_dim]
@@ -182,10 +370,14 @@ class PoseRefineHead(nn.Module):
         attended_target = target_features
         
         for cross_attn in self.cross_attention_layers:
-            # 源点云关注目标点云
-            new_source = cross_attn(attended_source, attended_target)
-            # 目标点云关注源点云  
-            new_target = cross_attn(attended_target, attended_source)
+            if self.use_local_attention:
+                # 局部跨注意力需要位置信息
+                new_source = cross_attn(attended_source, attended_target, source_points, target_points)
+                new_target = cross_attn(attended_target, attended_source, target_points, source_points)
+            else:
+                # 全局跨注意力
+                new_source = cross_attn(attended_source, attended_target)
+                new_target = cross_attn(attended_target, attended_source)
             
             # 残差连接
             attended_source = attended_source + new_source
@@ -205,6 +397,7 @@ class PoseRefineHead(nn.Module):
         
         # 预测位姿变化量
         pose_delta = self.pose_head(global_features)  # [6]
+        
         
         return pose_delta
     

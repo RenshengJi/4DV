@@ -93,11 +93,13 @@ class OnlineStage2Trainer:
         """创建第二阶段模型"""
         gaussian_refine_config = {
             "input_gaussian_dim": config.get('input_gaussian_dim', 14),
-            "output_gaussian_dim": config.get('output_gaussian_dim', 11),
+            "output_gaussian_dim": config.get('output_gaussian_dim', 14),  # 修复：应该是14，不是11
             "feature_dim": config.get('gaussian_feature_dim', 128),  # 减少特征维度以节省内存
             "num_attention_layers": config.get('gaussian_num_layers', 2),  # 减少层数
             "num_heads": config.get('gaussian_num_heads', 4),
-            "mlp_ratio": config.get('gaussian_mlp_ratio', 2.0)
+            "mlp_ratio": config.get('gaussian_mlp_ratio', 2.0),
+            "k_neighbors": config.get('k_neighbors', 20),  # 局部注意力邻居数
+            "use_local_attention": config.get('use_local_attention', True)  # 启用局部注意力
         }
         
         pose_refine_config = {

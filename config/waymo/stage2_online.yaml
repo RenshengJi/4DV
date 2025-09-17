@@ -26,12 +26,12 @@ stage2_frequency: 1          # 每次iteration都进行第二阶段训练
 stage2_memory_efficient: True
 
 # 第二阶段模型配置
-stage2_training_mode: 'joint'  # 'joint', 'gaussian_only', 'pose_only'
-stage2_learning_rate: 3.0e-04  # 针对Waymo调整的学习率
+stage2_training_mode: 'gaussian_only'  # 'joint', 'gaussian_only', 'pose_only'
+stage2_learning_rate: 3.0e-05  # 针对Waymo调整的学习率
 
 # Gaussian细化头配置（针对Waymo场景优化）
 input_gaussian_dim: 14
-output_gaussian_dim: 11
+output_gaussian_dim: 14
 gaussian_feature_dim: 128      # 减少特征维度以节省内存
 gaussian_num_layers: 4         # 增加层数提升表达能力
 gaussian_num_heads: 8          # 增加注意力头
@@ -101,13 +101,13 @@ dist_backend: 'nccl'
 
 # ===== 评估和保存配置 =====
 eval_freq: 2               # 每2轮评估一次
-save_freq: 1               # 每5轮保存一次
+save_freq: 0.5               # 每5轮保存一次
 keep_freq: 10              # 每10轮永久保存
 print_freq: 1              # 每次iteration都打印，以显示Stage2损失详情
 print_img_freq: 1000       # 减少图像打印频率
 num_imgs_vis: 6            # 增加可视化图像数量
 save_dir: 'checkpoints'
-exp_name: 'waymo_stage2_online'  # 专用实验名称
+exp_name: 'waymo_stage2_online_zeroinit'  # 专用实验名称
 task: 'vggt'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/

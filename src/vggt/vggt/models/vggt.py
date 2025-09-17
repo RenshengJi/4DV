@@ -70,7 +70,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 out_channels=3,  # RGB output
             )
         
-        self.set_freeze(freeze="vggt_wo_gaussian_and_velocity")
+        self.set_freeze(freeze="all")
 
     def set_freeze(self, freeze):
         to_be_frozen = {

@@ -585,13 +585,13 @@ def train(args):
 
                 interval = 2
 
-                forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, forward_in_bound_mask, backward_in_bound_mask = calc_flow(
-                    vggt_batch["images"], auxiliary_models["flow"],
-                    check_consistency=True,
-                    geo_thresh=auxiliary_models["flow"].args.geo_thresh,
-                    photo_thresh=auxiliary_models["flow"].args.photo_thresh,
-                    interval=interval,
-                )
+                # forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, forward_in_bound_mask, backward_in_bound_mask = calc_flow(
+                #     vggt_batch["images"], auxiliary_models["flow"],
+                #     check_consistency=True,
+                #     geo_thresh=auxiliary_models["flow"].args.geo_thresh,
+                #     photo_thresh=auxiliary_models["flow"].args.photo_thresh,
+                #     interval=interval,
+                # )
 
                 # camera loss
                 # if vggt_batch.get("extrinsics") is not None and vggt_batch.get("intrinsics") is not None and vggt_batch.get("point masks") is not None:
@@ -657,18 +657,18 @@ def train(args):
                 #             "backward_loss": torch.tensor(0.0, device=device, requires_grad=True),
                 #         })
                 
-                # velocity regularization loss
-                if vggt_batch.get("images") is not None:
-                    try:
-                        velocity_loss_value = velocity_loss(preds["velocity"])
-                        loss += 0.001 * velocity_loss_value  # 使用较小的权重
-                        loss_dict.update({"loss_velocity": velocity_loss_value})
-                    except Exception as e:
-                        print(f"Error in velocity loss computation: {e}")
-                        # 添加零损失作为fallback
-                        loss_dict.update({
-                            "loss_velocity": torch.tensor(0.0, device=device, requires_grad=True),
-                        })
+                # # velocity regularization loss
+                # if vggt_batch.get("images") is not None:
+                #     try:
+                #         velocity_loss_value = velocity_loss(preds["velocity"])
+                #         loss += 0.001 * velocity_loss_value  # 使用较小的权重
+                #         loss_dict.update({"loss_velocity": velocity_loss_value})
+                #     except Exception as e:
+                #         print(f"Error in velocity loss computation: {e}")
+                #         # 添加零损失作为fallback
+                #         loss_dict.update({
+                #             "loss_velocity": torch.tensor(0.0, device=device, requires_grad=True),
+                #         })
                 
                 # # SAM2 mask-based velocity consistency loss
                 # # 使用预处理的SAM掩码或在线推理
@@ -732,24 +732,15 @@ def train(args):
                 #     loss_dict.update(sky_color_loss_dict)
 
             
-                
-                loss_value = float(loss)
-                
-                loss_scaler(
-                    loss,
-                    optimizer,
-                    parameters=model.parameters(),
-                    update_grad=True,
-                    clip_grad=1.0,
-                )
-                optimizer.zero_grad()
                 lr = optimizer.param_groups[0]["lr"]
                 metric_logger.update(epoch=epoch)
                 metric_logger.update(lr=lr)
-                metric_logger.update(loss=loss_value, **loss_dict)
+                # 先记录第一阶段的损失（第二阶段损失会在后面加入）
+                loss_value_stage1 = float(loss)
+                metric_logger.update(loss=loss_value_stage1, **loss_dict)
                 if log_writer is not None:
                     step = epoch * len(data_loader_train) + data_iter_step
-                    log_writer.add_scalar("train_loss", loss_value, step)
+                    log_writer.add_scalar("train_loss", loss_value_stage1, step)
                     log_writer.add_scalar("train_lr", lr, step)
                     for name, val in loss_dict.items():
                         if isinstance(val, torch.Tensor):
@@ -798,20 +789,31 @@ def train(args):
                                         continue
                                     log_writer.add_scalar("train_" + name, val, step)
                             
-                            # 保留原有的详细日志输出（可选）
-                            if data_iter_step % args.print_freq == 0:
-                                printer.info(f"Stage2 training at epoch {epoch}, iter {data_iter_step}, total_loss: {float(stage2_loss):.6f}")
-                                # 单独显示每个Stage2损失项目
-                                for k, v in stage2_loss_dict.items():
-                                    if isinstance(v, (int, float)):
-                                        printer.info(f"  Stage2 {k}: {v:.6f}")
-                                    elif hasattr(v, 'item'):
-                                        printer.info(f"  Stage2 {k}: {v.item():.6f}")
-                                    else:
-                                        printer.info(f"  Stage2 {k}: {v}")
                     
                     except Exception as e:
                         printer.warning(f"Stage2 training failed at epoch {epoch}, iter {data_iter_step}: {e}")
+
+                # 两阶段处理完成后，统一进行梯度回传
+                loss_value = float(loss)
+                
+                # 只对第二阶段的refine模型进行梯度回传
+                if online_stage2_trainer is not None and online_stage2_trainer.enable_stage2:
+                    stage2_params = online_stage2_trainer.get_stage2_parameters()
+                    if stage2_params:
+                        loss_scaler(
+                            loss,
+                            optimizer,
+                            parameters=stage2_params,  # 只使用第二阶段refine模型参数
+                            update_grad=True,
+                            clip_grad=1.0,
+                        )
+                        optimizer.zero_grad()
+
+                # 更新最终的损失记录
+                metric_logger.meters["loss"].update(loss_value)
+                if log_writer is not None:
+                    step = epoch * len(data_loader_train) + data_iter_step
+                    log_writer.add_scalar("train_loss_final", loss_value, step)
 
                 # 按照save_freq保存模型
                 if (
@@ -1586,7 +1588,7 @@ def run(cfg: OmegaConf):
     if cfg.get("debug", False):
         cfg.num_workers = 0
         import debugpy
-        debugpy.listen(5690)
+        debugpy.listen(5692)
         print("Waiting for debugger to attach...")
         debugpy.wait_for_client()
     logdir = pathlib.Path(cfg.logdir)

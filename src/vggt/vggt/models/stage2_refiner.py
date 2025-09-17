@@ -9,6 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
+import time
+import logging
 
 # 导入头网络
 from vggt.heads.gaussian_refine_head import GaussianRefineHead
@@ -31,15 +33,17 @@ class Stage2Refiner(nn.Module):
     ):
         super().__init__()
         
-        # 默认配置
+        # 默认配置 - 使用局部注意力机制优化显存
         if gaussian_refine_config is None:
             gaussian_refine_config = {
                 "input_gaussian_dim": 14,
-                "output_gaussian_dim": 11,
+                "output_gaussian_dim": 14,
                 "feature_dim": 256,
                 "num_attention_layers": 4,
                 "num_heads": 8,
-                "mlp_ratio": 4.0
+                "mlp_ratio": 4.0,
+                "k_neighbors": 20,  # 局部注意力的邻居数量
+                "use_local_attention": True  # 默认使用局部注意力
             }
             
         if pose_refine_config is None:
@@ -48,7 +52,9 @@ class Stage2Refiner(nn.Module):
                 "feature_dim": 256,
                 "num_heads": 8,
                 "num_layers": 3,
-                "max_points": 8192
+                "max_points": 8192,
+                "k_neighbors": 32,
+                "use_local_attention": True
             }
         
         # 初始化网络组件
@@ -104,7 +110,8 @@ class Stage2Refiner(nn.Module):
             'gaussian_refinements': {}
         }
         
-        for obj_data in dynamic_objects:
+        for obj_idx, obj_data in enumerate(dynamic_objects):
+            object_start_time = time.time()
             object_id = obj_data['object_id']
             
             # 支持两种数据格式：新格式和旧格式
@@ -219,6 +226,19 @@ class Stage2Refiner(nn.Module):
                 }
             
             results['refined_dynamic_objects'].append(refined_obj)
+            
+            # Log object processing timing
+            object_time = time.time() - object_start_time
+            N = aggregated_gaussians.shape[0] if aggregated_gaussians is not None else 0
+            logger = logging.getLogger(__name__)
+            if logger.isEnabledFor(logging.INFO):
+                modes = []
+                if self.training_mode in ["joint", "gaussian_only"]:
+                    modes.append(f"gaussian({N:,})")
+                if self.training_mode in ["joint", "pose_only"]:
+                    modes.append(f"pose({len(initial_transforms)}frames)")
+                mode_str = "+".join(modes) if modes else "skip"
+                logger.info(f"Stage2Refiner obj[{obj_idx}] id={object_id}: {mode_str}, time={object_time:.4f}s")
         
         return results
     
