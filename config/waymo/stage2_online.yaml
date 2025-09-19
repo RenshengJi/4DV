@@ -1,96 +1,123 @@
-debug: True
-model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, use_sky_token=False)"
-pretrained: /mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(true+fixmodel+lowlr!+nolpips+onlyflow+velocitylocal+fromscratch)/checkpoint-epoch_2_17880.pth
+# Stage 2 Online Training Configuration for VGGT
+# 第二阶段在线训练配置 - 专注于渲染损失和动态对象精细化
 
+# =============== 模型配置 ===============
+model: "VGGT(img_size=518, patch_size=14, embed_dim=1024)"
+pretrained: null  # 第二阶段需要加载第一阶段训练好的模型
+
+# VGGT冻结策略配置
+# 可选值: "none", "encoder", "encoder_frame", "backbone", "backbone_camera", "backbone_pts",
+#        "vggt", "vggt_wo_velocity", "vggt_wo_depth", "vggt_wo_gaussian_and_velocity", "all"
+# 第二阶段训练时冻结所有VGGT参数，只训练Stage2 refine模型
+vggt_freeze_strategy: "all"
+
+
+# =============== 辅助模型配置 ===============
 auxiliary_models:
-  flow: RAFT(RAFTCfg(name="kitti-M", dataset="kitti", path="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/Tartan-C-T-TSKH-kitti432x960-M.pth",
-    use_var=True, var_min=0, var_max=10, pretrain="resnet34", initial_dim=64, block_dims=[64, 128, 256],
-    radius=4, dim=128, num_blocks=2, iters=4, image_size=[432, 960],
-    offload=${offload_auxiliary}, geo_thresh=2, photo_thresh=-1))
+  # SAM2模型 (用于动态对象检测)
+  sam2: SAM2AutomaticMaskGenerator(SAM2Base(config_file="sam2.1_hiera_tiny.yaml",
+    path="sam2.1_hiera_tiny.pt", offload=${offload_auxiliary}))
+
+  # DAM2模型 (用于生成sky masks)
+  dam2: DepthAnythingV2(encoder="vitb", offload=${offload_auxiliary})
 
 offload_auxiliary: False
+
+# =============== 训练配置 ===============
 load_only_encoder: False
-long_context: False
-fixed_length: True
-resume: null
-benchmark: True
-num_views : 8  # 大幅减少视图数量以节省内存
-num_test_views : 2
+long_context: True
+fixed_length: False
+resume: null  # 通常从第一阶段的checkpoint开始
+benchmark: False
+num_views: 32
+num_test_views: 16
 n_corres_train: 0
 n_corres_test: 0
 
-# ===== 在线第二阶段训练配置 =====
-enable_stage2: True
-stage2_start_epoch: 0        # Waymo数据较复杂，早期开始第二阶段训练
-stage2_frequency: 1          # 每次iteration都进行第二阶段训练
-stage2_memory_efficient: True
+# =============== 训练阶段配置 ===============
+# 第二阶段专用配置
+training_stage: 'stage2'
+
+# =============== 第一阶段损失权重配置 (第二阶段禁用) ===============
+# 第二阶段训练时，第一阶段的所有损失都设为0
+self_render_weight: 0.0
+flow_loss_weight: 0.0
+sam2_velocity_weight: 0.0
+sky_opacity_weight: 0.0
+sky_color_weight: 0.0
+velocity_reg_weight: 0.0
+vggt_distill_weight: 0.0                   # 第二阶段不需要蒸馏损失
+
+# =============== 第二阶段配置 ===============
+# 启用第二阶段训练
+enable_stage2: true
+stage2_start_epoch: 0                     # 第二阶段从第0个epoch开始
+stage2_frequency: 1                       # 每个iteration都进行第二阶段训练
+
+# 第二阶段损失权重
+stage2_loss_weight: 1.0                   # 第二阶段渲染损失权重
 
 # 第二阶段模型配置
-stage2_training_mode: 'gaussian_only'  # 'joint', 'gaussian_only', 'pose_only'
-stage2_learning_rate: 3.0e-05  # 针对Waymo调整的学习率
-
-# Gaussian细化头配置（针对Waymo场景优化）
 input_gaussian_dim: 14
-output_gaussian_dim: 14
-gaussian_feature_dim: 128      # 减少特征维度以节省内存
-gaussian_num_layers: 4         # 增加层数提升表达能力
-gaussian_num_heads: 8          # 增加注意力头
-gaussian_mlp_ratio: 4.0        # 标准MLP比例
+output_gaussian_dim: 11
+gaussian_feature_dim: 128
+gaussian_num_layers: 2
+gaussian_num_heads: 4
+gaussian_mlp_ratio: 2.0
+pose_feature_dim: 128
+pose_num_heads: 4
+pose_num_layers: 2
+max_points_per_object: 2048
+stage2_training_mode: 'refine'             # 第二阶段专用的refine模式
 
-# 姿态细化头配置（针对Waymo动态物体）
-pose_feature_dim: 128          # 减少特征维度以节省内存
-pose_num_heads: 8              # 增加注意力头
-pose_num_layers: 3             # 增加层数
-max_points_per_object: 2048    # 减少每个物体的最大点数以节省内存
+# 第二阶段损失配置
+stage2_rgb_loss_weight: 1.0               # RGB渲染损失
+stage2_depth_loss_weight: 0.1             # 深度渲染损失
+stage2_lpips_loss_weight: 0.05            # LPIPS感知损失
+stage2_consistency_loss_weight: 0.02      # 多视图一致性损失
+stage2_gaussian_reg_weight: 0.005         # Gaussian参数正则化
+stage2_pose_reg_weight: 0.005             # 位姿参数正则化
+stage2_temporal_smooth_weight: 0.002      # 时序平滑损失
 
-# 第二阶段损失权重配置（简化版本）
-stage2_rgb_loss_weight: 1.0           # 保留RGB损失
-stage2_depth_loss_weight: 0.0         # 禁用深度损失
-stage2_lpips_loss_weight: 0.1         # 保留感知损失
-stage2_consistency_loss_weight: 0.0   # 禁用一致性损失
-stage2_gaussian_reg_weight: 0.0       # 禁用Gaussian正则化
-stage2_pose_reg_weight: 0.0           # 禁用位姿正则化
-stage2_temporal_smooth_weight: 0.0    # 禁用时间平滑性
+# 动态处理器配置
+min_object_size: 100
+max_objects_per_frame: 10
+velocity_threshold_percentile: 0.75
+enable_optical_flow_aggregation: true
 
-# 动态物体处理器配置（针对Waymo场景）
-sam2_model_cfg: 'sam2_hiera_l.yaml'
-sam2_checkpoint: 'checkpoints/sam2_hiera_large.pt'
-confidence_threshold: 0.25     # 降低阈值检测更多物体
-min_mask_area: 200             # 车辆较大，提高最小面积
-max_objects_per_frame: 4       # 进一步减少每帧最大物体数以节省内存
-tracking_memory_length: 8      # 增加跟踪记忆长度
-optical_flow_model: 'RAFT'
+# =============== 数据集配置 ===============
 
-# 动态物体处理器细节配置
-min_object_size: 200           # 车辆最小尺寸
-velocity_threshold_percentile: 0.7  # 速度阈值
-use_optical_flow_aggregation: True  # 启用光流聚合
-
-train_criterion: RenderLoss(MSE, shape="BHWC") + 0.1 * RenderLoss(LPIPS, shape="BCHW")
-test_criterion: RenderLoss(MSE, shape="BHWC")
-
-# ===== Waymo专用数据集配置 =====
-resolution: [(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)]
 allow_repeat: False
-train_dataset: Waymo_Multi(allow_repeat=${allow_repeat}, split=None, ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/test", img_ray_mask_p=[1.0, 0.0, 0.0], valid_camera_id_list=["1"], aug_crop=0, resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], transform=ImgNorm, num_views=${num_views}, n_corres=${n_corres_train}, seq_aug_crop=True, load_sam_masks=True)
-test_dataset: 1000 @ Waymo_Multi(split=None, ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train", img_ray_mask_p=[1.0, 0.0, 0.0], valid_camera_id_list=["1", "2", "3"], resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], num_views=${num_test_views}, seed=42, n_corres=${n_corres_test}, seq_aug_crop=True)
+train_dataset: Waymo_Multi(allow_repeat=${allow_repeat}, split=None,
+  ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train",
+  img_ray_mask_p=[1.0, 0.0, 0.0], valid_camera_id_list=["1", "2", "3"],
+  aug_crop=0, resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], transform=ImgNorm,
+  num_views=${num_views}, n_corres=${n_corres_train}, seq_aug_crop=True, load_sam_masks=False)
 
+test_dataset: 1000 @ Waymo_Multi(split=None,
+  ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train",
+  img_ray_mask_p=[1.0, 0.0, 0.0], valid_camera_id_list=["1", "2", "3"],
+  resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], num_views=${num_test_views}, seed=42, n_corres=${n_corres_test})
 
-# ===== 训练参数配置 =====
+# =============== 优化器配置 ===============
 seed: 0
-batch_size: 1              # 减小batch size适应复杂场景
-accum_iter: 2              # 增加累积步骤保持有效batch size
-gradient_checkpointing: true  # 启用梯度检查点节省内存
-epochs: 50                 # 增加训练轮数
+batch_size: 1
+accum_iter: 4
+gradient_checkpointing: True
+epochs: 10                                 # 第二阶段通常需要较少epochs
 start_epoch: 0
-weight_decay: 0.05
-lr: 3.0e-06                # 降低学习率适应Waymo
-min_lr: 5.0e-07
-warmup_epochs: 2           # 增加预热轮数
-amp: 1                     # 启用混合精度
+weight_decay: 0.01                         # 第二阶段使用较小的weight decay
+lr: 1e-4                                   # 第二阶段使用较小的学习率
+min_lr: 1e-8
+warmup_epochs: 0.1                         # 第二阶段使用较短的warmup
+amp: 1
 
-# ===== 分布式训练配置 =====
-num_workers: 8
+# 第二阶段专用学习率配置
+stage2_learning_rate: 5e-5                # 更小的学习率用于精细化
+stage2_weight_decay: 0.005                # 更小的权重衰减
+
+# =============== 训练监控配置 ===============
+num_workers: 4
 world_size: 1
 local-rank: -1
 dist_url: 'env://'
@@ -99,20 +126,21 @@ gpu: 0
 distributed: False
 dist_backend: 'nccl'
 
-# ===== 评估和保存配置 =====
-eval_freq: 2               # 每2轮评估一次
-save_freq: 0.5               # 每5轮保存一次
-keep_freq: 10              # 每10轮永久保存
-print_freq: 1              # 每次iteration都打印，以显示Stage2损失详情
-print_img_freq: 1000       # 减少图像打印频率
-num_imgs_vis: 6            # 增加可视化图像数量
-save_dir: 'checkpoints'
-exp_name: 'waymo_stage2_online_zeroinit'  # 专用实验名称
-task: 'vggt'
+eval_freq: 1
+save_freq: 0.2                             # 第二阶段更频繁保存
+keep_freq: 1
+print_freq: 5                              # 更频繁的打印
+print_img_freq: 50000000
+num_imgs_vis: 4
+
+# =============== 输出配置 ===============
+save_dir: 'checkpoints/waymo_stage2_online'
+exp_name: 'stage2_online'
+task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/
 
-# ===== Hydra配置 =====
+# =============== Hydra配置 ===============
 hydra:
   verbose: True
   run:

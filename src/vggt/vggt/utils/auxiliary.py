@@ -31,10 +31,53 @@ def freeze_all_params(modules):
             module.requires_grad = False
 
 
+def get_heatmap(info, var_min=0.0, var_max=10.0):
+    """
+    Extract confidence heatmap from RAFT model info output.
+
+    Args:
+        info: Info tensor from RAFT model output with shape (B, 4, H, W)
+              where channels are [weight1, weight2, log_var1, log_var2]
+        var_min: Minimum variance clamp value
+        var_max: Maximum variance clamp value
+
+    Returns:
+        heatmap: Confidence heatmap tensor of shape (B, 1, H, W)
+    """
+    if info is None:
+        return None
+
+    raw_b = info[:, 2:]  # Extract variance channels
+    log_b = torch.zeros_like(raw_b)
+    weight = info[:, :2].softmax(dim=1)  # Softmax over weight channels
+
+    log_b[:, 0] = torch.clamp(raw_b[:, 0], min=0, max=var_max)
+    log_b[:, 1] = torch.clamp(raw_b[:, 1], min=var_min, max=0)
+    heatmap = (log_b * weight).sum(dim=1, keepdim=True)
+
+    return heatmap
+
+
 @torch.no_grad()
-def calc_flow(images, flow_model, chunk_size=16, check_consistency=False, geo_thresh=-1, photo_thresh=-1, interval=1):
+def calc_flow(images, flow_model, chunk_size=16, check_consistency=False, geo_thresh=-1, photo_thresh=-1, interval=1, return_heatmap=False):
     """
     Calculate optical flow between consecutive images in a batch of views.
+
+    Args:
+        images: Input images tensor of shape (B, S, C, H, W)
+        flow_model: RAFT flow model
+        chunk_size: Batch size for flow computation
+        check_consistency: Whether to compute consistency masks
+        geo_thresh: Geometric consistency threshold
+        photo_thresh: Photometric consistency threshold
+        interval: Interval between frames for flow computation
+        return_heatmap: Whether to return confidence heatmaps
+
+    Returns:
+        If return_heatmap=False:
+            forward_flow, backward_flow (and consistency masks if check_consistency=True)
+        If return_heatmap=True:
+            forward_flow, backward_flow, forward_heatmap, backward_heatmap (and consistency masks if check_consistency=True)
     """
     # Shape: (batch_size, num_views, C, H, W)
     if torch.max(images) <= 1.0 + 1e-5:
@@ -55,15 +98,26 @@ def calc_flow(images, flow_model, chunk_size=16, check_consistency=False, geo_th
 
     forward_flow_raft = []
     backward_flow_raft = []
+    forward_info_raft = []
+    backward_info_raft = []
+
     for i in range(0, images_part1.shape[0], chunk_size):
-        forward_flow_raft.append(
-            flow_model(images_part1[i : i + chunk_size], images_part2[i : i + chunk_size], iters=flow_model.args.iters, test_mode=True)["flow"][-1]
-        )
-        backward_flow_raft.append(
-            flow_model(images_part2[i : i + chunk_size], images_part1[i : i + chunk_size], iters=flow_model.args.iters, test_mode=True)["flow"][-1]
-        )
+        forward_output = flow_model(images_part1[i : i + chunk_size], images_part2[i : i + chunk_size], iters=flow_model.args.iters, test_mode=True)
+        forward_flow_raft.append(forward_output["flow"][-1])
+        if return_heatmap and "info" in forward_output:
+            forward_info_raft.append(forward_output["info"][-1])
+
+        backward_output = flow_model(images_part2[i : i + chunk_size], images_part1[i : i + chunk_size], iters=flow_model.args.iters, test_mode=True)
+        backward_flow_raft.append(backward_output["flow"][-1])
+        if return_heatmap and "info" in backward_output:
+            backward_info_raft.append(backward_output["info"][-1])
+
     forward_flow_raft = torch.cat(forward_flow_raft, dim=0)
     backward_flow_raft = torch.cat(backward_flow_raft, dim=0)
+
+    if return_heatmap and len(forward_info_raft) > 0 and len(backward_info_raft) > 0:
+        forward_info_raft = torch.cat(forward_info_raft, dim=0)
+        backward_info_raft = torch.cat(backward_info_raft, dim=0)
 
     scale_factor = torch.tensor([W / flowmap_size[1], H / flowmap_size[0]], device=forward_flow_raft.device, dtype=forward_flow_raft.dtype)
 
@@ -79,6 +133,27 @@ def calc_flow(images, flow_model, chunk_size=16, check_consistency=False, geo_th
     backward_flow = torch.cat(
         [torch.zeros_like(backward_flow[:, 0:1]).repeat(1,interval,1,1,1), backward_flow], dim=1
     ) # Pad first frame's backward flow
+
+    # Process heatmaps if requested
+    if return_heatmap and len(forward_info_raft) > 0 and len(backward_info_raft) > 0:
+        # Extract heatmaps from info tensors
+        forward_heatmap_raft = get_heatmap(forward_info_raft, var_min=getattr(flow_model.args, 'var_min', 0.0), var_max=getattr(flow_model.args, 'var_max', 10.0))
+        backward_heatmap_raft = get_heatmap(backward_info_raft, var_min=getattr(flow_model.args, 'var_min', 0.0), var_max=getattr(flow_model.args, 'var_max', 10.0))
+
+        # Interpolate heatmaps to original resolution
+        forward_heatmap = F.interpolate(forward_heatmap_raft, size=(H, W), mode="bilinear", align_corners=False)
+        backward_heatmap = F.interpolate(backward_heatmap_raft, size=(H, W), mode="bilinear", align_corners=False)
+
+        # Reshape and pad heatmaps
+        forward_heatmap = rearrange(forward_heatmap, "(B S) C H W -> B S C H W", B=batch_size)
+        forward_heatmap = torch.cat(
+            [forward_heatmap, torch.zeros_like(forward_heatmap[:, 0:1]).repeat(1,interval,1,1,1)], dim=1
+        ) # Pad last frame's forward heatmap
+
+        backward_heatmap = rearrange(backward_heatmap, "(B S) C H W -> B S C H W", B=batch_size)
+        backward_heatmap = torch.cat(
+            [torch.zeros_like(backward_heatmap[:, 0:1]).repeat(1,interval,1,1,1), backward_heatmap], dim=1
+        ) # Pad first frame's backward heatmap
 
     if check_consistency:
         grid_y, grid_x = torch.meshgrid(
@@ -124,9 +199,16 @@ def calc_flow(images, flow_model, chunk_size=16, check_consistency=False, geo_th
         backward_in_bound_mask = torch.cat(
             [torch.ones_like(backward_in_bound_mask[:, 0:1].repeat(1,interval,1,1,1)), backward_in_bound_mask], dim=1
         )
-        return forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, forward_in_bound_mask, backward_in_bound_mask
 
-    return forward_flow, backward_flow
+        if return_heatmap and len(forward_info_raft) > 0 and len(backward_info_raft) > 0:
+            return forward_flow, backward_flow, forward_heatmap, backward_heatmap, forward_consist_mask, backward_consist_mask, forward_in_bound_mask, backward_in_bound_mask
+        else:
+            return forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, forward_in_bound_mask, backward_in_bound_mask
+
+    if return_heatmap and len(forward_info_raft) > 0 and len(backward_info_raft) > 0:
+        return forward_flow, backward_flow, forward_heatmap, backward_heatmap
+    else:
+        return forward_flow, backward_flow
 
 
 def get_consist_mask(image1, image2, flow1_2, flow2_1, init_pos=None, geo_thresh=-1, photo_thresh=-1):

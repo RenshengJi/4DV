@@ -245,15 +245,25 @@ def train(args):
     printer.info("Loading model: %s", args.model)
     model = eval(args.model)
     model.gradient_checkpointing_enable()
+
+    # 应用VGGT冻结策略配置
+    vggt_freeze_strategy = getattr(args, 'vggt_freeze_strategy', None)
+    if vggt_freeze_strategy is not None:
+        printer.info(f"Applying VGGT freeze strategy: {vggt_freeze_strategy}")
+        model.set_freeze(vggt_freeze_strategy)
+    else:
+        printer.info("No VGGT freeze strategy specified, using model defaults")
+
     printer.info(f"All model parameters: {sum(p.numel() for p in model.parameters())}")
+    printer.info(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 
     model.to(device)
 
     if args.pretrained and not args.resume:
         printer.info(f"Loading pretrained: {args.pretrained}")
-        # ckpt = torch.load(args.pretrained, map_location=device, weights_only=True)
-        ckpt = torch.load(args.pretrained, map_location=device)['model']
-        ckpt = {k.replace("module.", ""): v for k, v in ckpt.items()}
+        ckpt = torch.load(args.pretrained, map_location=device, weights_only=True)
+        # ckpt = torch.load(args.pretrained, map_location=device)['model']
+        # ckpt = {k.replace("module.", ""): v for k, v in ckpt.items()}
         model.load_state_dict(ckpt, strict=False)
         del ckpt
         
@@ -377,7 +387,7 @@ def train(args):
                         offload = offload_match.group(1).lower() == "true" if offload_match else False
                         
                         # 构建VGGT teacher模型
-                        teacher_model = VGGT(img_size=518, patch_size=14, embed_dim=1024)
+                        teacher_model = VGGT(img_size=518, patch_size=14, embed_dim=1024, use_sky_token=False)
                         
                         # 加载checkpoint
                         state_dict = torch.load(ckpt_path, map_location="cpu" if offload else device)
@@ -547,7 +557,7 @@ def train(args):
                 if vggt_batch.get("images") is not None:
                     preds = model(
                         vggt_batch["images"],
-                        compute_sky_color_loss=False,
+                        compute_sky_color_loss=True,
                         sky_masks=vggt_batch.get("sky_masks"),
                         gt_images=vggt_batch.get("images")
                     )
@@ -555,11 +565,25 @@ def train(args):
                     # Fallback for other models
                     preds = model(batch)
 
+                # =============== STAGE 1 TRAINING LOGIC ===============
                 loss = 0.0
                 loss_dict = {}
-                
-                # VGGT teacher predictions (without distillation loss)
+
+                # 获取损失权重配置
+                loss_weights = {
+                    'self_render_weight': getattr(args, 'self_render_weight', 1.0),
+                    'flow_loss_weight': getattr(args, 'flow_loss_weight', 1.0),
+                    'sam2_velocity_weight': getattr(args, 'sam2_velocity_weight', 1.0),
+                    'sky_opacity_weight': getattr(args, 'sky_opacity_weight', 1.0),
+                    'sky_color_weight': getattr(args, 'sky_color_weight', 1.0),
+                    'velocity_reg_weight': getattr(args, 'velocity_reg_weight', 0.001),
+                    'vggt_distill_weight': getattr(args, 'vggt_distill_weight', 1.0)
+                }
+
+                # VGGT teacher predictions
+                # 只要teacher存在就执行替换，确保其他损失计算使用稳定的teacher预测值
                 teacher_preds = None
+                student_preds_original = None
                 if "vggt_teacher" in auxiliary_models and vggt_batch.get("images") is not None:
                     try:
                         with torch.no_grad():
@@ -569,167 +593,168 @@ def train(args):
                                 sky_masks=vggt_batch.get("sky_masks"),
                                 gt_images=vggt_batch["images"],
                             )
+
+                        # 保存原始student预测值用于蒸馏损失
+                        student_preds_original = {
+                            'depth': preds["depth"].clone() if preds.get("depth") is not None else None,
+                            'pose_enc': preds["pose_enc"].clone() if preds.get("pose_enc") is not None else None,
+                            'depth_conf': preds["depth_conf"].clone() if preds.get("depth_conf") is not None else None
+                        }
+
+                        # 强制替换：无论蒸馏权重如何，都使用teacher预测值进行其他损失计算
+                        # 这确保了即使unfreeze backbone时，其他损失仍使用稳定的预测值
+                        if teacher_preds.get("depth") is not None:
+                            preds["depth"] = teacher_preds["depth"]
+                        if teacher_preds.get("pose_enc") is not None:
+                            preds["pose_enc"] = teacher_preds["pose_enc"]
+                        if teacher_preds.get("depth_conf") is not None:
+                            preds["depth_conf"] = teacher_preds["depth_conf"]
+
                     except Exception as e:
                         print(f"Error in VGGT teacher inference: {e}")
                         teacher_preds = None
-                
-                # 使用teacher的预测结果替换student的预测结果（如果teacher可用）
-                if teacher_preds is not None:
-                    # 替换depth、depth_conf、pose_enc为teacher的预测结果
-                    preds["depth"] = teacher_preds["depth"]
-                    preds["depth_conf"] = teacher_preds["depth_conf"]
-                    preds["pose_enc"] = teacher_preds["pose_enc"]
-                    print("Using teacher predictions for depth, depth_conf, and pose_enc")
-                else:
-                    print("Teacher not available, using student predictions")
 
-                interval = 2
+                # 计算光流（flow_loss需要）
+                interval = getattr(args, 'flow_interval', 2)
+                forward_flow = backward_flow = forward_consist_mask = backward_consist_mask = None
 
-                # forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, forward_in_bound_mask, backward_in_bound_mask = calc_flow(
-                #     vggt_batch["images"], auxiliary_models["flow"],
-                #     check_consistency=True,
-                #     geo_thresh=auxiliary_models["flow"].args.geo_thresh,
-                #     photo_thresh=auxiliary_models["flow"].args.photo_thresh,
-                #     interval=interval,
-                # )
+                if loss_weights['flow_loss_weight'] > 0 and "flow" in auxiliary_models:
+                    try:
+                        forward_flow, backward_flow, _, _, forward_consist_mask, backward_consist_mask, _, _ = calc_flow(
+                            vggt_batch["images"], auxiliary_models["flow"],
+                            check_consistency=True,
+                            geo_thresh=auxiliary_models["flow"].args.geo_thresh,
+                            photo_thresh=auxiliary_models["flow"].args.photo_thresh,
+                            interval=interval,
+                            return_heatmap=True
+                        )
+                    except Exception as e:
+                        print(f"Error in optical flow computation: {e}")
 
-                # camera loss
-                # if vggt_batch.get("extrinsics") is not None and vggt_batch.get("intrinsics") is not None and vggt_batch.get("point masks") is not None:
-                #     cam_loss, __ = camera_loss([preds["pose_enc"]], vggt_batch)
-                #     loss += cam_loss["loss_camera"]
-                #     loss_dict.update(cam_loss)
+                # 1. Self Render Loss (训练gaussian head)
+                if loss_weights['self_render_weight'] > 0 and vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
+                    try:
+                        self_loss_dict, _ = self_render_and_loss(
+                            preds["depth"].detach(),
+                            preds["gaussian_params"],
+                            preds["pose_enc"],
+                            vggt_batch["extrinsics"],
+                            vggt_batch["intrinsics"],
+                            vggt_batch["images"]
+                        )
+                        self_render_loss = self_loss_dict.get("loss_self_render_rgb", 0.0)
+                        loss += loss_weights['self_render_weight'] * self_render_loss
+                        loss_dict.update({k: v for k, v in self_loss_dict.items() if not k.startswith("loss_self_render_lpips")})
+                    except Exception as e:
+                        print(f"Error in self render loss computation: {e}")
 
-                # point loss
-                # if vggt_batch.get("world_points") is not None and vggt_batch.get("point_masks") is not None:
-                #     point_loss_dict = point_loss(preds["world_points"], preds["world_points_conf"], vggt_batch)
-                #     loss += 0.00000001 * point_loss_dict.get("loss_conf", 0.0)
-                #     loss_dict.update(point_loss_dict)
+                # 2. Flow Loss (训练velocity head)
+                if loss_weights['flow_loss_weight'] > 0 and forward_flow is not None and vggt_batch.get("images") is not None:
+                    try:
+                        conf = preds["depth_conf"] > 2
+                        flow_loss_dict = flow_loss(
+                            conf, interval, forward_flow, backward_flow,
+                            forward_consist_mask, backward_consist_mask,
+                            preds["depth"], preds["velocity"], preds["pose_enc"],
+                            vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"]
+                        )
+                        flow_loss_value = flow_loss_dict.get("forward_loss", 0.0)
+                        loss += loss_weights['flow_loss_weight'] * flow_loss_value
+                        loss_dict.update(flow_loss_dict)
+                    except Exception as e:
+                        print(f"Error in flow loss computation: {e}")
 
-                # depth loss
-                # if vggt_batch.get("depths") is not None and vggt_batch.get("point_masks") is not None:
-                #     depth_loss_dict = depth_loss(preds["depth"], preds["depth_conf"], vggt_batch)
-                #     loss += depth_loss_dict.get("loss_conf_depth", 0.0)
-                #     loss_dict.update(depth_loss_dict)
+                # 3. SAM2 Velocity Consistency Loss (辅助velocity head监督)
+                if loss_weights['sam2_velocity_weight'] > 0 and vggt_batch.get("images") is not None:
+                    use_preprocessed_sam = getattr(args, "use_preprocessed_sam", False)
+                    try:
+                        if use_preprocessed_sam and vggt_batch.get("sam_masks") is not None:
+                            # 离线模式：使用预处理的SAM掩码
+                            sam2_loss_dict = sam2_velocity_consistency_loss_with_preprocessed_masks(
+                                vggt_batch["images"],
+                                preds["velocity"],
+                                vggt_batch["sam_masks"],
+                                device=device
+                            )
+                        elif "sam2" in auxiliary_models:
+                            # 在线模式：边训练边推理SAM2
+                            sam2_loss_dict = sam2_velocity_consistency_loss(
+                                vggt_batch["images"],
+                                preds["velocity"],
+                                auxiliary_models["sam2"],
+                                device=device
+                            )
+                        else:
+                            sam2_loss_dict = {}
 
-                # # gaussian loss (cross)
-                # if vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
-                #     conf = preds["depth_conf"] > 2
-                #     try:
-                #         gaussian_loss_dict, _ = cross_render_and_loss(conf, interval, forward_consist_mask, backward_consist_mask, preds["depth"].detach(), preds["gaussian_params"], preds["velocity"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"], vggt_batch["depths"], vggt_batch["point_masks"])
-                #         loss += gaussian_loss_dict.get("loss_render_rgb", 0.0) + 0.0 * gaussian_loss_dict.get("loss_render_lpips", 0.0) + gaussian_loss_dict.get("loss_render_depth", 0.0) 
-                #         loss_dict.update(gaussian_loss_dict)
-                #     except Exception as e:
-                #         print(f"Error in gaussian loss computation: {e}")
-                #         # 添加零损失作为fallback
-                #         loss_dict.update({
-                #             "loss_render_rgb": torch.tensor(0.0, device=device, requires_grad=True),
-                #             "loss_render_lpips": torch.tensor(0.0, device=device, requires_grad=True),
-                #             "loss_render_depth": torch.tensor(0.0, device=device, requires_grad=True),
-                #         })
+                        sam2_loss_value = sam2_loss_dict.get("sam2_velocity_consistency_loss", 0.0)
+                        if sam2_loss_value > 0:
+                            loss += loss_weights['sam2_velocity_weight'] * sam2_loss_value
+                            loss_dict.update(sam2_loss_dict)
+                    except Exception as e:
+                        print(f"Error in SAM2 velocity loss computation: {e}")
 
-                # # self render loss (self)
-                # if vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
-                    # try:
-                    #     self_loss_dict, _ = self_render_and_loss(preds["depth"].detach(), preds["gaussian_params"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"])
-                    #     loss += self_loss_dict.get("loss_self_render_rgb", 0.0) + 0.0 * self_loss_dict.get("loss_self_render_lpips", 0.0) + self_loss_dict.get("loss_self_render_depth", 0.0)
-                    #     loss_dict.update(self_loss_dict)
-                    # except Exception as e:
-                    #     print(f"Error in self render loss computation: {e}")
-                    #     # 添加零损失作为fallback
-                    #     loss_dict.update({
-                    #         "loss_self_render_rgb": torch.tensor(0.0, device=device, requires_grad=True),
-                    #         "loss_self_render_lpips": torch.tensor(0.0, device=device, requires_grad=True),
-                    #         "loss_self_render_depth": torch.tensor(0.0, device=device, requires_grad=True),
-                    #     })
+                # 4. Sky Opacity Loss (监督gaussian head的opacity参数)
+                if loss_weights['sky_opacity_weight'] > 0 and preds.get("gaussian_params") is not None and sky_masks is not None:
+                    try:
+                        sky_opacity_loss_dict = sky_opacity_loss(
+                            preds["gaussian_params"],
+                            sky_masks,
+                            weight=1.0
+                        )
+                        sky_opacity_loss_value = sky_opacity_loss_dict.get("sky_opacity_loss", 0.0)
+                        loss += loss_weights['sky_opacity_weight'] * sky_opacity_loss_value
+                        loss_dict.update(sky_opacity_loss_dict)
+                    except Exception as e:
+                        print(f"Error in sky opacity loss computation: {e}")
 
-                # # optical flow -> velocity loss
-                # if vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
-                #     conf = preds["depth_conf"] > 2
-                #     try:
-                #         flow_loss_dict = flow_loss(conf, interval, forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, preds["depth"], preds["velocity"], preds["pose_enc"], vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"])
-                #         loss += flow_loss_dict.get("forward_loss", 0.0) # + flow_loss_dict.get("backward_loss", 0.0)
-                #         loss_dict.update(flow_loss_dict)
-                #     except Exception as e:
-                #         print(f"Error in flow loss computation: {e}")
-                #         # 添加零损失作为fallback
-                #         loss_dict.update({
-                #             "forward_loss": torch.tensor(0.0, device=device, requires_grad=True),
-                #             "backward_loss": torch.tensor(0.0, device=device, requires_grad=True),
-                #         })
-                
-                # # velocity regularization loss
-                # if vggt_batch.get("images") is not None:
-                #     try:
-                #         velocity_loss_value = velocity_loss(preds["velocity"])
-                #         loss += 0.001 * velocity_loss_value  # 使用较小的权重
-                #         loss_dict.update({"loss_velocity": velocity_loss_value})
-                #     except Exception as e:
-                #         print(f"Error in velocity loss computation: {e}")
-                #         # 添加零损失作为fallback
-                #         loss_dict.update({
-                #             "loss_velocity": torch.tensor(0.0, device=device, requires_grad=True),
-                #         })
-                
-                # # SAM2 mask-based velocity consistency loss
-                # # 使用预处理的SAM掩码或在线推理
-                # use_preprocessed_sam = getattr(args, "use_preprocessed_sam", False)
-                # if use_preprocessed_sam:
-                #     # 使用预加载的SAM掩码
-                #     if vggt_batch.get("images") is not None and vggt_batch.get("sam_masks") is not None:
-                #         try:
-                #             sam2_velocity_loss_dict = sam2_velocity_consistency_loss_with_preprocessed_masks(
-                #                 vggt_batch["images"], 
-                #                 preds["velocity"], 
-                #                 vggt_batch["sam_masks"],
-                #                 device=device
-                #             )
-                #             loss += sam2_velocity_loss_dict.get("sam2_velocity_consistency_loss", 0.0)
-                #             loss_dict.update(sam2_velocity_loss_dict)
-                #         except Exception as e:
-                #             print(f"Error in preprocessed SAM2 loss computation: {e}")
-                #             # 添加零损失作为fallback
-                #             loss_dict.update({
-                #                 "sam2_velocity_consistency_loss": torch.tensor(0.0, device=device, requires_grad=True),
-                #             })
-                # else:
-                #     # 使用在线SAM推理
-                #     if "sam2" in auxiliary_models and vggt_batch.get("images") is not None:
-                #         try:
-                #             sam2_velocity_loss_dict = sam2_velocity_consistency_loss(
-                #                 vggt_batch["images"], 
-                #                 preds["velocity"], 
-                #                 auxiliary_models["sam2"],
-                #                 device=device
-                #             )
-                #             loss += sam2_velocity_loss_dict.get("sam2_velocity_consistency_loss", 0.0)
-                #             loss_dict.update(sam2_velocity_loss_dict)
-                #         except Exception as e:
-                #             print(f"Error in SAM2 loss computation: {e}")
-                #             # 添加零损失作为fallback
-                #             loss_dict.update({
-                #                 "sam2_velocity_consistency_loss": torch.tensor(0.0, device=device, requires_grad=True),
-                #             })
-                
-                # DAM2 sky mask generation and sky loss                    
-                # Sky opacity loss: 鼓励sky区域的gaussian opacity为0
-                # if preds.get("gaussian_params") is not None:
-                #     sky_opacity_loss_dict = sky_opacity_loss(
-                #         preds["gaussian_params"], 
-                #         sky_masks, 
-                #         weight=1.0
-                #     )
-                #     loss += sky_opacity_loss_dict.get("sky_opacity_loss", 0.0)
-                #     loss_dict.update(sky_opacity_loss_dict)
-                    
-                #     # 计算sky color loss
-                #     sky_color_loss_dict = sky_color_loss(
-                #         preds["pred_sky_colors"], 
-                #         vggt_batch["images"], 
-                #         sky_masks, 
-                #         weight=1.0
-                #     )
-                #     loss += sky_color_loss_dict.get("sky_color_loss", 0.0)
-                #     loss_dict.update(sky_color_loss_dict)
+                # 5. Sky Color Loss (监督sky token以及sky head学习)
+                if loss_weights['sky_color_weight'] > 0 and preds.get("pred_sky_colors") is not None and sky_masks is not None:
+                    try:
+                        sky_color_loss_dict = sky_color_loss(
+                            preds["pred_sky_colors"],
+                            vggt_batch["images"],
+                            sky_masks,
+                            weight=1.0
+                        )
+                        sky_color_loss_value = sky_color_loss_dict.get("sky_color_loss", 0.0)
+                        loss += loss_weights['sky_color_weight'] * sky_color_loss_value
+                        loss_dict.update(sky_color_loss_dict)
+                    except Exception as e:
+                        print(f"Error in sky color loss computation: {e}")
+
+                # 6. Velocity Regularization Loss (约束velocity值)
+                if loss_weights['velocity_reg_weight'] > 0 and preds.get("velocity") is not None:
+                    try:
+                        velocity_loss_value = velocity_loss(preds["velocity"])
+                        loss += loss_weights['velocity_reg_weight'] * velocity_loss_value
+                        loss_dict.update({"loss_velocity": velocity_loss_value})
+                    except Exception as e:
+                        print(f"Error in velocity regularization loss computation: {e}")
+
+                # 7. VGGT Distillation Loss (蒸馏损失，监督depth head、camera head等)
+                if loss_weights['vggt_distill_weight'] > 0 and teacher_preds is not None and student_preds_original is not None:
+                    try:
+                        # 构建原始student预测字典用于蒸馏损失计算
+                        student_preds_for_distill = preds.copy()
+                        # 使用原始student预测值进行蒸馏
+                        if student_preds_original['depth'] is not None:
+                            student_preds_for_distill['depth'] = student_preds_original['depth']
+                        if student_preds_original['pose_enc'] is not None:
+                            student_preds_for_distill['pose_enc'] = student_preds_original['pose_enc']
+                        if student_preds_original['depth_conf'] is not None:
+                            student_preds_for_distill['depth_conf'] = student_preds_original['depth_conf']
+
+                        distill_loss_dict = vggt_distillation_loss(
+                            student_preds=student_preds_for_distill,
+                            teacher_preds=teacher_preds
+                        )
+                        distill_loss_value = distill_loss_dict.get("loss_distillation", 0.0)
+                        loss += loss_weights['vggt_distill_weight'] * distill_loss_value
+                        loss_dict.update(distill_loss_dict)
+                    except Exception as e:
+                        print(f"Error in VGGT distillation loss computation: {e}")
+
 
             
                 lr = optimizer.param_groups[0]["lr"]
@@ -750,10 +775,14 @@ def train(args):
                             continue
                         log_writer.add_scalar("train_" + name, val, step)
 
-                # 在线第二阶段训练（仅在主进程中进行）
+                # =============== STAGE 2 TRAINING LOGIC ===============
+                # 第二阶段：仅包含渲染损失，用于动态对象精细化
                 stage2_loss = None
                 stage2_loss_dict = {}
-                if online_stage2_trainer is not None:
+
+                if (online_stage2_trainer is not None and
+                    getattr(args, 'enable_stage2', False) and
+                    epoch >= getattr(args, 'stage2_start_epoch', 10)):
                     try:
                         stage2_loss, stage2_loss_dict = online_stage2_trainer.process_stage1_outputs(
                             preds=preds,
@@ -762,52 +791,105 @@ def train(args):
                             epoch=epoch,
                             iteration=data_iter_step
                         )
-                        
+
                         if stage2_loss is not None:
-                            # 将第二阶段损失添加到总损失中（使用较小的权重）
+                            # 第二阶段只包含渲染损失，权重配置
                             stage2_weight = getattr(args, 'stage2_loss_weight', 0.1)
-                            loss += stage2_weight * stage2_loss
-                            
-                            # 更新损失字典，用于tensorboard记录
+
+                            # 注意：第二阶段的损失不加入第一阶段的总损失中
+                            # 因为第二阶段有独立的参数和优化器
+
+                            # 记录第二阶段损失用于监控
                             stage2_loss_dict_for_log = {}
                             for k, v in stage2_loss_dict.items():
-                                prefixed_key = f"stage2_{k}"
-                                loss_dict[prefixed_key] = v
-                                stage2_loss_dict_for_log[prefixed_key] = v
-                            
-                            # 将Stage2损失添加到metric_logger中，使其出现在croco.utils.misc格式的日志中
+                                if k.startswith('render'):  # 确保只包含渲染相关损失
+                                    prefixed_key = f"stage2_{k}"
+                                    stage2_loss_dict_for_log[prefixed_key] = v
+
+                            # 记录到metric_logger和tensorboard
                             metric_logger.update(**stage2_loss_dict_for_log)
-                            
-                            # 将Stage2损失记录到tensorboard中
+
                             if log_writer is not None:
                                 step = epoch * len(data_loader_train) + data_iter_step
+                                log_writer.add_scalar("stage2_total_loss", float(stage2_loss), step)
                                 for name, val in stage2_loss_dict_for_log.items():
-                                    if isinstance(val, torch.Tensor):
-                                        if val.ndim > 0:
-                                            continue
-                                    if isinstance(val, dict):
-                                        continue
-                                    log_writer.add_scalar("train_" + name, val, step)
-                            
-                    
+                                    if isinstance(val, torch.Tensor) and val.ndim == 0:
+                                        log_writer.add_scalar("train_" + name, val, step)
+
+
                     except Exception as e:
                         printer.warning(f"Stage2 training failed at epoch {epoch}, iter {data_iter_step}: {e}")
 
-                # 两阶段处理完成后，统一进行梯度回传
+                # =============== 梯度更新逻辑 ===============
                 loss_value = float(loss)
-                
-                # 只对第二阶段的refine模型进行梯度回传
-                if online_stage2_trainer is not None and online_stage2_trainer.enable_stage2:
-                    stage2_params = online_stage2_trainer.get_stage2_parameters()
-                    if stage2_params:
-                        loss_scaler(
-                            loss,
-                            optimizer,
-                            parameters=stage2_params,  # 只使用第二阶段refine模型参数
-                            update_grad=True,
-                            clip_grad=1.0,
-                        )
-                        optimizer.zero_grad()
+
+                # 获取当前训练阶段配置
+                training_stage = getattr(args, 'training_stage', 'stage1')  # 默认第一阶段
+
+                if training_stage == 'stage1':
+                    # ============ 第一阶段训练 ============
+                    # 只更新第一阶段的参数（VGGT主模型）
+                    loss_scaler(
+                        loss,
+                        optimizer,
+                        parameters=model.parameters(),  # 第一阶段使用完整模型参数
+                        update_grad=True,
+                        clip_grad=1.0,
+                    )
+                    optimizer.zero_grad()
+
+                elif training_stage == 'stage2':
+                    # ============ 第二阶段训练 ============
+                    # 只更新第二阶段的参数（refine模型），不更新第一阶段参数
+                    if (stage2_loss is not None and
+                        online_stage2_trainer is not None and
+                        online_stage2_trainer.enable_stage2):
+                        stage2_params = online_stage2_trainer.get_stage2_parameters()
+                        if stage2_params:
+                            # 第二阶段使用独立的损失和参数
+                            loss_scaler(
+                                stage2_loss,
+                                optimizer,
+                                parameters=stage2_params,  # 只更新第二阶段refine模型参数
+                                update_grad=True,
+                                clip_grad=1.0,
+                            )
+                            optimizer.zero_grad()
+                        else:
+                            print("Warning: Stage2 enabled but no parameters found for update")
+                    else:
+                        print("Warning: Stage2 training requested but stage2_loss is None")
+
+                elif training_stage == 'joint':
+                    # ============ 联合训练模式 ============
+                    # 同时更新第一阶段和第二阶段参数（如果第二阶段启用）
+                    # 第一阶段参数更新
+                    loss_scaler(
+                        loss,
+                        optimizer,
+                        parameters=model.parameters(),
+                        update_grad=True,
+                        clip_grad=1.0,
+                    )
+                    optimizer.zero_grad()
+
+                    # 第二阶段参数更新（如果启用）
+                    if (stage2_loss is not None and
+                        online_stage2_trainer is not None and
+                        online_stage2_trainer.enable_stage2):
+                        stage2_params = online_stage2_trainer.get_stage2_parameters()
+                        if stage2_params:
+                            loss_scaler(
+                                stage2_loss,
+                                optimizer,
+                                parameters=stage2_params,
+                                update_grad=True,
+                                clip_grad=1.0,
+                            )
+                            optimizer.zero_grad()
+                else:
+                    raise ValueError(f"Unknown training_stage: {training_stage}. Must be 'stage1', 'stage2', or 'joint'")
+
 
                 # 更新最终的损失记录
                 metric_logger.meters["loss"].update(loss_value)

@@ -374,7 +374,7 @@ def warp_gaussian(flow, mask, gaussian_means, gaussian_vel, T, H, W, direction="
         raise ValueError("direction must be forward or backward")
 
     # # for debug : mask全为True
-    # mask = torch.ones_like(mask)
+    mask = torch.ones_like(mask)
 
     inds = torch.nonzero(mask, as_tuple=True)
     init_pos_b, init_pos_t, _, init_pos_h, init_pos_w = inds
