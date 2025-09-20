@@ -552,19 +552,19 @@ def sam2_velocity_consistency_loss_impl(images, velocity, sam2_model, device):
     }
 
 
-def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic, gt_rgb):
+def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic, gt_rgb, pred_sky_colors=None, sky_masks=None):
     """
-    自渲染损失函数：每一帧自己进行渲染与监督，不使用任何mask
+    自渲染损失函数：每一帧自己进行渲染与监督，支持天空区域的mask替代
 
     Args:
         depth: [B, S, H, W] 深度图
         gaussian_params: [B, S, H*W, 14] 高斯参数
-        velocity: [B, S, H, W, 3] 速度场
         pose_enc: [B, S, 7] 姿态编码
         extrinsic: [B, S, 4, 4] 外参矩阵
         intrinsic: [B, S, 3, 3] 内参矩阵
         gt_rgb: [B, S, 3, H, W] 真实RGB图像
-        gt_depth: [B, S, H, W] 真实深度图
+        pred_sky_colors: [B, S, H, W, 3] 预测的天空颜色 (可选)
+        sky_masks: [B, S, H, W] 天空mask，1表示天空区域 (可选)
 
     Returns:
         dict: 损失字典
@@ -623,16 +623,55 @@ def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic,
             # 使用当前帧的3D点进行渲染（不使用velocity，因为是自己渲染自己）
             mean_current = xyz[i]  # 不使用velocity，直接使用当前帧的3D点
 
-            # 渲染当前帧
-            render_color, _, _ = rasterization(
-                mean_current, rotations[i], scale[i], opacity[i], color[i],
-                viewmat[i], K[i], image_width, image_height,
-                sh_degree=0, render_mode="RGB+ED",
-                radius_clip=0, near_plane=0.0001,
-                far_plane=1000.0,
-                eps2d=0.3,
-            )
-            render_colors.append(render_color[0])
+            # 如果有天空mask，需要过滤掉天空区域的gaussian点
+            if sky_masks is not None:
+                # 将sky_masks转换为与gaussian点相同的格式 [H*W]
+                current_sky_mask = sky_masks[0, i].flatten()  # [H*W]
+                # 保留非天空区域的gaussian点（sky_mask为0的地方）
+                non_sky_mask = ~current_sky_mask.bool()
+
+                if non_sky_mask.sum() > 0:
+                    # 只渲染非天空区域的gaussian点
+                    render_color, _, _ = rasterization(
+                        mean_current[non_sky_mask], rotations[i][non_sky_mask],
+                        scale[i][non_sky_mask], opacity[i][non_sky_mask], color[i][non_sky_mask],
+                        viewmat[i], K[i], image_width, image_height,
+                        sh_degree=0, render_mode="RGB+ED",
+                        radius_clip=0, near_plane=0.0001,
+                        far_plane=1000.0,
+                        eps2d=0.3,
+                    )
+                else:
+                    # 如果全是天空，创建空的渲染结果
+                    render_color = torch.zeros((image_height, image_width, 4),
+                                             device=mean_current.device, dtype=mean_current.dtype)
+            else:
+                # 没有天空mask，正常渲染所有点
+                render_color, _, _ = rasterization(
+                    mean_current, rotations[i], scale[i], opacity[i], color[i],
+                    viewmat[i], K[i], image_width, image_height,
+                    sh_degree=0, render_mode="RGB+ED",
+                    radius_clip=0, near_plane=0.0001,
+                    far_plane=1000.0,
+                    eps2d=0.3,
+                )
+
+            # 如果有天空颜色预测和天空mask，用天空颜色替换天空区域
+            if pred_sky_colors is not None and sky_masks is not None:
+                # 将预测的天空颜色应用到天空区域
+                current_sky_mask_2d = sky_masks[0, i]  # [H, W]
+                sky_colors_frame = pred_sky_colors[0, i]  # [H, W, 3]
+
+                # 将渲染结果reshape为[H, W, 4]
+                render_color_2d = render_color.reshape(image_height, image_width, 4)
+
+                # 在天空区域用预测的天空颜色替换RGB部分
+                render_color_2d[current_sky_mask_2d.bool(), :3] = sky_colors_frame[current_sky_mask_2d.bool()]
+
+                # 重新reshape回原格式
+                render_color = render_color_2d.reshape(-1, 4)
+
+            render_colors.append(render_color)
             gt_colors.append(gt_rgb[0, i])
             gt_depths.append(depth[i].squeeze(-1))
 
@@ -652,8 +691,19 @@ def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic,
         pred_rgb = torch.clamp(pred_rgb, min=0, max=1)
         pred_depth = render_colors[..., -1]  # [S, H, W]
 
-        # 计算损失（不使用mask，直接计算全图损失）
-        depth_loss = F.l1_loss(pred_depth, gt_depths)
+        # 计算损失
+        # 对于depth loss，如果有天空mask，需要排除天空区域
+        if sky_masks is not None:
+            # 创建非天空区域的mask
+            non_sky_mask = ~sky_masks[0].bool()  # [S, H, W]
+            # 只在非天空区域计算depth loss
+            if non_sky_mask.sum() > 0:
+                depth_loss = F.l1_loss(pred_depth[non_sky_mask], gt_depths[non_sky_mask])
+            else:
+                depth_loss = torch.tensor(0.0, device=gt_rgb.device, requires_grad=True)
+        else:
+            # 没有天空mask，计算全图depth loss
+            depth_loss = F.l1_loss(pred_depth, gt_depths)
         depth_loss = check_and_fix_inf_nan(depth_loss, "self_depth_loss")
 
         rgb_loss = F.l1_loss(pred_rgb, gt_colors)
@@ -748,6 +798,8 @@ def sky_color_loss(pred_sky_colors, gt_images, sky_masks, weight=1.0):
     return {
         "sky_color_loss": total_loss * weight
     }
+
+
 
 
 def check_and_fix_inf_nan(loss_tensor, loss_name, hard_max=100):

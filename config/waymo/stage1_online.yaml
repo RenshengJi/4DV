@@ -67,7 +67,7 @@ use_preprocessed_sam: false                 # false=在线推理SAM2, true=使�
 sky_opacity_weight: 0.2                    # 天空区域opacity约束
 
 # 5. Sky Color Loss (监督sky token以及sky head学习)
-sky_color_weight: 0.1                      # 天空颜色预测监督
+sky_color_weight: 0.0                      # 天空颜色预测监督 (已融合到self_render_loss中)
 
 # 6. Velocity Regularization Loss (约束velocity值)
 velocity_reg_weight: 0.001                 # 速度正则化约束
