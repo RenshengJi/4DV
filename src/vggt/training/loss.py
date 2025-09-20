@@ -656,21 +656,6 @@ def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic,
                     eps2d=0.3,
                 )
 
-            # 如果有天空颜色预测和天空mask，用天空颜色替换天空区域
-            if pred_sky_colors is not None and sky_masks is not None:
-                # 将预测的天空颜色应用到天空区域
-                current_sky_mask_2d = sky_masks[0, i]  # [H, W]
-                sky_colors_frame = pred_sky_colors[0, i]  # [H, W, 3]
-
-                # 将渲染结果reshape为[H, W, 4]
-                render_color_2d = render_color.reshape(image_height, image_width, 4)
-
-                # 在天空区域用预测的天空颜色替换RGB部分
-                render_color_2d[current_sky_mask_2d.bool(), :3] = sky_colors_frame[current_sky_mask_2d.bool()]
-
-                # 重新reshape回原格式
-                render_color = render_color_2d.reshape(-1, 4)
-
             render_colors.append(render_color)
             gt_colors.append(gt_rgb[0, i])
             gt_depths.append(depth[i].squeeze(-1))
@@ -683,12 +668,26 @@ def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic,
             }, {}
 
         # 堆叠结果
-        render_colors = torch.stack(render_colors, dim=0)
+        render_colors = torch.stack(render_colors, dim=0).squeeze(1)
         gt_colors = torch.stack(gt_colors, dim=0)  # [S, 3, H, W]
         gt_depths = torch.stack(gt_depths, dim=0)  # [S, H, W]
 
         pred_rgb = render_colors[..., :3].permute(0, 3, 1, 2)   # [S, 3, H, W]
         pred_rgb = torch.clamp(pred_rgb, min=0, max=1)
+
+        # 如果有天空颜色预测和天空mask，用天空颜色替换天空区域
+        if pred_sky_colors is not None and sky_masks is not None:
+            for i in range(S):
+                current_sky_mask_2d = sky_masks[0, i]  # [H, W]
+                sky_colors_frame = pred_sky_colors[0, i]  # [H, W, 3]
+
+                # 确保维度匹配
+                sky_mask_bool = current_sky_mask_2d.bool()  # [H, W]
+                if sky_mask_bool.any():
+                    # 将天空颜色从[H, W, 3]转换为[3, H, W]然后替换
+                    sky_colors_chw = sky_colors_frame.permute(2, 0, 1)  # [3, H, W]
+                    pred_rgb[i, :, sky_mask_bool] = sky_colors_chw[:, sky_mask_bool]
+
         pred_depth = render_colors[..., -1]  # [S, H, W]
 
         # 计算损失

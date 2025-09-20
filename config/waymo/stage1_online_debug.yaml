@@ -1,7 +1,7 @@
 # Stage 1 Online Training Configuration for VGGT
 # 第一阶段在线训练配置 - 包含统一的损失权重管理
 
-# debug: True
+debug: True
 
 # =============== 模型配置 ===============
 model: "VGGT(img_size=518, patch_size=14, embed_dim=1024)"
@@ -55,7 +55,10 @@ training_stage: 'stage1'
 # 权重为0则完全不计算该损失
 
 # 1. Self Render Loss (训练gaussian head)
-self_render_weight: 1.0                    # Gaussian参数学习的主要损失
+self_render_weight: 1.0                    # Gaussian参数学习的主要损失 (已弃用，使用下面的分项权重)
+self_render_rgb_weight: 1.0                # RGB损失权重
+self_render_lpips_weight: 0.1              # LPIPS感知损失权重
+self_render_depth_weight: 1.0              # 深度损失权重
 
 # 2. Flow Loss (训练velocity head)
 flow_loss_weight: 0.5                      # 光流监督velocity学习
@@ -72,10 +75,10 @@ sky_opacity_weight: 0.2                    # 天空区域opacity约束
 sky_color_weight: 0.0                      # 天空颜色预测监督 (已融合到self_render_loss中)
 
 # 6. Velocity Regularization Loss (约束velocity值)
-velocity_reg_weight: 0.001                 # 速度正则化约束
+velocity_reg_weight: 0.01                 # 速度正则化约束
 
 # 7. VGGT Distillation Loss (蒸馏损失，监督depth head、camera head等)
-vggt_distill_weight: 0.5                   # VGGT teacher蒸馏监督，防止unfreeze backbone时输出漂移
+vggt_distill_weight: 10.0                   # VGGT teacher蒸馏监督，防止unfreeze backbone时输出漂移
 
 # =============== 数据集配置 ===============
 

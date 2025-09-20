@@ -262,8 +262,6 @@ def train(args):
     if args.pretrained and not args.resume:
         printer.info(f"Loading pretrained: {args.pretrained}")
         ckpt = torch.load(args.pretrained, map_location=device, weights_only=True)
-        # ckpt = torch.load(args.pretrained, map_location=device)['model']
-        # ckpt = {k.replace("module.", ""): v for k, v in ckpt.items()}
         model.load_state_dict(ckpt, strict=False)
         del ckpt
         
@@ -640,11 +638,30 @@ def train(args):
                             preds["pose_enc"],
                             vggt_batch["extrinsics"],
                             vggt_batch["intrinsics"],
-                            vggt_batch["images"]
+                            vggt_batch["images"],
+                            pred_sky_colors=preds.get("pred_sky_colors"),
+                            sky_masks=vggt_batch.get("sky_masks")
                         )
-                        self_render_loss = self_loss_dict.get("loss_self_render_rgb", 0.0)
-                        loss += loss_weights['self_render_weight'] * self_render_loss
-                        loss_dict.update({k: v for k, v in self_loss_dict.items() if not k.startswith("loss_self_render_lpips")})
+                        # 将所有self_render损失加入到总loss中
+                        self_render_rgb_loss = self_loss_dict.get("loss_self_render_rgb", 0.0)
+                        self_render_lpips_loss = self_loss_dict.get("loss_self_render_lpips", 0.0)
+                        self_render_depth_loss = self_loss_dict.get("loss_self_render_depth", 0.0)
+
+                        # 使用分别的权重加入总loss
+                        if loss_weights.get('self_render_rgb_weight') is not None:
+                            # 使用新的分项权重
+                            loss += (loss_weights.get('self_render_rgb_weight', 0.0) * self_render_rgb_loss +
+                                   loss_weights.get('self_render_lpips_weight', 0.0) * self_render_lpips_loss +
+                                   loss_weights.get('self_render_depth_weight', 0.0) * self_render_depth_loss)
+                        else:
+                            # 向后兼容：使用旧的总权重
+                            total_self_render_loss = (self_render_rgb_loss +
+                                                    self_render_lpips_loss +
+                                                    self_render_depth_loss)
+                            loss += loss_weights.get('self_render_weight', 0.0) * total_self_render_loss
+
+                        # 将所有损失记录到loss_dict中
+                        loss_dict.update(self_loss_dict)
                     except Exception as e:
                         print(f"Error in self render loss computation: {e}")
 
