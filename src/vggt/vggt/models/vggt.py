@@ -49,9 +49,16 @@ def freeze_all_params(modules):
 
 
 class VGGT(nn.Module, PyTorchModelHubMixin):
-    def __init__(self, img_size=518, patch_size=14, embed_dim=1024, use_sky_token=True):
+    def __init__(self, img_size=518, patch_size=14, embed_dim=1024, use_sky_token=True, memory_efficient=True):
         super().__init__()
-        self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim, use_sky_token=use_sky_token)
+        self.aggregator = Aggregator(
+            img_size=img_size,
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+            use_sky_token=use_sky_token,
+            memory_efficient=memory_efficient,
+            output_layers=[4, 11, 17, 23] if memory_efficient else None
+        )
         self.camera_head = CameraHead(dim_in=2 * embed_dim)
         self.point_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log", conf_activation="expp1")
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1")

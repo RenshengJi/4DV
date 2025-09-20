@@ -68,6 +68,8 @@ class Aggregator(nn.Module):
         rope_freq=100,
         init_values=0.01,
         use_sky_token=True,
+        memory_efficient=True,  # Enable memory efficient mode
+        output_layers=None,  # Specific layers to output (0-indexed)
     ):
         super().__init__()
 
@@ -115,6 +117,24 @@ class Aggregator(nn.Module):
         self.aa_order = aa_order
         self.patch_size = patch_size
         self.aa_block_size = aa_block_size
+        self.memory_efficient = memory_efficient
+
+        # Set default output layers if not specified
+        # Based on the comment: layers 4, 11, 17, and 23 are required
+        # Camera head needs the last layer (23), so we always include it
+        if output_layers is None:
+            if memory_efficient:
+                # Always include the last layer for camera head
+                self.output_layers = set([4, 11, 17, 23])
+                # Ensure we include the last layer
+                if depth - 1 not in self.output_layers:
+                    self.output_layers.add(depth - 1)
+            else:
+                self.output_layers = set(range(depth))
+        else:
+            self.output_layers = set(output_layers)
+            # Always ensure the last layer is included for camera head
+            self.output_layers.add(depth - 1)
 
         # Validate that depth is divisible by aa_block_size
         if self.depth % self.aa_block_size != 0:
@@ -245,8 +265,10 @@ class Aggregator(nn.Module):
         frame_idx = 0
         global_idx = 0
         output_list = []
+        current_layer = 0
 
-        for _ in range(self.aa_block_num):
+        # 使用更简单的逻辑：恢复原始结构，但在concatenate时检查是否需要该输出
+        for block_num in range(self.aa_block_num):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
                     tokens, frame_idx, frame_intermediates = self._process_frame_attention(
@@ -259,14 +281,26 @@ class Aggregator(nn.Module):
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
 
-            for i in range(len(frame_intermediates)):
-                # concat frame and global intermediates, [B x S x P x 2C]
-                concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
-                output_list.append(concat_inter)
+            # 只有在需要这一层的输出时才concatenate和保存
+            # 计算当前block对应的layer编号
+            current_layer_index = block_num  # 简化：假设每个block对应一个layer
 
-        del concat_inter
-        del frame_intermediates
-        del global_intermediates
+            if not self.memory_efficient or current_layer_index in self.output_layers:
+                for i in range(len(frame_intermediates)):
+                    # concat frame and global intermediates, [B x S x P x 2C]
+                    concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
+                    output_list.append(concat_inter)
+
+        # Clean up memory
+        if 'concat_inter' in locals():
+            del concat_inter
+        if 'frame_intermediates' in locals():
+            del frame_intermediates
+        if 'global_intermediates' in locals():
+            del global_intermediates
+        if 'layer_outputs' in locals():
+            del layer_outputs
+
         return output_list, self.patch_start_idx
 
     def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
@@ -289,7 +323,7 @@ class Aggregator(nn.Module):
                 tokens = checkpoint(block_to_run, tokens, pos, use_reentrant=self.use_reentrant)
             else:
                 tokens = block_to_run(tokens, pos=pos)
-            frame_idx += 1  
+            frame_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, frame_idx, intermediates
