@@ -135,10 +135,18 @@ def load_stage1_model(model_path, device):
     return model
 
 
-def generate_self_render_images(model_preds, vggt_batch, device):
+def generate_self_render_images(model_preds, vggt_batch, device, sky_color_images=None, opacity_threshold=0.05):
     """
     生成self_render图像
     使用模型预测的gaussian参数进行渲染，基于训练代码中的实现
+    在渲染前mask掉opacity小于阈值的gaussian，并在mask区域用sky_color替代
+
+    Args:
+        model_preds: 模型预测结果
+        vggt_batch: VGGT批次数据
+        device: 设备
+        sky_color_images: 天空颜色图像 [S, 3, H, W]，如果为None则生成
+        opacity_threshold: opacity阈值，小于此值的gaussian将被mask掉
     """
     try:
         from vggt.utils.pose_enc import pose_encoding_to_extri_intri
@@ -193,6 +201,14 @@ def generate_self_render_images(model_preds, vggt_batch, device):
 
         opacity = gaussian_params[..., 13:14].sigmoid().squeeze(-1) if gaussian_params.shape[-1] > 13 else torch.ones(S, H*W, device=device) * 0.5  # [S, H*W]
 
+        # 创建opacity mask - mask掉opacity小于阈值的gaussian
+        opacity_mask = opacity >= opacity_threshold  # [S, H*W]
+        print(f"Opacity statistics - min: {opacity.min():.4f}, max: {opacity.max():.4f}, mean: {opacity.mean():.4f}")
+        print(f"Gaussians above threshold {opacity_threshold}: {opacity_mask.sum().item()}/{opacity.numel()} ({opacity_mask.float().mean()*100:.1f}%)")
+
+        # 应用opacity mask - 将低于阈值的opacity设为0
+        opacity_masked = opacity * opacity_mask.float()
+
         # 准备相机参数用于渲染 - 完全按照loss.py的方式
         # extrinsics: [1, S, 4, 4], intrinsics: [1, S, 3, 3]
         viewmat = extrinsics.permute(1, 0, 2, 3)  # [S, 1, 4, 4]
@@ -211,12 +227,12 @@ def generate_self_render_images(model_preds, vggt_batch, device):
                 print(f"  scale: {scale[i].shape}, opacity: {opacity[i].shape}, color: {color[i].shape}")
                 print(f"  viewmat: {viewmat[i].shape}, K: {K[i].shape}")
 
-                # 完全按照loss.py的方式使用gsplat进行渲染
+                # 完全按照loss.py的方式使用gsplat进行渲染，使用masked opacity
                 render_color, _, _ = rasterization(
                     xyz[i],  # mean positions [H*W, 3]
                     rotation[i],  # rotations [H*W, 4]
                     scale[i],  # scales [H*W, 3]
-                    opacity[i],  # opacities [H*W]
+                    opacity_masked[i],  # 使用masked后的opacities [H*W]
                     color[i],  # colors [H*W, 1, 3]
                     viewmat[i],  # view matrix [1, 4, 4]
                     K[i],  # camera intrinsics [1, 3, 3]
@@ -234,6 +250,19 @@ def generate_self_render_images(model_preds, vggt_batch, device):
                 render_rgb = render_color[0][..., :3]  # [H, W, 3] - 提取RGB
                 render_rgb = render_rgb.permute(2, 0, 1)  # [3, H, W] - 转换为CHW格式
                 render_rgb = torch.clamp(render_rgb, min=0, max=1)  # 限制在[0,1]范围
+
+                # 创建mask区域并用sky_color替代
+                if sky_color_images is not None and i < sky_color_images.shape[0]:
+                    # 将opacity_mask转换为图像mask [H, W]
+                    opacity_image_mask = opacity_mask[i].view(H, W).float()  # [H, W] - 转换为float
+                    # 扩展到3个通道 [3, H, W]
+                    opacity_image_mask = opacity_image_mask.unsqueeze(0).repeat(3, 1, 1)
+
+                    # 在opacity小于阈值的区域使用sky_color
+                    sky_color_frame = sky_color_images[i]  # [3, H, W]
+                    render_rgb = render_rgb * opacity_image_mask + sky_color_frame * (1 - opacity_image_mask)
+
+                    print(f"Frame {i}: Applied sky color masking")
 
                 rendered_images.append(render_rgb)
                 print(f"Frame {i}: Rendering successful, RGB shape: {render_rgb.shape}")
@@ -619,20 +648,20 @@ def run_stage1_inference(dataset, stage1_model, device, args):
     print("Generating GT images...")
     gt_images = vggt_batch["images"][0]  # [S, 3, H, W]
 
+    print("Generating sky color images...")
+    start_time = time.time()
+    sky_color_images = generate_sky_color_images(stage1_preds, vggt_batch, device, stage1_model)
+    print(f"Sky color generation completed in {time.time() - start_time:.2f} seconds")
+
     print("Generating self-render images...")
     start_time = time.time()
-    self_render_images = generate_self_render_images(stage1_preds, vggt_batch, device)
+    self_render_images = generate_self_render_images(stage1_preds, vggt_batch, device, sky_color_images)
     print(f"Self-render generation completed in {time.time() - start_time:.2f} seconds")
 
     print("Generating velocity map...")
     start_time = time.time()
     velocity_map = generate_velocity_map(stage1_preds, vggt_batch, device)
     print(f"Velocity map generation completed in {time.time() - start_time:.2f} seconds")
-
-    print("Generating sky color images...")
-    start_time = time.time()
-    sky_color_images = generate_sky_color_images(stage1_preds, vggt_batch, device, stage1_model)
-    print(f"Sky color generation completed in {time.time() - start_time:.2f} seconds")
 
     return {
         'gt_images': gt_images,

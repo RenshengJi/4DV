@@ -147,10 +147,9 @@ class Aggregator(nn.Module):
         self.camera_token = nn.Parameter(torch.randn(1, 2, 1, embed_dim))
         self.register_token = nn.Parameter(torch.randn(1, 2, num_register_tokens, embed_dim))
 
-        # Sky token support
+        # Sky token support (managed externally by VGGT main model)
         self.use_sky_token = use_sky_token
         if self.use_sky_token:
-            self.sky_token = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
             # The patch tokens start after the sky token, the camera and register tokens
             self.patch_start_idx = 1 + 1 + num_register_tokens
         else:
@@ -207,11 +206,13 @@ class Aggregator(nn.Module):
             if hasattr(self.patch_embed, "mask_token"):
                 self.patch_embed.mask_token.requires_grad_(False)
 
-    def forward(self, images: torch.Tensor) -> Tuple[List[torch.Tensor], int]:
+    def forward(self, images: torch.Tensor, sky_token: torch.Tensor = None) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
             images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
                 B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
+            sky_token (torch.Tensor, optional): Sky token with shape [1, 1, embed_dim].
+                Required if use_sky_token=True.
 
         Returns:
             (list[torch.Tensor], int):
@@ -241,9 +242,11 @@ class Aggregator(nn.Module):
 
         # Add sky token if enabled
         if self.use_sky_token:
-            sky_token = self.sky_token.repeat(B * S, 1, 1)
+            if sky_token is None:
+                raise ValueError("sky_token must be provided when use_sky_token=True")
+            sky_token_expanded = sky_token.repeat(B * S, 1, 1)
             # Concatenate special tokens with patch tokens
-            tokens = torch.cat([sky_token, camera_token, register_token, patch_tokens], dim=1)
+            tokens = torch.cat([sky_token_expanded, camera_token, register_token, patch_tokens], dim=1)
         else:
             # Concatenate special tokens with patch tokens
             tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)

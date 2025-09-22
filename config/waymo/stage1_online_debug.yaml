@@ -1,7 +1,7 @@
 # Stage 1 Online Training Configuration for VGGT
 # 第一阶段在线训练配置 - 包含统一的损失权重管理
 
-debug: True
+# debug: True
 
 # =============== 模型配置 ===============
 model: "VGGT(img_size=518, patch_size=14, embed_dim=1024)"
@@ -9,9 +9,9 @@ pretrained: model.pt
 
 # VGGT冻结策略配置
 # 可选值: "none", "encoder", "encoder_frame", "backbone", "backbone_camera", "backbone_pts",
-#        "vggt", "vggt_wo_velocity", "vggt_wo_depth", "vggt_wo_gaussian_and_velocity", "all"
+#        "vggt", "vggt_wo_velocity", "vggt_wo_depth", "vggt_wo_gaussian_and_velocity", "all", "old"
 # null表示不设置冻结策略（保持模型默认行为）
-vggt_freeze_strategy: null
+vggt_freeze_strategy: "old"
 
 
 # =============== 辅助模型配置 ===============
@@ -30,7 +30,7 @@ auxiliary_models:
   dam2: DepthAnythingV2(encoder="vitb", offload=${offload_auxiliary})
 
   # VGGT teacher模型 (用于渲染损失)
-  vggt_teacher: VGGT(path="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/model.pt", offload=${offload_auxiliary})
+  # vggt_teacher: VGGT(path="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/model.pt", offload=${offload_auxiliary})
 
 offload_auxiliary: False
 
@@ -75,10 +75,10 @@ sky_opacity_weight: 0.2                    # 天空区域opacity约束
 sky_color_weight: 0.0                      # 天空颜色预测监督 (已融合到self_render_loss中)
 
 # 6. Velocity Regularization Loss (约束velocity值)
-velocity_reg_weight: 0.01                 # 速度正则化约束
+velocity_reg_weight: 0.01               # 速度正则化约束
 
 # 7. VGGT Distillation Loss (蒸馏损失，监督depth head、camera head等)
-vggt_distill_weight: 10.0                   # VGGT teacher蒸馏监督，防止unfreeze backbone时输出漂移
+vggt_distill_weight: 0.0                   # VGGT teacher蒸馏监督，防止unfreeze backbone时输出漂移
 
 # =============== 数据集配置 ===============
 

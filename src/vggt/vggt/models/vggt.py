@@ -66,9 +66,11 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         self.velocity_head = DPTGSHead(dim_in=2 * embed_dim, output_dim=4, activation="linear", conf_activation="expp1")
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size)
         
-        # Sky token support
+        # Sky token support - now managed at VGGT level
         self.use_sky_token = use_sky_token
         if self.use_sky_token:
+            # Sky token moved from aggregator to main model for better parameter control
+            self.sky_token = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
             self.plucker_embedder = PluckerEmbedder(img_size=img_size)
             self.sky_head = ModulatedLinearLayer(
                 3,  # input channels (ray directions)
@@ -142,6 +144,13 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 self.depth_head,
                 self.velocity_head,
             ],
+            "old": [
+                self.aggregator,
+                self.camera_head,
+                self.point_head,
+                self.depth_head,
+                self.track_head,
+            ],
         }
         if hasattr(self, "track_head"):
             to_be_frozen["vggt"].append(self.track_head)
@@ -196,7 +205,11 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         if query_points is not None and len(query_points.shape) == 2:
             query_points = query_points.unsqueeze(0)
 
-        aggregated_tokens_list, patch_start_idx = self.aggregator(images)
+        # Pass sky_token to aggregator if enabled
+        if self.use_sky_token:
+            aggregated_tokens_list, patch_start_idx = self.aggregator(images, sky_token=self.sky_token)
+        else:
+            aggregated_tokens_list, patch_start_idx = self.aggregator(images)
 
         predictions = {}
 

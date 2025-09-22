@@ -7,7 +7,7 @@ pretrained: model.pt
 
 # VGGT冻结策略配置
 # 可选值: "none", "encoder", "encoder_frame", "backbone", "backbone_camera", "backbone_pts",
-#        "vggt", "vggt_wo_velocity", "vggt_wo_depth", "vggt_wo_gaussian_and_velocity", "all"
+#        "vggt", "vggt_wo_velocity", "vggt_wo_depth", "vggt_wo_gaussian_and_velocity", "all", "old"
 # null表示不设置冻结策略（保持模型默认行为）
 vggt_freeze_strategy: null
 
@@ -73,10 +73,10 @@ sky_opacity_weight: 0.2                    # 天空区域opacity约束
 sky_color_weight: 0.0                      # 天空颜色预测监督 (已融合到self_render_loss中)
 
 # 6. Velocity Regularization Loss (约束velocity值)
-velocity_reg_weight: 0.001                 # 速度正则化约束
+velocity_reg_weight: 0.05                 # 速度正则化约束
 
 # 7. VGGT Distillation Loss (蒸馏损失，监督depth head、camera head等)
-vggt_distill_weight: 0.5                   # VGGT teacher蒸馏监督，防止unfreeze backbone时输出漂移
+vggt_distill_weight: 0.0                  # VGGT teacher蒸馏监督，防止unfreeze backbone时输出漂移
 
 # =============== 数据集配置 ===============
 
@@ -125,7 +125,7 @@ num_imgs_vis: 4
 
 # =============== 输出配置 ===============
 save_dir: 'checkpoints/waymo_stage1_online'
-exp_name: 'stage1_online'
+exp_name: 'stage1_online_unfreeze+newsky+highvelocity+flownosky'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/

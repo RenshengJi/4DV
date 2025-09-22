@@ -295,7 +295,7 @@ def cross_render_and_loss(conf, interval, forward_consist_mask, backward_consist
         return gaussian_loss_dict, img_dict
 
 
-def flow_loss(conf, interval, forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, depth, velocity, pose_enc, extrinsic, intrinsic, gt_rgb):
+def flow_loss(conf, interval, forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, depth, velocity, pose_enc, extrinsic, intrinsic, gt_rgb, sky_masks=None):
     # gaussian_params: [N, 10]
     # extrinsic, intrinsic: 当前帧相机参数
     # gt_depth, gt_rgb: ground truth
@@ -331,10 +331,20 @@ def flow_loss(conf, interval, forward_flow, backward_flow, forward_consist_mask,
         gaussian_bwd_vel = - \
             velocity.reshape(B, S, H, W, 3).permute(0, 1, 4, 2, 3).contiguous()
 
+        # create combined masks (exclude sky regions)
+        if sky_masks is not None:
+            # sky_masks should have shape [B, S, H, W], take inverse to exclude sky
+            non_sky_mask = ~sky_masks[:, :, None, :, :]  # [B, S, 1, H, W]
+            forward_mask = forward_consist_mask & conf[:, :, None, :, :] & non_sky_mask
+            backward_mask = backward_consist_mask & conf[:, :, None, :, :] & non_sky_mask
+        else:
+            forward_mask = forward_consist_mask & conf[:, :, None, :, :]
+            backward_mask = backward_consist_mask & conf[:, :, None, :, :]
+
         # forward loss
         warped_means, target_means = warp_gaussian(
             forward_flow,
-            forward_consist_mask & conf[:, :, None, :, :],
+            forward_mask,
             gaussian_means,
             gaussian_fwd_vel,
             S, H, W,
@@ -347,7 +357,7 @@ def flow_loss(conf, interval, forward_flow, backward_flow, forward_consist_mask,
         # backward loss
         warped_means, target_means = warp_gaussian(
             backward_flow,
-            backward_consist_mask & conf[:, :, None, :, :],
+            backward_mask,
             gaussian_means,
             gaussian_bwd_vel,
             S, H, W,
@@ -372,9 +382,6 @@ def warp_gaussian(flow, mask, gaussian_means, gaussian_vel, T, H, W, direction="
         mask[:, 0:interval, :, :] = False
     else:
         raise ValueError("direction must be forward or backward")
-
-    # # for debug : mask全为True
-    mask = torch.ones_like(mask)
 
     inds = torch.nonzero(mask, as_tuple=True)
     init_pos_b, init_pos_t, _, init_pos_h, init_pos_w = inds
