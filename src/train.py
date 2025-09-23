@@ -28,7 +28,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'vggt'))
 from vggt.vggt.models.vggt import VGGT
 from vggt.training.loss import camera_loss, depth_loss, point_loss, cross_render_and_loss, flow_loss, self_render_and_loss, velocity_loss, sky_opacity_loss, sky_color_loss, vggt_distillation_loss
 from vggt.utils.auxiliary import RAFTCfg, calc_flow
-from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+from vggt.utils.pose_enc import pose_encoding_to_extri_intri, extri_intri_to_pose_encoding
 
 # ===== 在线第二阶段训练器 =====
 from online_stage2_trainer import OnlineStage2Trainer
@@ -575,7 +575,9 @@ def train(args):
                     'sky_opacity_weight': getattr(args, 'sky_opacity_weight', 1.0),
                     'sky_color_weight': getattr(args, 'sky_color_weight', 1.0),
                     'velocity_reg_weight': getattr(args, 'velocity_reg_weight', 0.001),
-                    'vggt_distill_weight': getattr(args, 'vggt_distill_weight', 1.0)
+                    'vggt_distill_weight': getattr(args, 'vggt_distill_weight', 1.0),
+                    'camera_loss_weight': getattr(args, 'camera_loss_weight', 1.0),
+                    'depth_loss_weight': getattr(args, 'depth_loss_weight', 1.0)
                 }
 
                 # VGGT teacher predictions
@@ -635,7 +637,7 @@ def train(args):
                         self_loss_dict, _ = self_render_and_loss(
                             preds["depth"].detach(),
                             preds["gaussian_params"],
-                            preds["pose_enc"],
+                            preds["pose_enc"].detach(),
                             vggt_batch["extrinsics"],
                             vggt_batch["intrinsics"],
                             vggt_batch["images"],
@@ -673,7 +675,8 @@ def train(args):
                             conf, interval, forward_flow, backward_flow,
                             forward_consist_mask, backward_consist_mask,
                             preds["depth"], preds["velocity"], preds["pose_enc"],
-                            vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"]
+                            vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"],
+                            vggt_batch
                         )
                         flow_loss_value = flow_loss_dict.get("forward_loss", 0.0)
                         loss += loss_weights['flow_loss_weight'] * flow_loss_value
@@ -772,8 +775,35 @@ def train(args):
                     except Exception as e:
                         print(f"Error in VGGT distillation loss computation: {e}")
 
+                # 8. Camera Loss (监督camera head训练)
+                if loss_weights['camera_loss_weight'] > 0 and preds.get("pose_enc") is not None and vggt_batch.get("extrinsics") is not None and vggt_batch.get("intrinsics") is not None:
+                    try:
+                        camera_loss_dict = camera_loss(
+                            [preds["pose_enc"]],
+                            vggt_batch,
+                        )
+                        camera_loss_value = camera_loss_dict.get("loss_camera", 0.0)
+                        loss += loss_weights['camera_loss_weight'] * camera_loss_value
+                        loss_dict.update(camera_loss_dict)
+                    except Exception as e:
+                        print(f"Error in camera loss computation: {e}")
 
-            
+                # 9. Depth Loss (监督depth head训练)
+                if loss_weights['depth_loss_weight'] > 0 and preds.get("depth") is not None and preds.get("depth_conf") is not None and vggt_batch.get("depths") is not None:
+                    try:
+                        depth_loss_dict = depth_loss(
+                            preds["depth"],
+                            preds["depth_conf"],
+                            vggt_batch,
+                        )
+                        depth_loss_value = depth_loss_dict.get("loss_conf_depth", 0.0)
+                        loss += loss_weights['depth_loss_weight'] * depth_loss_value
+                        loss_dict.update(depth_loss_dict)
+                    except Exception as e:
+                        print(f"Error in depth loss computation: {e}")
+
+
+
                 lr = optimizer.param_groups[0]["lr"]
                 metric_logger.update(epoch=epoch)
                 metric_logger.update(lr=lr)
@@ -1661,6 +1691,19 @@ def cut3r_batch_to_vggt(views):
                     torch.linalg.inv(vggt_batch['extrinsics']),
                     vggt_batch['extrinsics'][0]
                 )
+            
+            # 将extrinsics(中的T)以及world_points、depth进行非metric化
+            world_points_flatten = vggt_batch['world_points'].reshape(-1, 3)
+            world_points_mask_flatten = vggt_batch['point_masks'].reshape(-1) if vggt_batch['point_masks'] is not None else torch.ones_like(world_points_flatten[:, 0], dtype=torch.bool)
+            dist_avg = world_points_flatten[world_points_mask_flatten].norm(dim=-1).mean()
+            depth_scale_factor = 1 / dist_avg
+            pose_scale_factor = depth_scale_factor
+
+            # 应用非metric化
+            vggt_batch['depths'] = vggt_batch['depths'] * depth_scale_factor
+            vggt_batch['extrinsics'][:, :, :3, 3] = vggt_batch['extrinsics'][:, :, :3, 3] * pose_scale_factor
+            vggt_batch['world_points'] = vggt_batch['world_points'] * depth_scale_factor
+
 
     vggt_batch['images'] = vggt_batch['images'].permute(1, 0, 2, 3, 4).contiguous()
     vggt_batch['depths'] = vggt_batch['depths'].permute(1, 0, 2, 3).contiguous() if vggt_batch['depths'] is not None else None

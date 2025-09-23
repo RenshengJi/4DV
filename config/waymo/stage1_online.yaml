@@ -27,8 +27,8 @@ auxiliary_models:
   # DAM2模型 (用于生成sky masks)
   dam2: DepthAnythingV2(encoder="vitb", offload=${offload_auxiliary})
 
-  # VGGT teacher模型 (用于渲染损失)
-  vggt_teacher: VGGT(path="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/model.pt", offload=${offload_auxiliary})
+  # # VGGT teacher模型 (用于渲染损失)
+  # vggt_teacher: VGGT(path="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/model.pt", offload=${offload_auxiliary})
 
 offload_auxiliary: False
 
@@ -78,6 +78,12 @@ velocity_reg_weight: 0.05                 # 速度正则化约束
 # 7. VGGT Distillation Loss (蒸馏损失，监督depth head、camera head等)
 vggt_distill_weight: 0.0                  # VGGT teacher蒸馏监督，防止unfreeze backbone时输出漂移
 
+# 8. Camera Loss (监督camera head训练)
+camera_loss_weight: 1.0                   # 相机参数预测损失权重
+
+# 9. Depth Loss (监督depth head训练)
+depth_loss_weight: 1.0                    # 深度预测损失权重
+
 # =============== 数据集配置 ===============
 
 allow_repeat: False
@@ -125,7 +131,7 @@ num_imgs_vis: 4
 
 # =============== 输出配置 ===============
 save_dir: 'checkpoints/waymo_stage1_online'
-exp_name: 'stage1_online_unfreeze+newsky+highvelocity+flownosky'
+exp_name: 'stage1_online_unfreeze+newsky+highvelocity+flownosky+gt+fixedextrinsic+detach'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/

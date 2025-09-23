@@ -295,84 +295,200 @@ def cross_render_and_loss(conf, interval, forward_consist_mask, backward_consist
         return gaussian_loss_dict, img_dict
 
 
-def flow_loss(conf, interval, forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, depth, velocity, pose_enc, extrinsic, intrinsic, gt_rgb, sky_masks=None):
-    # gaussian_params: [N, 10]
-    # extrinsic, intrinsic: 当前帧相机参数
-    # gt_depth, gt_rgb: ground truth
+def flow_loss(conf, interval, forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, depth, velocity, pose_enc, extrinsic, intrinsic, gt_rgb, vggt_batch, sky_masks=None):
+    # 使用GT depth计算GT velocity并与预测velocity比较
+    # vggt_batch: 包含gt depth和point_masks的batch数据
+    # velocity: predicted velocity
 
     with tf32_off():
 
-        extrinsic, intrinsic = pose_encoding_to_extri_intri(
-            pose_enc, gt_rgb.shape[-2:])
-        extrinsic = torch.cat([extrinsic, torch.tensor([0, 0, 0, 1], device=extrinsic.device)[
-                              None, None, None, :].repeat(1, extrinsic.shape[1], 1, 1)], dim=-2)
+        # 使用GT的pose（从vggt_batch获取）而不是预测的pose
+        gt_extrinsic = vggt_batch['extrinsics']  # [B, S, 4, 4] - GT extrinsics
+        gt_intrinsic = vggt_batch['intrinsics']  # [B, S, 3, 3] - GT intrinsics
 
-        # 1. gaussian means
-        depth = depth.view(
-            depth.shape[0]*depth.shape[1], depth.shape[2], depth.shape[3], 1)
-        world_points = depth_to_world_points(depth, intrinsic)
-        world_points = world_points.view(
-            world_points.shape[0], world_points.shape[1]*world_points.shape[2], 3)
+        # 确保GT extrinsics是4x4矩阵格式
+        if gt_extrinsic.shape[-1] == 4 and gt_extrinsic.shape[-2] == 4:
+            extrinsic = gt_extrinsic
+        else:
+            # 如果不是4x4，需要添加最后一行[0,0,0,1]
+            extrinsic = torch.cat([gt_extrinsic, torch.tensor([0, 0, 0, 1], device=gt_extrinsic.device)[
+                                  None, None, None, :].repeat(1, gt_extrinsic.shape[1], 1, 1)], dim=-2)
+
+        intrinsic = gt_intrinsic
+
+        B, S, _, H, W = forward_flow.shape
+
+        # 1. 从vggt_batch获取GT depth和point masks
+        gt_depth = vggt_batch['depths']  # [B, S, H, W]
+        point_masks = vggt_batch['point_masks']  # [B, S, H, W] - sparse depth的valid mask
+
+        # 2. 使用GT depth计算GT的3D points (只在有效区域)
+        gt_depth_reshaped = gt_depth.view(
+            gt_depth.shape[0]*gt_depth.shape[1], gt_depth.shape[2], gt_depth.shape[3], 1)
+        gt_world_points = depth_to_world_points(gt_depth_reshaped, intrinsic)
+        gt_world_points = gt_world_points.view(
+            gt_world_points.shape[0], gt_world_points.shape[1]*gt_world_points.shape[2], 3)
 
         extrinsic_inv = torch.linalg.inv(extrinsic)
-        xyz = torch.matmul(extrinsic_inv[0, :, :3, :3], world_points.transpose(-1, -2)).transpose(-1, -2) + \
+        gt_xyz = torch.matmul(extrinsic_inv[0, :, :3, :3], gt_world_points.transpose(-1, -2)).transpose(-1, -2) + \
             extrinsic_inv[0, :, :3, 3:4].transpose(-1, -2)
-        mean = xyz.reshape(-1, 3)
-        B, S, _, H, W = forward_flow.shape
-        gaussian_means = mean.reshape(B, S, H, W, 3).permute(
+
+        gt_gaussian_means = gt_xyz.reshape(B, S, H, W, 3).permute(
             0, 1, 4, 2, 3).contiguous()
 
-        # 2. gaussian velocity
+        # 3. 预测的velocity
         velocity = velocity.reshape(-1, 3)
         velocity = torch.sign(velocity) * (torch.exp(torch.abs(velocity)) - 1)
         velocity = velocity_local_to_global(velocity, extrinsic_inv)
-        gaussian_fwd_vel = velocity.reshape(
+        pred_fwd_vel = velocity.reshape(
             B, S, H, W, 3).permute(0, 1, 4, 2, 3).contiguous()
-        gaussian_bwd_vel = - \
-            velocity.reshape(B, S, H, W, 3).permute(0, 1, 4, 2, 3).contiguous()
 
-        # create combined masks (exclude sky regions)
-        if sky_masks is not None:
-            # sky_masks should have shape [B, S, H, W], take inverse to exclude sky
-            non_sky_mask = ~sky_masks[:, :, None, :, :]  # [B, S, 1, H, W]
-            forward_mask = forward_consist_mask & conf[:, :, None, :, :] & non_sky_mask
-            backward_mask = backward_consist_mask & conf[:, :, None, :, :] & non_sky_mask
-        else:
-            forward_mask = forward_consist_mask & conf[:, :, None, :, :]
-            backward_mask = backward_consist_mask & conf[:, :, None, :, :]
-
-        # forward loss
-        warped_means, target_means = warp_gaussian(
-            forward_flow,
-            forward_mask,
-            gaussian_means,
-            gaussian_fwd_vel,
-            S, H, W,
-            "forward",
-            interval=interval
+        # 4. 计算GT velocity - 参考MotionLoss的warp_pts3d方法
+        gt_fwd_vel, gt_fwd_mask = warp_pts3d_for_gt_velocity(
+            gt_gaussian_means, point_masks,
+            forward_flow, forward_consist_mask,
+            direction="forward", interval=interval
         )
-        forward_loss = F.l1_loss(warped_means, target_means)
+
+        # 5. 计算L1 loss between GT velocity and predicted velocity
+        forward_loss = compute_velocity_l1_loss_vectorized(
+            pred_fwd_vel, gt_fwd_vel, gt_fwd_mask,
+            direction="forward", interval=interval
+        )
+
         forward_loss = check_and_fix_inf_nan(forward_loss, "forward_loss")
-
-        # backward loss
-        warped_means, target_means = warp_gaussian(
-            backward_flow,
-            backward_mask,
-            gaussian_means,
-            gaussian_bwd_vel,
-            S, H, W,
-            "backward",
-            interval=interval
-        )
-        backward_loss = F.l1_loss(warped_means, target_means)
-        backward_loss = check_and_fix_inf_nan(backward_loss, "backward_loss")
 
         flow_loss_dict = {
             "forward_loss": forward_loss,
-            "backward_loss": backward_loss,
         }
 
         return flow_loss_dict
+
+
+def warp_pts3d_for_gt_velocity(gt_gaussian_means, point_masks, flow_map, flow_mask, direction="forward", interval=1):
+    """
+    参考MotionLoss的warp_pts3d方法，计算GT velocity
+
+    Args:
+        gt_gaussian_means: [B, S, 3, H, W] GT 3D points in camera coordinate
+        point_masks: [B, S, H, W] sparse depth的valid mask
+        flow_map: [B, S, 2, H, W] optical flow
+        flow_mask: [B, S, 1, H, W] flow consistency mask
+        direction: "forward" or "backward"
+        interval: frame interval
+
+    Returns:
+        gt_velocity: [B, S, 3, H, W] GT velocity
+        gt_mask: [B, S, H, W] valid mask for GT velocity
+    """
+    B, S, C, H, W = gt_gaussian_means.shape
+    assert direction in ["forward", "backward"], f"bad {direction=}"
+
+    # 创建有效的combined mask
+    if direction == "forward":
+        # forward: 需要当前帧和下一帧都有效
+        valid_frames = S - interval
+        current_point_masks = point_masks[:, :-interval]  # [B, S-interval, H, W]
+        next_point_masks = point_masks[:, interval:]      # [B, S-interval, H, W]
+        current_flow_mask = flow_mask[:, :-interval]      # [B, S-interval, 1, H, W]
+        current_flow = flow_map[:, :-interval]            # [B, S-interval, 2, H, W]
+        current_3d = gt_gaussian_means[:, :-interval]     # [B, S-interval, 3, H, W]
+        next_3d = gt_gaussian_means[:, interval:]         # [B, S-interval, 3, H, W]
+    else:  # backward
+        # backward: 需要当前帧和上一帧都有效
+        valid_frames = S - interval
+        current_point_masks = point_masks[:, interval:]   # [B, S-interval, H, W]
+        prev_point_masks = point_masks[:, :-interval]     # [B, S-interval, H, W]
+        current_flow_mask = flow_mask[:, interval:]       # [B, S-interval, 1, H, W]
+        current_flow = flow_map[:, interval:]             # [B, S-interval, 2, H, W]
+        current_3d = gt_gaussian_means[:, interval:]      # [B, S-interval, 3, H, W]
+        prev_3d = gt_gaussian_means[:, :-interval]        # [B, S-interval, 3, H, W]
+        next_point_masks = prev_point_masks  # 重命名为统一变量名
+        next_3d = prev_3d
+
+    # 初始化输出
+    gt_velocity = torch.zeros_like(gt_gaussian_means)  # [B, S, 3, H, W]
+    gt_mask = torch.zeros_like(point_masks)            # [B, S, H, W]
+
+    # 合并mask: point_mask & flow_mask
+    combined_mask = current_point_masks & current_flow_mask.squeeze(2)  # [B, S-interval, H, W]
+
+    # 获取所有有效位置的索引
+    inds = torch.nonzero(combined_mask, as_tuple=True)  # (batch_idx, time_idx, h_idx, w_idx)
+    init_pos_b, init_pos_t, init_pos_h, init_pos_w = inds
+
+    if len(init_pos_b) == 0:
+        return gt_velocity, gt_mask
+
+    # 获取这些位置的flow
+    flow = current_flow[init_pos_b, init_pos_t, :, init_pos_h, init_pos_w]  # [N, 2]
+
+    # 计算warped位置
+    warp_pos_w = (init_pos_w + flow[:, 0]).round().long().clamp(min=0, max=W - 1)
+    warp_pos_h = (init_pos_h + flow[:, 1]).round().long().clamp(min=0, max=H - 1)
+    warp_pos_b = init_pos_b
+    warp_pos_t = init_pos_t
+
+    # 获取当前位置和warped位置的3D点
+    current_pts = current_3d[init_pos_b, init_pos_t, :, init_pos_h, init_pos_w]    # [N, 3]
+    warped_pts = next_3d[warp_pos_b, warp_pos_t, :, warp_pos_h, warp_pos_w]       # [N, 3]
+
+    # 检查warped位置是否也有有效的depth
+    warped_valid = next_point_masks[warp_pos_b, warp_pos_t, warp_pos_h, warp_pos_w]  # [N]
+
+    # 只保留warped位置也有效的点
+    final_valid = warped_valid.bool()
+    if final_valid.sum() == 0:
+        return gt_velocity, gt_mask
+
+    # 过滤有效的点
+    valid_init_b = init_pos_b[final_valid]
+    valid_init_t = init_pos_t[final_valid]
+    valid_init_h = init_pos_h[final_valid]
+    valid_init_w = init_pos_w[final_valid]
+    valid_current_pts = current_pts[final_valid]    # [N_valid, 3]
+    valid_warped_pts = warped_pts[final_valid]      # [N_valid, 3]
+
+    # 计算velocity = warped_pts - current_pts
+    velocity = valid_warped_pts - valid_current_pts  # [N_valid, 3]
+
+    # 填充到输出tensor中
+    # velocity的形状是[N_valid, 3]，需要逐个分量赋值
+    for i in range(3):  # 对x, y, z三个分量分别赋值
+        gt_velocity[valid_init_b, valid_init_t, i, valid_init_h, valid_init_w] = velocity[:, i]
+
+    gt_mask[valid_init_b, valid_init_t, valid_init_h, valid_init_w] = True
+
+    return gt_velocity, gt_mask
+
+
+def compute_velocity_l1_loss_vectorized(pred_vel, gt_vel, gt_mask, direction="forward", interval=1):
+    """
+    计算predicted velocity和GT velocity之间的L1 loss (vectorized版本)
+
+    Args:
+        pred_vel: [B, S, 3, H, W] predicted velocity
+        gt_vel: [B, S, 3, H, W] GT velocity
+        gt_mask: [B, S, H, W] valid mask for GT velocity
+        direction: "forward" or "backward"
+        interval: frame interval
+
+    Returns:
+        loss: scalar L1 loss
+    """
+    # gt_mask中为True的位置表示有有效的GT velocity
+    if gt_mask.sum() == 0:
+        return torch.tensor(0.0, device=pred_vel.device, requires_grad=True)
+
+    # 扩展mask以匹配velocity的通道数
+    valid_mask_expanded = gt_mask.unsqueeze(2).expand(-1, -1, 3, -1, -1)  # [B, S, 3, H, W]
+
+    # 只在有效区域计算L1 loss
+    pred_masked = pred_vel[valid_mask_expanded]  # [N_valid]
+    gt_masked = gt_vel[valid_mask_expanded]      # [N_valid]
+
+    loss = F.l1_loss(pred_masked, gt_masked)
+    return loss
 
 
 def warp_gaussian(flow, mask, gaussian_means, gaussian_vel, T, H, W, direction="forward", interval=1):
@@ -883,41 +999,7 @@ def camera_loss(pred_pose_enc_list, batch, loss_type="l1", gamma=0.6, pose_encod
         "loss_fl": loss_fl
     }
 
-    with torch.no_grad():
-        # compute auc
-        last_pred_pose_enc = pred_pose_enc_list[-1]
-
-        last_pred_extrinsic, _ = pose_encoding_to_extri_intri(last_pred_pose_enc.detach(
-        ), image_size_hw, pose_encoding_type=pose_encoding_type, build_intrinsics=False)
-
-        rel_rangle_deg, rel_tangle_deg = camera_to_rel_deg(
-            last_pred_extrinsic.float(), gt_extrinsic.float(), gt_extrinsic.device)
-
-        if rel_rangle_deg.numel() == 0 and rel_tangle_deg.numel() == 0:
-            rel_rangle_deg = torch.FloatTensor([0]).to(
-                gt_extrinsic.device).to(gt_extrinsic.dtype)
-            rel_tangle_deg = torch.FloatTensor([0]).to(
-                gt_extrinsic.device).to(gt_extrinsic.dtype)
-
-        thresholds = [5, 15]
-        for threshold in thresholds:
-            loss_dict[f"Rac_{threshold}"] = (
-                rel_rangle_deg < threshold).float().mean()
-            loss_dict[f"Tac_{threshold}"] = (
-                rel_tangle_deg < threshold).float().mean()
-
-        _, normalized_histogram = calculate_auc(
-            rel_rangle_deg, rel_tangle_deg, max_threshold=30, return_list=True
-        )
-
-        auc_thresholds = [30, 10, 5, 3]
-        for auc_threshold in auc_thresholds:
-            cur_auc = torch.cumsum(
-                normalized_histogram[:auc_threshold], dim=0
-            ).mean()
-            loss_dict[f"Auc_{auc_threshold}"] = cur_auc
-
-    return loss_dict, last_pred_extrinsic
+    return loss_dict
 
 
 def camera_loss_single(cur_pred_pose_enc, gt_pose_encoding, loss_type="l1"):
