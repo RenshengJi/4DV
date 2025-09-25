@@ -22,33 +22,360 @@ from collections import defaultdict
 # 导入现有的聚类和光流配准系统
 import sys
 import os
-from sklearn.cluster import DBSCAN
+from cuml.cluster import DBSCAN
+from sklearn.cluster import DBSCAN as SklearnDBSCAN
+import cupy as cp
 from scipy.optimize import linear_sum_assignment
 
-# 延迟导入以避免循环导入
 
 
-def _import_clustering_functions():
-    """延迟导入聚类函数"""
-    try:
-        sys.path.append(os.path.dirname(
-            os.path.dirname(os.path.abspath(__file__))))
-        # 导入单独的函数而不是整个模块
-        import importlib.util
+def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, min_samples=10, area_threshold=750):
+    """
+    对每一帧进行动态物体聚类
 
-        # 导入聚类方法
-        demo_spec = importlib.util.spec_from_file_location(
-            "demo_clustering",
-            os.path.join(os.path.dirname(os.path.dirname(
-                os.path.abspath(__file__))), "demo_video_with_pointcloud_save.py")
-        )
-        demo_module = importlib.util.module_from_spec(demo_spec)
-        demo_spec.loader.exec_module(demo_module)
+    Args:
+        xyz: [S, H*W, 3] 点云坐标
+        velocity: [S, H*W, 3] 速度向量
+        velocity_threshold: 速度阈值，用于过滤静态背景
+        eps: DBSCAN的邻域半径
+        min_samples: DBSCAN的最小样本数
+        area_threshold: 面积阈值，过滤掉面积小于此值的聚类
 
-        return demo_module.dynamic_object_clustering, demo_module.match_objects_across_frames
-    except Exception as e:
-        print(f"Failed to import clustering functions: {e}")
-        return None, None
+    Returns:
+        list: 每一帧的聚类结果，每个元素包含点云坐标和聚类标签
+    """
+    clustering_results = []
+
+    for frame_idx in range(xyz.shape[0]):
+        # 获取当前帧的点云和速度
+        frame_points = xyz[frame_idx]  # [H*W, 3]
+        frame_velocity = velocity[frame_idx]  # [H*W, 3]
+
+        # 计算速度大小
+        velocity_magnitude = torch.norm(frame_velocity, dim=-1)  # [H*W]
+
+        # 过滤动态点（速度大于阈值的点）
+        dynamic_mask = velocity_magnitude > velocity_threshold
+        dynamic_points = frame_points[dynamic_mask]  # [N_dynamic, 3]
+        dynamic_velocities = frame_velocity[dynamic_mask]  # [N_dynamic, 3]
+
+        if len(dynamic_points) < min_samples:
+            # 如果动态点太少，返回空聚类
+            clustering_results.append({
+                'points': frame_points,
+                'labels': torch.full((len(frame_points),), -1, dtype=torch.long),
+                'dynamic_mask': dynamic_mask,
+                'num_clusters': 0,
+                'cluster_centers': [],
+                'cluster_velocities': [],
+                'cluster_sizes': [],
+                'cluster_indices': []
+            })
+            continue
+
+        # 尝试使用cuML GPU加速的DBSCAN聚类
+        try:
+            # 检查dynamic_points是否在GPU上
+            if dynamic_points.is_cuda:
+                # 如果已经在GPU上，直接转换为CuPy数组
+                dynamic_points_cp = cp.asarray(dynamic_points.detach())
+            else:
+                # 如果在CPU上，先移到GPU再转换为CuPy数组
+                dynamic_points_cp = cp.asarray(dynamic_points.detach().cpu().numpy())
+
+            # 执行cuML DBSCAN聚类（GPU加速）
+            dbscan = DBSCAN(eps=eps, min_samples=min_samples)
+            cluster_labels_cp = dbscan.fit_predict(dynamic_points_cp)
+
+            # 转换回NumPy数组
+            cluster_labels = cp.asnumpy(cluster_labels_cp)
+            # print(f"cuML DBSCAN成功: 找到 {len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)} 个聚类")
+        except Exception as e:
+            # 回退到sklearn CPU版本
+            # print(f"cuML DBSCAN失败，回退到sklearn: {e}")
+            try:
+                dynamic_points_np = dynamic_points.detach().cpu().numpy()
+                dbscan_sklearn = SklearnDBSCAN(eps=eps, min_samples=min_samples)
+                cluster_labels = dbscan_sklearn.fit_predict(dynamic_points_np)
+                # print(f"sklearn DBSCAN成功: 找到 {len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)} 个聚类")
+            except Exception as sklearn_e:
+                # print(f"sklearn DBSCAN也失败: {sklearn_e}")
+                # 简单回退：所有点标记为噪声
+                cluster_labels = np.full(len(dynamic_points), -1)
+
+        # 将聚类结果映射回原始点云
+        full_labels = torch.full((len(frame_points),), -1, device=frame_points.device)
+        full_labels[dynamic_mask] = torch.from_numpy(cluster_labels).to(frame_points.device).long()
+
+        # 统计聚类数量（排除噪声点，标签为-1）
+        all_unique_labels = set(cluster_labels)
+        if -1 in all_unique_labels:
+            all_unique_labels.remove(-1)
+        initial_num_clusters = len(all_unique_labels)
+
+        # 计算每个聚类的中心位置和平均速度
+        cluster_centers = []
+        cluster_velocities = []
+        cluster_sizes = []
+        valid_labels = []
+
+        for label in sorted(all_unique_labels):
+            cluster_mask = cluster_labels == label
+            cluster_points = dynamic_points[cluster_mask]
+            cluster_vel = dynamic_velocities[cluster_mask]
+
+            # 计算聚类中心（平均位置）
+            center = cluster_points.mean(dim=0)
+            # 计算平均速度
+            avg_velocity = cluster_vel.mean(dim=0)
+            cluster_size = len(cluster_points)
+
+            # 过滤掉面积太小的聚类
+            if cluster_size >= area_threshold:
+                cluster_centers.append(center)
+                cluster_velocities.append(avg_velocity)
+                cluster_sizes.append(cluster_size)
+                valid_labels.append(label)
+            else:
+                # 将过滤掉的聚类重新标记为静态点（-1）
+                cluster_indices = np.where(cluster_mask)[0]
+                dynamic_indices = torch.where(dynamic_mask)[0]
+                filtered_indices = dynamic_indices[cluster_indices]
+                full_labels[filtered_indices] = -1
+
+        # 更新聚类数量
+        num_clusters = len(valid_labels)
+
+        # 重新映射聚类标签，确保连续
+        if num_clusters > 0:
+            # 创建新的标签映射
+            label_mapping = {old_label: new_label for new_label,
+                             old_label in enumerate(valid_labels)}
+
+            # 更新full_labels中的聚类标签
+            for old_label, new_label in label_mapping.items():
+                mask = full_labels == old_label
+                full_labels[mask] = new_label
+
+        # 计算每个聚类的点索引
+        cluster_indices = []
+        for label in range(num_clusters):
+            # 找到属于当前聚类的点的索引
+            cluster_mask = full_labels == label
+            cluster_point_indices = torch.where(cluster_mask)[0].cpu().numpy().tolist()
+            cluster_indices.append(cluster_point_indices)
+
+        clustering_results.append({
+            'points': frame_points,
+            'labels': full_labels.cpu(),
+            'dynamic_mask': dynamic_mask,
+            'num_clusters': num_clusters,
+            'dynamic_points': dynamic_points,
+            'cluster_labels': torch.from_numpy(cluster_labels),
+            'cluster_centers': cluster_centers,
+            'cluster_velocities': cluster_velocities,
+            'cluster_sizes': cluster_sizes,
+            'cluster_indices': cluster_indices
+        })
+
+    return clustering_results
+
+
+def match_objects_across_frames(clustering_results, position_threshold=0.5, velocity_threshold=0.2):
+    """
+    跨帧匹配动态物体（使用匈牙利算法）
+
+    Args:
+        clustering_results: 每一帧的聚类结果
+        position_threshold: 位置匹配阈值
+        velocity_threshold: 速度匹配阈值
+
+    Returns:
+        list: 每一帧的聚类结果，包含全局物体ID
+    """
+    if len(clustering_results) == 0:
+        return clustering_results
+
+    # 初始化全局物体ID
+    next_global_id = 0
+    global_object_tracks = {}  # {global_id: {frame_id, center, velocity, size}}
+
+    # 为每一帧分配全局ID
+    for frame_idx, frame_result in enumerate(clustering_results):
+        if frame_result['num_clusters'] == 0:
+            frame_result['global_ids'] = []
+            # 确保 cluster_indices 字段存在
+            if 'cluster_indices' not in frame_result:
+                frame_result['cluster_indices'] = []
+            continue
+
+        frame_centers = frame_result['cluster_centers']
+        frame_velocities = frame_result['cluster_velocities']
+        frame_sizes = frame_result['cluster_sizes']
+
+        # 初始化当前帧的全局ID数组，按照聚类标签的顺序
+        frame_global_ids = [-1] * len(frame_centers)  # 初始化为-1表示未分配
+
+        if frame_idx == 0:
+            # 第一帧，为所有物体分配新的全局ID
+            for cluster_idx in range(len(frame_centers)):
+                global_id = next_global_id
+                next_global_id += 1
+
+                global_object_tracks[global_id] = {
+                    'frame_id': frame_idx,
+                    'center': frame_centers[cluster_idx],
+                    'velocity': frame_velocities[cluster_idx],
+                    'size': frame_sizes[cluster_idx]
+                }
+                frame_global_ids[cluster_idx] = global_id
+        else:
+            # 使用匈牙利算法进行匹配
+            prev_result = clustering_results[frame_idx - 1]
+            prev_global_ids = prev_result.get('global_ids', [])
+
+            if len(prev_global_ids) == 0:
+                # 前一帧没有物体，为当前帧所有物体分配新ID
+                for cluster_idx in range(len(frame_centers)):
+                    global_id = next_global_id
+                    next_global_id += 1
+
+                    global_object_tracks[global_id] = {
+                        'frame_id': frame_idx,
+                        'center': frame_centers[cluster_idx],
+                        'velocity': frame_velocities[cluster_idx],
+                        'size': frame_sizes[cluster_idx]
+                    }
+                    frame_global_ids[cluster_idx] = global_id
+            else:
+                # 构建成本矩阵
+                num_prev = len(prev_global_ids)
+                num_current = len(frame_centers)
+                cost_matrix = np.full((num_prev, num_current), float('inf'))
+
+                for i, prev_global_id in enumerate(prev_global_ids):
+                    track_info = global_object_tracks[prev_global_id]
+                    prev_center = track_info['center']
+                    prev_velocity = track_info['velocity']
+
+                    for j in range(num_current):
+                        current_center = frame_centers[j]
+                        current_velocity = frame_velocities[j]
+
+                        # 使用T帧的位置和速度预测T+1帧的位置
+                        predicted_center = prev_center + prev_velocity
+
+                        # 计算预测位置与实际位置的距离
+                        pos_distance = torch.norm(
+                            current_center - predicted_center).item()
+
+                        # 计算速度相似度
+                        vel_distance = torch.norm(
+                            current_velocity - prev_velocity).item()
+
+                        # 综合评分（位置权重更高）
+                        score = pos_distance  # + 0.3 * vel_distance
+
+                        # 如果满足阈值条件，设置成本；否则保持无穷大
+                        if pos_distance < position_threshold:  # and vel_distance < velocity_threshold:
+                            cost_matrix[i, j] = score
+
+                # 使用匈牙利算法求解最优匹配
+                if num_prev > 0 and num_current > 0:
+                    # 检查是否有有效的匹配（非无穷大成本）
+                    has_valid_matches = np.any(cost_matrix < float('inf'))
+
+                    if has_valid_matches:
+                        try:
+                            row_indices, col_indices = linear_sum_assignment(
+                                cost_matrix)
+
+                            # 处理匹配结果
+                            matched_prev = set()
+                            matched_current = set()
+
+                            for i, j in zip(row_indices, col_indices):
+                                if cost_matrix[i, j] < float('inf'):  # 有效匹配
+                                    prev_global_id = prev_global_ids[i]
+                                    matched_prev.add(i)
+                                    matched_current.add(j)
+
+                                    # 更新跟踪信息
+                                    global_object_tracks[prev_global_id] = {
+                                        'frame_id': frame_idx,
+                                        'center': frame_centers[j],
+                                        'velocity': frame_velocities[j],
+                                        'size': frame_sizes[j]
+                                    }
+                                    # 按照聚类索引顺序存储
+                                    frame_global_ids[j] = prev_global_id
+
+                            # 为未匹配的当前帧物体分配新ID
+                            for j in range(num_current):
+                                if j not in matched_current:
+                                    global_id = next_global_id
+                                    next_global_id += 1
+
+                                    global_object_tracks[global_id] = {
+                                        'frame_id': frame_idx,
+                                        'center': frame_centers[j],
+                                        'velocity': frame_velocities[j],
+                                        'size': frame_sizes[j]
+                                    }
+                                    # 按照聚类索引顺序存储
+                                    frame_global_ids[j] = global_id
+
+                            # 为未匹配的前一帧物体保持跟踪（可选：设置消失标记）
+                            for i in range(num_prev):
+                                if i not in matched_prev:
+                                    prev_global_id = prev_global_ids[i]
+                                    # 可以选择保持最后一帧的信息或标记为消失
+                                    pass
+                        except ValueError as e:
+                            # 如果匈牙利算法失败，为所有物体分配新ID
+                            for cluster_idx in range(len(frame_centers)):
+                                global_id = next_global_id
+                                next_global_id += 1
+
+                                global_object_tracks[global_id] = {
+                                    'frame_id': frame_idx,
+                                    'center': frame_centers[cluster_idx],
+                                    'velocity': frame_velocities[cluster_idx],
+                                    'size': frame_sizes[cluster_idx]
+                                }
+                                frame_global_ids[cluster_idx] = global_id
+                    else:
+                        # 没有有效匹配，为所有物体分配新ID
+                        for cluster_idx in range(len(frame_centers)):
+                            global_id = next_global_id
+                            next_global_id += 1
+
+                            global_object_tracks[global_id] = {
+                                'frame_id': frame_idx,
+                                'center': frame_centers[cluster_idx],
+                                'velocity': frame_velocities[cluster_idx],
+                                'size': frame_sizes[cluster_idx]
+                            }
+                            frame_global_ids[cluster_idx] = global_id
+                else:
+                    # 没有前一帧物体，为当前帧所有物体分配新ID
+                    for cluster_idx in range(len(frame_centers)):
+                        global_id = next_global_id
+                        next_global_id += 1
+
+                        global_object_tracks[global_id] = {
+                            'frame_id': frame_idx,
+                            'center': frame_centers[cluster_idx],
+                            'velocity': frame_velocities[cluster_idx],
+                            'size': frame_sizes[cluster_idx]
+                        }
+                        frame_global_ids[cluster_idx] = global_id
+
+        # 将全局ID添加到帧结果中
+        frame_result['global_ids'] = frame_global_ids
+
+    return clustering_results
+
 
 
 def _import_optical_flow():
@@ -131,7 +458,6 @@ class OnlineDynamicProcessor:
                 try:
                     self.optical_flow_registration = self._optical_flow_class(
                         device=str(device),
-                        use_pnp=True,
                         min_inliers_ratio=0.1,  # 降低最小内点比例
                         ransac_threshold=5.0,   # 增加RANSAC阈值
                         max_flow_magnitude=200.0  # 增加最大光流幅度
@@ -139,9 +465,7 @@ class OnlineDynamicProcessor:
                 except Exception as e:
                     self.optical_flow_registration = None
 
-        # 缓存聚类函数
-        self._dynamic_clustering_func = None
-        self._match_objects_func = None
+        # 聚类函数已直接定义在此文件中，不需要缓存
 
         # 时序缓存
         self.enable_temporal_cache = enable_temporal_cache
@@ -182,13 +506,9 @@ class OnlineDynamicProcessor:
         try:
             # 获取基本信息
             images = vggt_batch.get('images')  # [B, S, 3, H, W]
-            if images is None:
-                return {'dynamic_objects': [], 'static_gaussians': None}
-
             B, S, C, H, W = images.shape
             velocity = preds.get('velocity')  # [B, S, H, W, 3]
-            # [B, S*H*W, 14] or similar
-            gaussian_params = preds.get('gaussian_params')
+            gaussian_params = preds.get('gaussian_params')  # [B, S*H*W, 14] or similar
 
             # ========== Stage 1: 数据后处理 ==========
             preprocessing_start = time.time()
@@ -317,40 +637,59 @@ class OnlineDynamicProcessor:
                 preds, vggt_batch, velocity
             )
             stage_times['Stage 2: 动态物体聚类'] = time.time() - clustering_start
+            print(f"Stage 2: 动态物体聚类耗时: {stage_times['Stage 2: 动态物体聚类']:.4f}s")
 
             # ========== Stage 3: 跨帧物体跟踪 ==========
             tracking_start = time.time()
-            if self._match_objects_func is None:
-                _, self._match_objects_func = _import_clustering_functions()
-
-            if self._match_objects_func is not None:
-                matched_clustering_results = self._match_objects_func(
-                    clustering_results,
-                    position_threshold=2.0,
-                    velocity_threshold=0.2
-                )
-            else:
-                matched_clustering_results = clustering_results
+            matched_clustering_results = match_objects_across_frames(
+                clustering_results,
+                position_threshold=2.0,
+                velocity_threshold=0.2
+            )
             stage_times['Stage 3: 跨帧物体跟踪'] = time.time() - tracking_start
+            print(f"Stage 3: 跨帧物体跟踪耗时: {stage_times['Stage 3: 跨帧物体跟踪']:.4f}s")
 
             # ========== Stage 4: 光流聚合 ==========
             aggregation_start = time.time()
+            print("    开始Stage 4: 光流聚合...")
+            stage4_times = {}
+
             dynamic_objects = []
             if self.optical_flow_registration is not None and len(matched_clustering_results) > 0:
                 try:
-                    dynamic_objects = self._aggregate_with_existing_optical_flow_method(
+                    step41_start = time.time()
+                    print("      Step 4.1: 使用光流聚合方法...")
+                    dynamic_objects, aggregation_details = self._aggregate_with_existing_optical_flow_method(
                         matched_clustering_results, preds, vggt_batch
                     )
+                    stage4_times['Step 4.1: 光流聚合'] = time.time() - step41_start
+                    print(f"      Step 4.1完成: {stage4_times['Step 4.1: 光流聚合']:.4f}s")
+
+                    # 显示光流聚合的详细时间
+                    if aggregation_details:
+                        for detail_key, detail_time in aggregation_details.items():
+                            print(f"        - {detail_key}: {detail_time:.4f}s")
+
                 except Exception as e:
-                    print(f"光流聚合失败，回退到简单方法: {e}")
+                    print(f"      Step 4.1失败，回退到简单方法: {e}")
+                    step42_start = time.time()
                     dynamic_objects = self._create_objects_from_clustering_results(
                         matched_clustering_results, gaussian_params, H, W, preds
                     )
+                    stage4_times['Step 4.2: 简单聚合(回退)'] = time.time() - step42_start
+                    print(f"      Step 4.2回退方法完成: {stage4_times['Step 4.2: 简单聚合(回退)']:.4f}s")
             else:
+                step43_start = time.time()
+                print("      Step 4.3: 无光流配准器，使用简单方法...")
                 dynamic_objects = self._create_objects_from_clustering_results(
                     matched_clustering_results, gaussian_params, H, W, preds
                 )
+                stage4_times['Step 4.3: 简单聚合(无光流)'] = time.time() - step43_start
+                print(f"      Step 4.3完成: {stage4_times['Step 4.3: 简单聚合(无光流)']:.4f}s")
+
             stage_times['Stage 4: 光流聚合'] = time.time() - aggregation_start
+            stage_times.update({f'Stage4_{k}': v for k, v in stage4_times.items()})
+            print(f"    Stage 4: 光流聚合总耗时: {stage_times['Stage 4: 光流聚合']:.4f}s")
 
             # ========== Stage 5: 背景分离 ==========
             background_start = time.time()
@@ -358,8 +697,10 @@ class OnlineDynamicProcessor:
                 preds, velocity, matched_clustering_results, H, W, S
             )
             stage_times['Stage 5: 背景分离'] = time.time() - background_start
+            print(f"Stage 5: 背景分离耗时: {stage_times['Stage 5: 背景分离']:.4f}s")
 
             total_time = time.time() - start_time
+            print(f"总耗时: {total_time:.4f}s")
 
             # 更新统计信息
             self.processing_stats['total_sequences'] += 1
@@ -472,27 +813,19 @@ class OnlineDynamicProcessor:
             else:
                 velocity_reshaped = torch.zeros(S, H*W, 3, device=self.device)
 
-            # 使用现有的动态物体聚类函数
-            if self._dynamic_clustering_func is None:
-                self._dynamic_clustering_func, _ = _import_clustering_functions()
+            # 使用直接定义的动态物体聚类函数
+            # 分离张量梯度以便在聚类中使用numpy
+            xyz_detached = xyz.detach()
+            velocity_detached = velocity_reshaped.detach()
 
-            if self._dynamic_clustering_func is not None:
-                # 分离张量梯度以便在聚类中使用numpy
-                xyz_detached = xyz.detach()
-                velocity_detached = velocity_reshaped.detach()
-
-                clustering_results = self._dynamic_clustering_func(
-                    xyz_detached,  # [S, H*W, 3]
-                    velocity_detached,  # [S, H*W, 3]
-                    velocity_threshold=0.02,  # 速度阈值
-                    eps=0.01,  # DBSCAN的邻域半径
-                    min_samples=10,  # DBSCAN的最小样本数
-                    area_threshold=self.min_object_size  # 面积阈值
-                )
-            else:
-                # 回退到简单实现
-                clustering_results = self._simple_clustering(
-                    xyz, velocity_reshaped)
+            clustering_results = dynamic_object_clustering(
+                xyz_detached,  # [S, H*W, 3]
+                velocity_detached,  # [S, H*W, 3]
+                velocity_threshold=0.02,  # 速度阈值
+                eps=0.01,  # DBSCAN的邻域半径
+                min_samples=10,  # DBSCAN的最小样本数
+                area_threshold=self.min_object_size  # 面积阈值
+            )
 
             return clustering_results
 
@@ -500,125 +833,17 @@ class OnlineDynamicProcessor:
             # 返回空的聚类结果
             return []
 
-    def _simple_clustering(self, xyz: torch.Tensor, velocity: torch.Tensor) -> List[Dict]:
-        """简单的聚类实现（作为回退方案）"""
-        try:
-            clustering_results = []
-            S = xyz.shape[0]
-
-            for frame_idx in range(S):
-                frame_points = xyz[frame_idx]  # [H*W, 3]
-                frame_velocity = velocity[frame_idx]  # [H*W, 3]
-
-                # 计算速度大小
-                velocity_magnitude = torch.norm(
-                    frame_velocity, dim=-1)  # [H*W]
-
-                # 过滤动态点
-                velocity_threshold = 0.01
-                dynamic_mask = velocity_magnitude > velocity_threshold
-                dynamic_points = frame_points[dynamic_mask]
-
-                if len(dynamic_points) < 10:
-                    clustering_results.append({
-                        'frame_idx': frame_idx,  # 添加frame_idx字段
-                        'points': frame_points,
-                        'labels': torch.full((len(frame_points),), -1, dtype=torch.long),
-                        'dynamic_mask': dynamic_mask,
-                        'num_clusters': 0,
-                        'cluster_centers': [],
-                        'cluster_velocities': [],
-                        'cluster_sizes': [],
-                        'global_ids': [],
-                        'cluster_indices': []  # 添加cluster_indices字段
-                    })
-                    continue
-
-                # 简单的基于空间的聚类
-                dynamic_points_np = dynamic_points.cpu().numpy()
-
-                try:
-                    # 使用DBSCAN聚类
-                    dbscan = DBSCAN(eps=0.02, min_samples=10)
-                    cluster_labels = dbscan.fit_predict(dynamic_points_np)
-
-                    # 映射回原始点云
-                    full_labels = torch.full(
-                        (len(frame_points),), -1, dtype=torch.long)
-                    full_labels[dynamic_mask] = torch.from_numpy(
-                        cluster_labels)
-
-                    # 统计聚类信息
-                    unique_labels = set(cluster_labels)
-                    if -1 in unique_labels:
-                        unique_labels.remove(-1)
-
-                    num_clusters = len(unique_labels)
-                    cluster_centers = []
-                    cluster_velocities = []
-                    cluster_sizes = []
-
-                    for label in sorted(unique_labels):
-                        cluster_mask = cluster_labels == label
-                        cluster_points = dynamic_points[cluster_mask]
-                        if len(cluster_points) >= self.min_object_size:
-                            center = cluster_points.mean(dim=0)
-                            cluster_centers.append(center)
-                            cluster_velocities.append(
-                                frame_velocity[dynamic_mask][cluster_mask].mean(dim=0))
-                            cluster_sizes.append(len(cluster_points))
-
-                    # 构建cluster_indices - 每个聚类中心对应的像素索引列表
-                    cluster_indices = []
-                    H_W = len(frame_points)
-                    for label in range(len(cluster_centers)):
-                        # 找到属于该聚类的所有点的索引
-                        cluster_mask = (full_labels == label)
-                        indices = torch.where(cluster_mask)[0].tolist()
-                        cluster_indices.append(indices)
-
-                    clustering_results.append({
-                        'frame_idx': frame_idx,  # 添加frame_idx字段
-                        'points': frame_points,
-                        'labels': full_labels,
-                        'dynamic_mask': dynamic_mask,
-                        'num_clusters': len(cluster_centers),
-                        'cluster_centers': cluster_centers,
-                        'cluster_velocities': cluster_velocities,
-                        'cluster_sizes': cluster_sizes,
-                        # 简单分配ID
-                        'global_ids': list(range(len(cluster_centers))),
-                        'cluster_indices': cluster_indices  # 添加每个聚类对应的像素索引列表
-                    })
-
-                except Exception as e:
-                    clustering_results.append({
-                        'frame_idx': frame_idx,  # 添加frame_idx字段
-                        'points': frame_points,
-                        'labels': torch.full((len(frame_points),), -1, dtype=torch.long),
-                        'dynamic_mask': dynamic_mask,
-                        'num_clusters': 0,
-                        'cluster_centers': [],
-                        'cluster_velocities': [],
-                        'cluster_sizes': [],
-                        'global_ids': [],
-                        'cluster_indices': []  # 添加cluster_indices字段
-                    })
-
-            return clustering_results
-
-        except Exception as e:
-            return []
 
     def _aggregate_with_existing_optical_flow_method(
         self,
         clustering_results: List[Dict],
         preds: Dict[str, Any],
         vggt_batch: Dict[str, Any]
-    ) -> List[Dict]:
-        """使用optical_flow_registration.py中的光流聚合方法"""
+    ) -> tuple[List[Dict], Dict[str, float]]:
+        """使用optical_flow_registration.py中的光流聚合方法，返回结果和详细时间统计"""
         import time
         method_start = time.time()
+        detailed_times = {}
 
         try:
             if self.optical_flow_registration is None:
@@ -630,16 +855,19 @@ class OnlineDynamicProcessor:
                         # 假设points是[H*W, 3]格式，我们可能需要从别处获取H, W
                         # 这里使用默认值，实际情况可能需要调整
                         pass
-                return self._create_objects_from_clustering_results(
+                fallback_start = time.time()
+                result = self._create_objects_from_clustering_results(
                     clustering_results, None, H, W
                 )
+                detailed_times['回退到简单聚合'] = time.time() - fallback_start
+                return result, detailed_times
 
             # 1. 预计算所有帧之间的光流
             flow_start = time.time()
             flows = self.optical_flow_registration.precompute_optical_flows(
                 vggt_batch)
             flow_time = time.time() - flow_start
-            print(f"    预计算光流耗时: {flow_time:.4f}s")
+            detailed_times['1. 预计算光流'] = flow_time
 
             # 2. 获取所有全局物体ID
             ids_start = time.time()
@@ -647,13 +875,14 @@ class OnlineDynamicProcessor:
             for result in clustering_results:
                 all_global_ids.update(result.get('global_ids', []))
             ids_time = time.time() - ids_start
-            print(
-                f"    获取全局物体ID耗时: {ids_time:.4f}s ({len(all_global_ids)} 个物体)")
+            detailed_times['2. 获取全局ID'] = ids_time
 
             dynamic_objects = []
 
             # 3. 对每个全局物体进行光流聚合
             aggregation_start = time.time()
+            individual_object_times = []
+
             for i, global_id in enumerate(all_global_ids):
                 object_start = time.time()
                 try:
@@ -661,6 +890,16 @@ class OnlineDynamicProcessor:
                         clustering_results, preds, vggt_batch, global_id, flows
                     )
                     object_time = time.time() - object_start
+                    individual_object_times.append(object_time)
+
+                    # 检查是否有详细时间统计
+                    if aggregated_object is not None and 'step_times' in aggregated_object:
+                        object_step_times = aggregated_object['step_times']
+                        # 只打印 Gaussian参数提取 的耗时
+                        if '5. Gaussian参数提取' in object_step_times:
+                            gaussian_time = object_step_times['5. Gaussian参数提取']
+                            if isinstance(gaussian_time, (int, float)):
+                                print(f"        物体 {global_id} Gaussian参数提取: {gaussian_time:.4f}s")
 
                     if aggregated_object is not None:
                         # 使用aggregate_object_to_middle_frame已经提取的canonical_gaussians
@@ -729,14 +968,22 @@ class OnlineDynamicProcessor:
                     traceback.print_exc()
 
             aggregation_total_time = time.time() - aggregation_start
-            method_total_time = time.time() - method_start
+            detailed_times['3. 聚合所有物体'] = aggregation_total_time
+            if individual_object_times:
+                detailed_times['3.1 单物体平均耗时'] = sum(individual_object_times) / len(individual_object_times)
+                detailed_times['3.2 单物体最大耗时'] = max(individual_object_times)
+                detailed_times['3.3 物体数量'] = len(all_global_ids)
 
-            return dynamic_objects
+            method_total_time = time.time() - method_start
+            detailed_times['总耗时'] = method_total_time
+
+            return dynamic_objects, detailed_times
 
         except Exception as e:
             # 使用默认尺寸
             H, W = 64, 64
-            return self._create_objects_from_clustering_results(clustering_results, None, H, W)
+            detailed_times['异常回退'] = time.time() - method_start
+            return self._create_objects_from_clustering_results(clustering_results, None, H, W), detailed_times
 
     def _create_objects_from_clustering_results(
         self,
@@ -960,26 +1207,19 @@ class OnlineDynamicProcessor:
             # 注意：clustering_results的索引可能与frame_idx不同
             reference_clustering = None
 
-            print(
-                f"🔍 查找参考帧{reference_frame}，clustering_results有{len(clustering_results)}个结果")
 
             # 方法1: 直接通过frame_idx匹配
             for result in clustering_results:
                 frame_idx = result.get('frame_idx')
-                print(f"  检查clustering_results中的frame_idx: {frame_idx}")
                 if frame_idx == reference_frame:
                     reference_clustering = result
                     break
 
             # 方法2: 如果没找到，尝试通过索引匹配（reference_frame可能是相对索引）
             if reference_clustering is None and 0 <= reference_frame < len(clustering_results):
-                print(f"  通过索引{reference_frame}直接访问clustering_results")
                 reference_clustering = clustering_results[reference_frame]
 
             if reference_clustering is None:
-                print(f"⚠️  未找到参考帧{reference_frame}的聚类结果")
-                print(
-                    f"  可用的frame_idx: {[r.get('frame_idx') for r in clustering_results]}")
                 return self._points_to_gaussian_params_fallback(aggregated_points, global_id)
 
             # 获取该物体在参考帧中的像素索引
@@ -996,16 +1236,11 @@ class OnlineDynamicProcessor:
                         object_pixel_indices.extend(cluster_indices[i])
 
             if len(object_pixel_indices) == 0:
-                print(f"⚠️  在参考帧{reference_frame}中未找到物体{global_id}的像素索引")
                 return self._points_to_gaussian_params_fallback(aggregated_points, global_id)
 
-            print(
-                f"🔍 物体{global_id}: 在参考帧{reference_frame}找到{len(object_pixel_indices)}个像素索引")
 
             # 直接通过像素索引提取对应的Gaussian参数
             B, N_total, feature_dim = gaussian_params.shape
-            print(
-                f"🔍 Gaussian参数形状: B={B}, N_total={N_total}, feature_dim={feature_dim}")
 
             # gaussian_params的形状是 [B, S*H*W, 14]，我们需要计算正确的全局索引
             # cluster_indices中的像素索引是相对于单帧的（0到H*W-1），需要转换为全局索引
@@ -1014,13 +1249,10 @@ class OnlineDynamicProcessor:
             # 从clustering_results推断出H*W
             H_W = len(reference_clustering.get('points', []))
             if H_W == 0:
-                print(f"⚠️  无法推断图像尺寸")
                 return self._points_to_gaussian_params_fallback(aggregated_points, global_id)
 
             # 从N_total和H_W推断S
             S = N_total // H_W if H_W > 0 else 1
-            print(
-                f"🔍 推断的参数: H*W={H_W}, S={S}, reference_frame={reference_frame}")
 
             selected_gaussians_list = []
 
@@ -1032,13 +1264,10 @@ class OnlineDynamicProcessor:
                 if 0 <= global_idx < N_total:
                     selected_gaussians_list.append(
                         gaussian_params[0, global_idx])  # 使用batch=0
-                    print(f"  提取像素{pixel_idx}->全局索引{global_idx}的Gaussian参数")
                 else:
-                    print(
-                        f"  ⚠️  全局索引{global_idx}(来自像素{pixel_idx})超出范围[0, {N_total-1}]")
+                    pass  # 索引超出范围，跳过
 
             if len(selected_gaussians_list) == 0:
-                print(f"⚠️  无法提取有效的Gaussian参数")
                 return self._points_to_gaussian_params_fallback(aggregated_points, global_id)
 
             selected_gaussians = torch.stack(
@@ -1059,13 +1288,10 @@ class OnlineDynamicProcessor:
 
             selected_gaussians[:, :3] = points_tensor[:, :3]
 
-            print(f"✅ 正确提取了{len(selected_gaussians)}个Gaussian参数（通过像素索引对应）")
 
             return selected_gaussians
 
         except Exception as e:
-            print(f"❌ 像素索引对应方法失败: {e}")
-            print(f"回退到传统方法")
             return self._points_to_gaussian_params_fallback(aggregated_object.get('aggregated_points', []), global_id)
 
     def _extract_gaussian_params_from_preds(self, points, preds, aggregated_colors=None) -> Optional[torch.Tensor]:
@@ -1112,7 +1338,6 @@ class OnlineDynamicProcessor:
                 selected_indices = np.random.choice(
                     N_gaussians, N_points, replace=True)
                 selected_gaussians = gaussian_params_flat[selected_indices]
-                print(f"警告：Gaussian数量({N_gaussians}) < 点数({N_points})，使用随机采样")
             else:
                 # 使用KD-tree但确保每个点都有独特的参数
                 nbrs = NearestNeighbors(n_neighbors=min(
@@ -1145,7 +1370,6 @@ class OnlineDynamicProcessor:
 
             # 关键修复：对从VGGT提取的原始参数进行激活处理
             # 因为VGGT预测的是原始未激活的参数，需要应用激活函数
-            print("对提取的VGGT参数应用激活函数...")
             selected_gaussians = self._apply_gaussian_activation(
                 selected_gaussians)
 
@@ -1159,12 +1383,10 @@ class OnlineDynamicProcessor:
             # VGGT预测的颜色参数经过神经网络训练，适合3D Gaussian Splatting渲染
             # 光流聚合的颜色适合传统点云，但不适合Gaussian渲染
 
-            print(f"从VGGT预测中提取并激活了 {selected_gaussians.shape[0]} 个Gaussian参数")
 
             return selected_gaussians
 
         except Exception as e:
-            print(f"从VGGT预测提取Gaussian参数失败: {e}")
             # 注意：不要再次激活，因为回退方案中已经会激活
             return self._points_to_gaussian_params_fallback(points, None)
 
@@ -1228,7 +1450,6 @@ class OnlineDynamicProcessor:
             else:
                 # 默认中性颜色
                 gaussian_params[:, 6:9] = 0.5
-                print("回退方案：使用默认中性颜色")
 
             # 旋转: quaternion (positions 9:13) - normalized quaternion
             gaussian_params[:, 9:13] = torch.tensor(
@@ -1397,12 +1618,12 @@ class OnlineDynamicProcessor:
 
             # Step 4: 计算静态区域掩码
             step4_start = time.time()
-            velocity_threshold = 0.01  # 速度阈值
+            velocity_threshold = 0.02  # 速度阈值
             static_velocity_mask = velocity_magnitude <= velocity_threshold  # 低速度区域
             static_object_mask = ~dynamic_mask_all  # 非动态物体区域
 
             # 静态区域 = 低速度 AND 非动态物体
-            static_mask = static_velocity_mask & static_object_mask  # [S, H*W]
+            static_mask = static_velocity_mask # & static_object_mask  # [S, H*W]
             stage5_times['Step 4: 计算静态区域掩码'] = time.time() - step4_start
 
             # Step 5: 收集所有静态Gaussians
@@ -1426,7 +1647,7 @@ class OnlineDynamicProcessor:
             # Step 6: 下采样和去重处理
             step6_start = time.time()
             downsampled_static_gaussians = self._downsample_static_gaussians(
-                all_static_gaussians, max_points=5000000, spatial_threshold=0.005
+                all_static_gaussians, max_points=50000000, spatial_threshold=0.0001
             )
             stage5_times['Step 6: 下采样和去重处理'] = time.time() - step6_start
 
@@ -1522,13 +1743,9 @@ class OnlineDynamicProcessor:
                     f"        随机下采样: {len(deduped_gaussians)} -> {len(final_gaussians)}")
             else:
                 final_gaussians = deduped_gaussians
-                print(f"        最终点数: {len(final_gaussians)}")
             downsample_times['Step 6.4: 随机下采样'] = time.time() - step64_start
 
-            # 显示下采样详细耗时
-            print("        下采样详细耗时:")
-            for step_name, step_time in downsample_times.items():
-                print(f"          {step_name}: {step_time:.4f}s")
+            # 显示下采样详细耗时 - 已移除输出
 
             return final_gaussians
 

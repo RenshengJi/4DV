@@ -22,8 +22,6 @@ def main():
     parser.add_argument("--flow_model", type=str, default="raft",
                        choices=["raft", "pwc", "opencv"],
                        help="光流模型")
-    parser.add_argument("--use_pnp", action="store_true",
-                       help="使用3DPnP方法（复杂版），否则使用直接平移（简单版）")
     parser.add_argument("--device", type=str, default="cuda",
                        help="计算设备")
     parser.add_argument("--min_inliers_ratio", type=float, default=0.3,
@@ -47,7 +45,6 @@ def main():
     registration = OpticalFlowRegistration(
         flow_model_name=args.flow_model,
         device=args.device,
-        use_pnp=args.use_pnp,
         min_inliers_ratio=args.min_inliers_ratio,
         ransac_threshold=args.ransac_threshold,
         max_flow_magnitude=args.max_flow_magnitude

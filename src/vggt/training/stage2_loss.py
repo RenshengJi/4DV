@@ -332,7 +332,7 @@ class Stage2RenderLoss(nn.Module):
                 sh_degree=0, render_mode="RGB+ED",
                 radius_clip=0, near_plane=0.0001,
                 far_plane=1000.0,
-                eps2d=0.1,
+                eps2d=0.3,
             )
 
             # Check if rendering returned valid results

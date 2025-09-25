@@ -523,16 +523,13 @@ def create_clustering_visualization_from_matched_results(matched_clustering_resu
             B, S, C, H, W = vggt_batch["images"].shape
             return vggt_batch["images"][0]  # [S, 3, H, W]
 
-        print(f"Creating visualization from {len(matched_clustering_results)} clustering frames")
 
         # 生成可视化颜色
         colored_results = visualize_clustering_results(matched_clustering_results, num_colors=20)
 
         # 调试信息：检查聚类结果
-        print(f"总共生成了 {len(colored_results)} 帧的可视化结果")
         for i, result in enumerate(colored_results):
             non_black_count = np.any(result['colors'] > 0, axis=1).sum()
-            print(f"帧 {i}: 聚类数量={result['num_clusters']}, 非黑色像素数量={non_black_count}/{len(result['colors'])}")
 
         B, S, C, image_height, image_width = vggt_batch["images"].shape
 
@@ -566,7 +563,6 @@ def create_clustering_visualization_from_matched_results(matched_clustering_resu
                            cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
 
             clustering_images.append(fused_image)
-            print(f"帧 {frame_idx}: 检测到 {colored_result['num_clusters']} 个动态物体")
 
         # 转换为tensor格式
         clustering_tensor = torch.stack([torch.from_numpy(img) for img in clustering_images], dim=0)  # [S, H, W, 3]
@@ -675,11 +671,7 @@ def extract_and_cluster_dynamic_objects(preds, vggt_batch, conf, interval, veloc
             colored_results = visualize_clustering_results(clustering_results, num_colors=20)
 
             # 调试信息：检查聚类结果
-            print(f"总共生成了 {len(colored_results)} 帧的可视化结果")
-            for i, result in enumerate(colored_results):
-                non_black_count = np.any(result['colors'] > 0, axis=1).sum()
-                print(f"帧 {i}: 聚类数量={result['num_clusters']}, 非黑色像素数量={non_black_count}/{len(result['colors'])}")
-
+    
             # 将聚类结果与源RGB图像融合
             clustering_images = []
             for frame_idx, colored_result in enumerate(colored_results):
@@ -711,8 +703,7 @@ def extract_and_cluster_dynamic_objects(preds, vggt_batch, conf, interval, veloc
 
                 clustering_images.append(fused_image)
 
-                print(f"帧 {frame_idx}: 检测到 {colored_result['num_clusters']} 个动态物体")
-
+    
             # 转换为tensor格式
             clustering_tensor = torch.stack([torch.from_numpy(img) for img in clustering_images], dim=0)  # [S, H, W, 3]
             clustering_tensor = clustering_tensor.permute(0, 3, 1, 2)  # [S, 3, H, W]
@@ -770,25 +761,20 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
     """执行Stage2推理 - 同时运行两种模式并返回拼接结果"""
 
     # 准备输入视图（复用demo_video.py的逻辑）
-    print("Preparing input views...")
     idx = args.idx
     num_views = args.num_views
     views = dataset.__getitem__((idx, 2, num_views))
 
     # 运行Stage1推理
-    print("Running Stage1 inference...")
     start_time = time.time()
     with torch.no_grad():
         outputs, batch = inference(views, stage1_model, device)
     stage1_time = time.time() - start_time
-    print(f"Stage1 inference completed in {stage1_time:.2f} seconds")
 
     # 转换为VGGT格式的batch
-    print("Converting to VGGT batch format...")
     vggt_batch = cut3r_batch_to_vggt(views)
 
     # 运行Stage1 VGGT推理获得预测结果
-    print("Running Stage1 VGGT predictions...")
     start_time = time.time()
     with torch.no_grad():
         stage1_preds = stage1_model(
@@ -798,16 +784,12 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
             gt_images=vggt_batch["images"],
         )
     stage1_pred_time = time.time() - start_time
-    print(
-        f"Stage1 VGGT predictions completed in {stage1_pred_time:.2f} seconds")
 
     # 生成动态聚类可视化
-    print("Generating dynamic clustering visualization...")
     start_time = time.time()
 
 
     # 处理动态物体（如果有动态处理器）
-    print("Processing dynamic objects...")
     start_time = time.time()
 
     # 创建空的辅助模型字典（如果需要真实的SAM2等模型，需要额外加载）
@@ -815,17 +797,13 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
 
     try:
         # 真正的动态物体处理 - 与stage2训练过程完全一致
-        print("Processing dynamic objects using dynamic_processor...")
 
         dynamic_objects_data = stage2_trainer.dynamic_processor.process_dynamic_objects(
             stage1_preds, vggt_batch, auxiliary_models
         )
         dynamic_process_time = time.time() - start_time
-        print(
-            f"Dynamic object processing completed in {dynamic_process_time:.2f} seconds")
 
         if not dynamic_objects_data or len(dynamic_objects_data['dynamic_objects']) == 0:
-            print("No dynamic objects found, rendering static scene")
             # 如果没有动态物体，使用静态Gaussian进行渲染
             B, S, C, H, W = vggt_batch['images'].shape
 
@@ -843,8 +821,7 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
 
             # 使用静态Gaussian场景进行渲染
             static_scene = stage2_trainer.stage2_model.get_refined_scene(
-                dynamic_objects=[], # 空的动态物体列表
-                static_gaussians=dynamic_objects_data.get('static_gaussians')
+                [], dynamic_objects_data.get('static_gaussians')
             )
 
             with torch.no_grad():
@@ -868,8 +845,6 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
                 'views': views
             }
         else:
-            print(
-                f"Found {len(dynamic_objects_data['dynamic_objects'])} dynamic objects")
 
             # 准备渲染参数
             B, S, C, H, W = vggt_batch['images'].shape
@@ -888,7 +863,6 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
             ], dim=-2)
 
             # 模式1: 不使用Stage2细化，直接使用原始动态物体数据
-            print("Mode 1: Rendering without Stage2 refinement (initial values)...")
             start_time = time.time()
             initial_scene = stage2_trainer.stage2_model.get_refined_scene(
                 dynamic_objects_data['dynamic_objects'],
@@ -903,10 +877,8 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
                     image_width=W
                 )
             initial_render_time = time.time() - start_time
-            print(f"Initial rendering completed in {initial_render_time:.2f} seconds")
 
             # 模式2: 使用Stage2细化
-            print("Mode 2: Running Stage2 refinement...")
             start_time = time.time()
             with torch.no_grad():
                 refinement_results = stage2_trainer.stage2_model(
@@ -914,14 +886,12 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
                     static_gaussians=dynamic_objects_data.get('static_gaussians')
                 )
             stage2_refine_time = time.time() - start_time
-            print(f"Stage2 refinement completed in {stage2_refine_time:.2f} seconds")
 
             # 获取细化后的场景
             refined_scene = stage2_trainer.stage2_model.get_refined_scene(
                 refinement_results, dynamic_objects_data.get('static_gaussians')
             )
 
-            print("Mode 2: Rendering with Stage2 refinement...")
             start_time = time.time()
             with torch.no_grad():
                 refined_rendered_images, _ = stage2_render_loss.render_refined_scene(
@@ -932,7 +902,6 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
                     image_width=W
                 )
             refined_render_time = time.time() - start_time
-            print(f"Refined rendering completed in {refined_render_time:.2f} seconds")
 
             # 返回两种模式的结果
             rendered_images = {
@@ -963,7 +932,6 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
 
 def save_results_as_video(results, args):
     """保存结果为视频 - 拼接RGB和动态聚类结果"""
-    print("Saving concatenated results with dynamic clustering as video...")
 
     # 准备输出目录
     os.makedirs(args.output_dir, exist_ok=True)
@@ -1034,7 +1002,6 @@ def save_results_as_video(results, args):
 
             writer.append_data(combined_frame)
 
-    print(f"Enhanced comparison video with dynamic clustering saved to: {video_path}")
     return video_path
 
 
@@ -1085,8 +1052,6 @@ def run_batch_inference(dataset, stage1_model, stage2_trainer, stage2_render_los
             video_path = save_results_as_video(results, args)
             successful_videos.append(video_path)
 
-            print(f"✓ IDX {idx} completed successfully")
-            print(f"  Output: {video_path}")
             success_count += 1
 
             # 恢复原始idx
@@ -1106,7 +1071,6 @@ def run_batch_inference(dataset, stage1_model, stage2_trainer, stage2_render_los
 
         # 简短休息避免GPU过热
         if i < total_indices - 1:  # 不是最后一个
-            print("Waiting 1 second before next inference...")
             time.sleep(1)
 
         print("")

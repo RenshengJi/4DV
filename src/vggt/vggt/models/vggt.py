@@ -143,6 +143,9 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 self.gaussian_head,
                 self.depth_head,
                 self.velocity_head,
+                self.sky_head,
+                self.sky_token,
+                self.plucker_embedder,
             ],
             "old": [
                 self.aggregator,
