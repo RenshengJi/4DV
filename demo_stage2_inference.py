@@ -137,7 +137,7 @@ def load_stage1_model(model_path, device):
         img_size=518,
         patch_size=14,
         embed_dim=1024,
-        use_sky_token=False
+        use_sky_token=True
     )
 
     # 加载检查点（按照train.py中的正确方式）
@@ -779,7 +779,7 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
     with torch.no_grad():
         stage1_preds = stage1_model(
             vggt_batch["images"],
-            compute_sky_color_loss=False,
+            compute_sky_color_loss=True,  # 启用天空颜色预测
             sky_masks=vggt_batch.get("sky_masks"),
             gt_images=vggt_batch["images"],
         )
@@ -797,6 +797,29 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
 
     try:
         # 真正的动态物体处理 - 与stage2训练过程完全一致
+
+        # 应用depth_conf过滤 (confidence < 2的像素不参与处理)
+        if 'depth_conf' in stage1_preds:
+            print(f"Applying depth confidence filter (threshold=2.0)")
+            depth_conf = stage1_preds['depth_conf']  # [B, S, H, W]
+            conf_mask = depth_conf >= 1.0  # 只保留confidence >= 2的像素
+            stage1_preds['depth_conf_mask'] = conf_mask
+            print(f"Confidence filter applied: {conf_mask.float().mean().item():.3f} of pixels kept")
+        else:
+            print("No depth_conf found in predictions, skipping confidence filter")
+            stage1_preds['depth_conf_mask'] = None
+
+        # 获取天空颜色用于低opacity区域的替换
+        sky_colors = None
+        if 'pred_sky_colors' in stage1_preds:
+            sky_colors = stage1_preds['pred_sky_colors']  # [B, S, H, W, 3]
+            if sky_colors is not None:
+                sky_colors = sky_colors[0]  # [S, H, W, 3] - 取第一个batch
+                print(f"Found sky colors: {sky_colors.shape}")
+            else:
+                print("pred_sky_colors is None")
+        else:
+            print("No pred_sky_colors found in predictions")
 
         dynamic_objects_data = stage2_trainer.dynamic_processor.process_dynamic_objects(
             stage1_preds, vggt_batch, auxiliary_models
@@ -830,7 +853,8 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
                     intrinsics=intrinsics,
                     extrinsics=extrinsics,
                     image_height=H,
-                    image_width=W
+                    image_width=W,
+                    sky_colors=sky_colors
                 )
 
             # 返回结果 (没有动态物体的情况)
@@ -874,7 +898,8 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
                     intrinsics=intrinsics,
                     extrinsics=extrinsics,
                     image_height=H,
-                    image_width=W
+                    image_width=W,
+                    sky_colors=sky_colors
                 )
             initial_render_time = time.time() - start_time
 
@@ -899,7 +924,8 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
                     intrinsics=intrinsics,
                     extrinsics=extrinsics,
                     image_height=H,
-                    image_width=W
+                    image_width=W,
+                    sky_colors=sky_colors
                 )
             refined_render_time = time.time() - start_time
 
@@ -1069,10 +1095,6 @@ def run_batch_inference(dataset, stage1_model, stage2_trainer, stage2_render_los
                 print("Stopping batch inference due to error (use --continue_on_error to continue)")
                 break
 
-        # 简短休息避免GPU过热
-        if i < total_indices - 1:  # 不是最后一个
-            time.sleep(1)
-
         print("")
 
     # 输出最终统计
@@ -1128,7 +1150,7 @@ def main():
         split=None,
         ROOT=root_dir,
         img_ray_mask_p=[1.0, 0.0, 0.0],
-        valid_camera_id_list=["1"],
+        valid_camera_id_list=["1", "2", "3"],
         resolution=[(518, 378), (518, 336), (518, 294), (518, 252), (518, 210),
                     (518, 140), (378, 518), (336, 518), (294, 518), (252, 518)],
         num_views=args.num_views,

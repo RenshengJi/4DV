@@ -265,7 +265,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             sky_token = aggregated_tokens_list[-1][:, :, :1]  # [B, S,1, embed_dim]
             predictions["sky_token"] = sky_token
 
-        if compute_sky_color_loss and sky_masks is not None and gt_images is not None:
+        if compute_sky_color_loss and gt_images is not None:
             pred_extrinsics, pred_intrinsics = pose_encoding_to_extri_intri(
                 predictions["pose_enc"].detach(), (images.shape[-2], images.shape[-1])
             )

@@ -29,7 +29,7 @@ from scipy.optimize import linear_sum_assignment
 
 
 
-def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, min_samples=10, area_threshold=750):
+def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, min_samples=10, area_threshold=750, conf_mask=None):
     """
     对每一帧进行动态物体聚类
 
@@ -40,6 +40,7 @@ def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, 
         eps: DBSCAN的邻域半径
         min_samples: DBSCAN的最小样本数
         area_threshold: 面积阈值，过滤掉面积小于此值的聚类
+        conf_mask: [S, H*W] confidence掩码，True表示高置信度像素
 
     Returns:
         list: 每一帧的聚类结果，每个元素包含点云坐标和聚类标签
@@ -56,6 +57,12 @@ def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, 
 
         # 过滤动态点（速度大于阈值的点）
         dynamic_mask = velocity_magnitude > velocity_threshold
+
+        # 应用confidence掩码：只有高置信度且动态的点才参与聚类
+        if conf_mask is not None:
+            frame_conf_mask = conf_mask[frame_idx]  # [H*W]
+            dynamic_mask = dynamic_mask & frame_conf_mask  # 同时满足动态和高置信度
+
         dynamic_points = frame_points[dynamic_mask]  # [N_dynamic, 3]
         dynamic_velocities = frame_velocity[dynamic_mask]  # [N_dynamic, 3]
 
@@ -693,8 +700,8 @@ class OnlineDynamicProcessor:
 
             # ========== Stage 5: 背景分离 ==========
             background_start = time.time()
-            static_gaussians = self._create_static_background(
-                preds, velocity, matched_clustering_results, H, W, S
+            static_gaussians = self._create_static_background_from_labels(
+                preds, matched_clustering_results, H, W, S
             )
             stage_times['Stage 5: 背景分离'] = time.time() - background_start
             print(f"Stage 5: 背景分离耗时: {stage_times['Stage 5: 背景分离']:.4f}s")
@@ -813,6 +820,18 @@ class OnlineDynamicProcessor:
             else:
                 velocity_reshaped = torch.zeros(S, H*W, 3, device=self.device)
 
+            # 获取confidence掩码
+            conf_mask = None
+            if 'depth_conf_mask' in preds and preds['depth_conf_mask'] is not None:
+                conf_mask = preds['depth_conf_mask']  # [B, S, H, W]
+                if len(conf_mask.shape) == 4:
+                    conf_mask = conf_mask[0]  # [S, H, W]
+                conf_mask = conf_mask.reshape(S, H*W)  # [S, H*W]
+                conf_mask_ratio = conf_mask.float().mean().item()
+                print(f"  使用depth confidence掩码: {conf_mask_ratio:.3f} 的像素被保留")
+            else:
+                print("  未发现depth confidence掩码，使用所有像素")
+
             # 使用直接定义的动态物体聚类函数
             # 分离张量梯度以便在聚类中使用numpy
             xyz_detached = xyz.detach()
@@ -821,10 +840,11 @@ class OnlineDynamicProcessor:
             clustering_results = dynamic_object_clustering(
                 xyz_detached,  # [S, H*W, 3]
                 velocity_detached,  # [S, H*W, 3]
-                velocity_threshold=0.02,  # 速度阈值
+                velocity_threshold=0.005,  # 速度阈值
                 eps=0.01,  # DBSCAN的邻域半径
                 min_samples=10,  # DBSCAN的最小样本数
-                area_threshold=self.min_object_size  # 面积阈值
+                area_threshold=self.min_object_size,  # 面积阈值
+                conf_mask=conf_mask  # confidence掩码
             )
 
             return clustering_results
@@ -1550,6 +1570,64 @@ class OnlineDynamicProcessor:
             print(f"❌ 变换矩阵验证失败: {e}")
             return False
 
+    def _create_static_background_from_labels(
+        self,
+        preds: Dict[str, Any],
+        clustering_results: List[Dict],
+        H: int, W: int, S: int
+    ) -> torch.Tensor:
+        """直接使用动态聚类结果中的full_labels提取静态背景（标签为-1的gaussian）"""
+        try:
+            # 获取gaussian参数
+            gaussian_params = preds.get('gaussian_params')
+            if gaussian_params is None:
+                return self._create_default_static_background(H, W)
+
+            # 重新整形Gaussian参数为 [S, H*W, 14]
+            if gaussian_params.dim() == 3 and gaussian_params.shape[1] == S * H * W:
+                # [B, S*H*W, 14] -> [S, H*W, 14]
+                gaussian_params = gaussian_params[0].reshape(S, H * W, 14)
+            elif gaussian_params.dim() == 3 and gaussian_params.shape[0] == S:
+                # [S, H*W, 14] -> 已经是正确形状
+                pass
+            else:
+                # 其他情况，尝试重新整形
+                gaussian_params = gaussian_params.reshape(S, H * W, 14)
+
+            static_gaussians = []
+
+            for s, clustering_result in enumerate(clustering_results):
+                if s >= S:
+                    break
+
+                # 获取当前帧的full_labels，-1表示静态点
+                full_labels = clustering_result['labels']  # [H*W]
+
+                # 创建静态mask（标签为-1的点）
+                static_mask = full_labels == -1  # [H*W]
+
+                # 获取当前帧的gaussian参数
+                frame_gaussians = gaussian_params[s]  # [H*W, 14]
+
+                # 提取静态gaussian
+                static_frame_gaussians = frame_gaussians[static_mask]  # [N_static, 14]
+
+                static_gaussians.append(static_frame_gaussians)
+
+            # 合并所有帧的静态gaussian
+            if static_gaussians:
+                static_gaussians = torch.cat(static_gaussians, dim=0)
+            else:
+                static_gaussians = torch.empty(0, 14, device=self.device)
+
+            print(f"    提取静态背景: {static_gaussians.shape[0]} 个静态gaussian")
+            return static_gaussians
+
+        except Exception as e:
+            print(f"❌ 从labels提取静态背景失败: {e}")
+            # 回退到默认方法
+            return self._create_default_static_background(H, W)
+
     def _create_static_background(
         self,
         preds: Dict[str, Any],
@@ -1618,12 +1696,22 @@ class OnlineDynamicProcessor:
 
             # Step 4: 计算静态区域掩码
             step4_start = time.time()
-            velocity_threshold = 0.02  # 速度阈值
+            velocity_threshold = 0.003  # 速度阈值
             static_velocity_mask = velocity_magnitude <= velocity_threshold  # 低速度区域
             static_object_mask = ~dynamic_mask_all  # 非动态物体区域
 
-            # 静态区域 = 低速度 AND 非动态物体
+            # 静态区域 = 低速度 AND 非动态物体 AND 高置信度
             static_mask = static_velocity_mask # & static_object_mask  # [S, H*W]
+
+            # 应用confidence掩码：只有高置信度的像素才能成为静态背景
+            if 'depth_conf_mask' in preds and preds['depth_conf_mask'] is not None:
+                conf_mask = preds['depth_conf_mask']  # [B, S, H, W]
+                if len(conf_mask.shape) == 4:
+                    conf_mask = conf_mask[0]  # [S, H, W]
+                conf_mask = conf_mask.reshape(S, H*W)  # [S, H*W]
+                static_mask = static_mask & conf_mask
+                print(f"  静态背景应用confidence掩码: {conf_mask.float().mean().item():.3f} 的像素被保留")
+
             stage5_times['Step 4: 计算静态区域掩码'] = time.time() - step4_start
 
             # Step 5: 收集所有静态Gaussians
@@ -1647,7 +1735,7 @@ class OnlineDynamicProcessor:
             # Step 6: 下采样和去重处理
             step6_start = time.time()
             downsampled_static_gaussians = self._downsample_static_gaussians(
-                all_static_gaussians, max_points=50000000, spatial_threshold=0.0001
+                all_static_gaussians, max_points=50000000, spatial_threshold=0.001
             )
             stage5_times['Step 6: 下采样和去重处理'] = time.time() - step6_start
 

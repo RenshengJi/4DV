@@ -196,18 +196,20 @@ class Stage2RenderLoss(nn.Module):
         intrinsics: torch.Tensor,
         extrinsics: torch.Tensor,
         image_height: int,
-        image_width: int
+        image_width: int,
+        sky_colors: Optional[torch.Tensor] = None
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """
         仅渲染细化后的场景，返回rendered_images和rendered_depths
-        
+
         Args:
             refined_scene: 细化后的场景表示
             intrinsics: [B, S, 3, 3] 相机内参
             extrinsics: [B, S, 4, 4] 相机外参
             image_height: 图像高度
             image_width: 图像宽度
-            
+            sky_colors: [S, H, W, 3] 天空颜色，用于替换低opacity区域 (可选)
+
         Returns:
             rendered_images: List[torch.Tensor] 渲染的RGB图像列表
             rendered_depths: List[torch.Tensor] 渲染的深度图列表
@@ -220,11 +222,16 @@ class Stage2RenderLoss(nn.Module):
         for frame_idx in range(S):
             frame_intrinsic = intrinsics[0, frame_idx]  # [3, 3]
             frame_extrinsic = extrinsics[0, frame_idx]  # [4, 4]
-            
+
+            # 获取当前帧的天空颜色
+            frame_sky_colors = None
+            if sky_colors is not None:
+                frame_sky_colors = sky_colors[frame_idx]  # [H, W, 3]
+
             # 渲染当前帧
             rendered_rgb, rendered_depth = self._render_frame(
-                refined_scene, frame_intrinsic, frame_extrinsic, 
-                image_height, image_width, frame_idx
+                refined_scene, frame_intrinsic, frame_extrinsic,
+                image_height, image_width, frame_idx, frame_sky_colors
             )
             rendered_images.append(rendered_rgb)
             rendered_depths.append(rendered_depth)
@@ -238,7 +245,8 @@ class Stage2RenderLoss(nn.Module):
         extrinsic: torch.Tensor,
         height: int,
         width: int,
-        frame_idx: int = 0
+        frame_idx: int = 0,
+        sky_colors: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         渲染单帧图像
@@ -249,6 +257,7 @@ class Stage2RenderLoss(nn.Module):
             extrinsic: [4, 4] 相机外参
             height, width: 图像尺寸
             frame_idx: 当前帧索引
+            sky_colors: [H, W, 3] 天空颜色 (可选)
 
         Returns:
             rendered_rgb: [3, H, W] 渲染的RGB图像
@@ -365,7 +374,7 @@ class Stage2RenderLoss(nn.Module):
                 rendered_rgb = torch.zeros(3, height, width, device=device)
                 rendered_depth = torch.zeros(height, width, device=device)
             else:
-                rendered_image, _, rendered_depth_raw = render_result
+                rendered_image, rendered_alphas, rendered_depth_raw = render_result
 
                 if rendered_image is None or rendered_depth_raw is None:
                     print(
@@ -378,8 +387,16 @@ class Stage2RenderLoss(nn.Module):
                     try:
                         rendered_rgb = rendered_image[0, ..., :3].permute(
                             2, 0, 1)  # [3, H, W]
+
+                        # 应用天空替换：对opacity < 0.01的区域使用sky_colors
+                        if sky_colors is not None and rendered_alphas is not None:
+                            rendered_rgb = self._apply_sky_replacement(
+                                rendered_rgb, sky_colors, rendered_alphas, opacity_threshold=0.8
+                            )
+
                         # 限制RGB颜色值在[0, 1]范围内
                         rendered_rgb = torch.clamp(rendered_rgb, 0.0, 1.0)
+
                     except Exception as e:
                         rendered_rgb = torch.zeros(
                             3, height, width, device=device)
@@ -433,6 +450,71 @@ class Stage2RenderLoss(nn.Module):
             rendered_depth = torch.zeros(height, width, device=device)
 
         return rendered_rgb, rendered_depth
+
+    def _apply_sky_replacement(
+        self,
+        rendered_rgb: torch.Tensor,
+        sky_colors: torch.Tensor,
+        rendered_alphas: torch.Tensor,
+        opacity_threshold: float = 0.01
+    ) -> torch.Tensor:
+        """
+        对渲染图像的低opacity区域应用天空颜色替换
+
+        Args:
+            rendered_rgb: [3, H, W] 渲染的RGB图像
+            sky_colors: [H, W, 3] 天空颜色
+            rendered_alphas: [..., C, H, W, 1] 渲染的alpha值
+            opacity_threshold: opacity阈值，小于此值的区域将被替换
+
+        Returns:
+            torch.Tensor: [3, H, W] 替换天空后的RGB图像
+        """
+        try:
+            # 提取alpha通道 [..., C, H, W, 1] -> [H, W]
+            if len(rendered_alphas.shape) == 5:
+                alpha = rendered_alphas[0, 0, :, :, 0]  # [H, W]
+            elif len(rendered_alphas.shape) == 4:
+                alpha = rendered_alphas[0, :, :, 0]  # [H, W]
+            elif len(rendered_alphas.shape) == 3:
+                alpha = rendered_alphas[:, :, 0]  # [H, W]
+            else:
+                alpha = rendered_alphas.squeeze()  # 尝试去掉多余维度
+
+            # 确保alpha是[H, W]格式
+            if alpha.dim() != 2:
+                print(f"Warning: Unexpected alpha dimensions: {alpha.shape}")
+                return rendered_rgb
+
+            # 创建低opacity掩码
+            low_opacity_mask = alpha < opacity_threshold  # [H, W]
+
+            # 如果没有低opacity区域，直接返回原图
+            if not low_opacity_mask.any():
+                return rendered_rgb
+
+            # 转换天空颜色格式 [H, W, 3] -> [3, H, W]
+            sky_colors_chw = sky_colors.permute(2, 0, 1)  # [3, H, W]
+
+            # 确保在同一设备上
+            sky_colors_chw = sky_colors_chw.to(rendered_rgb.device)
+            low_opacity_mask = low_opacity_mask.to(rendered_rgb.device)
+
+            # 应用天空替换：在低opacity区域使用天空颜色
+            result = rendered_rgb.clone()
+            result[:, low_opacity_mask] = sky_colors_chw[:, low_opacity_mask]
+
+            # 统计替换的像素数量
+            replaced_pixels = low_opacity_mask.sum().item()
+            total_pixels = low_opacity_mask.numel()
+            replacement_ratio = replaced_pixels / total_pixels
+            print(f"  天空替换: {replaced_pixels}/{total_pixels} ({replacement_ratio:.3f}) 像素被替换 (opacity < {opacity_threshold})")
+
+            return result
+
+        except Exception as e:
+            print(f"Warning: Sky replacement failed: {e}")
+            return rendered_rgb
 
     def _object_exists_in_frame(self, obj_data: Dict, frame_idx: int) -> bool:
         """检查动态物体是否在指定帧中存在"""

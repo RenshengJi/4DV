@@ -310,16 +310,7 @@ def generate_velocity_map(model_preds, vggt_batch, device):
         # 按照loss.py中cross_render_and_loss的方法实现velocity可视化
         from dust3r.utils.image import scene_flow_to_rgb
 
-        # velocity_img_forward = scene_flow_to_rgb(velocity.reshape(S, H, W, 3), 0.03).permute(0, 3, 1, 2)
         velocity_img_forward = scene_flow_to_rgb(velocity_xyz.reshape(S, H, W, 3), 0.01).permute(0, 3, 1, 2)
-
-        # 也可以生成backward velocity用于对比（loss.py中的做法）
-        # velocity_img_backward = scene_flow_to_rgb(-velocity_xyz.reshape(S, H, W, 3), 0.03).permute(0, 3, 1, 2)
-
-        # 这里我们使用forward velocity作为主要的velocity map
-        # 如果需要concatenate forward和backward，可以按照loss.py中的方式：
-        # velocity_img = torch.cat([velocity_img_forward[:S-interval], velocity_img_backward[interval:]], dim=0)
-        # 但在推理中我们直接使用forward velocity
 
         return velocity_img_forward  # [S, 3, H, W]
 
@@ -855,7 +846,7 @@ def main():
         split=None,
         ROOT=root_dir,
         img_ray_mask_p=[1.0, 0.0, 0.0],
-        valid_camera_id_list=["1"],
+        valid_camera_id_list=["1","2","3"],
         resolution=[(518, 378), (518, 336), (518, 294), (518, 252), (518, 210),
                     (518, 140), (378, 518), (336, 518), (294, 518), (252, 518)],
         num_views=args.num_views,
