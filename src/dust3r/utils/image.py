@@ -534,7 +534,7 @@ def scene_flow_to_rgb(
 
     if background == "dark":
         parameters = ColorizationArgs(
-            move_hue_on_V_axis, move_hue_on_S_axis, op.array([255.0, 255.0, 255.0])
+            move_hue_on_V_axis, move_hue_on_S_axis, op.tensor([255.0, 255.0, 255.0]) if backend == "torch" else op.array([255.0, 255.0, 255.0])
         )
     else:
         parameters = ColorizationArgs(move_hue_on_S_axis, move_hue_on_V_axis, op.zeros(3))

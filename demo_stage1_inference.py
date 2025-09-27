@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Stage1推理代码 - 输出GT、self_render、velocitymap、skycolor四张拼接图片的视频
+Stage1推理代码 - 输出GT、self_render、velocitymap、gt_velocitymap、skycolor五张拼接图片的视频
 基于demo_stage2_inference.py的数据读取方式和输出格式
+支持GT velocity map生成，使用光流模型计算前向光流结合GT depth
 """
 import os
 import numpy as np
@@ -28,6 +29,11 @@ import torch.multiprocessing
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 
+# 导入光流相关模块
+sys.path.append(os.path.join(os.path.dirname(__file__), "src/SEA-RAFT/core"))
+from raft import RAFT
+from vggt.utils.auxiliary import RAFTCfg, calc_flow
+
 torch.multiprocessing.set_sharing_strategy("file_system")
 
 printer = get_logger(__name__, log_level="DEBUG")
@@ -44,13 +50,19 @@ def parse_args():
     parser.add_argument(
         "--model_path",
         type=str,
-        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(true+fixmodel+lowlr!+nolpips+onlyflow+velocitylocal+fromscratch)/checkpoint-epoch_2_17880.pth",
+        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_online_unfreeze+newsky+highvelocity+flownosky+gt+fixedextrinsic+detach/checkpoint-epoch_2_9765.pth",
         help="Path to the Stage1 model checkpoint",
+    )
+    parser.add_argument(
+        "--flow_model_path",
+        type=str,
+        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/Tartan-C-T-TSKH-kitti432x960-M.pth",
+        help="Path to the RAFT flow model checkpoint",
     )
     parser.add_argument(
         "--seq_dir",
         type=str,
-        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/test/segment-11717495969710734380_2440_000_2460_000_with_camera_labels",
+        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train/segment-15795616688853411272_1245_000_1265_000_with_camera_labels",
         help="Path to the sequence directory or video file",
     )
     parser.add_argument(
@@ -62,7 +74,7 @@ def parse_args():
     parser.add_argument(
         "--idx",
         type=int,
-        default=0,
+        default=1600,
         help="Index of the sequence to process (for single inference)",
     )
     parser.add_argument(
@@ -74,7 +86,7 @@ def parse_args():
     parser.add_argument(
         "--num_views",
         type=int,
-        default=24,
+        default=8,
         help="Number of views for inference",
     )
 
@@ -87,7 +99,7 @@ def parse_args():
     parser.add_argument(
         "--start_idx",
         type=int,
-        default=150,
+        default=1600,
         help="Starting index for batch inference",
     )
     parser.add_argument(
@@ -133,6 +145,49 @@ def load_stage1_model(model_path, device):
 
     print("Stage1 model loaded successfully")
     return model
+
+
+def load_flow_model(flow_model_path, device):
+    """加载RAFT光流模型，参考demo_stage1_inference_for_velocity.py中的加载方式"""
+    print(f"Loading RAFT flow model from {flow_model_path}...")
+
+    # 创建RAFT配置，使用RAFTCfg的正确参数
+    flow_cfg = RAFTCfg(
+        name="kitti-M",
+        dataset="kitti",
+        path=flow_model_path,
+        use_var=True,
+        var_min=0,
+        var_max=10,
+        pretrain="resnet34",
+        initial_dim=64,
+        block_dims=[64, 128, 256],
+        radius=4,
+        dim=128,
+        num_blocks=2,
+        iters=4,
+        image_size=[432, 960],
+        offload=False,
+        geo_thresh=2,
+        photo_thresh=-1
+    )
+
+    # 创建RAFT模型
+    flow_model = RAFT(flow_cfg)
+
+    # 加载权重
+    if os.path.exists(flow_model_path):
+        state_dict = torch.load(flow_model_path, map_location="cpu", weights_only=True)
+        missing_keys, unexpected_keys = flow_model.load_state_dict(state_dict, strict=False)
+        if missing_keys or unexpected_keys:
+            print(f"Warning: Missing keys: {missing_keys}, Unexpected keys: {unexpected_keys}")
+
+    flow_model.to(device)
+    flow_model.eval()
+    flow_model.requires_grad_(False)
+
+    print("RAFT flow model loaded successfully")
+    return flow_model
 
 
 def generate_self_render_images(model_preds, vggt_batch, device, sky_color_images=None, opacity_threshold=0.05):
@@ -307,6 +362,10 @@ def generate_velocity_map(model_preds, vggt_batch, device):
         # 应用与训练代码相同的速度变换
         velocity_xyz = torch.sign(velocity_xyz) * (torch.exp(torch.abs(velocity_xyz)) - 1)
 
+        # 坐标系调整一下(x=z, y=x, z=-y)
+        velocity_xyz = velocity_xyz[:, :, :, [2, 0, 1]]
+        velocity_xyz[:, :, :, 2] = -velocity_xyz[:, :, :, 2]
+
         # 按照loss.py中cross_render_and_loss的方法实现velocity可视化
         from dust3r.utils.image import scene_flow_to_rgb
 
@@ -316,6 +375,91 @@ def generate_velocity_map(model_preds, vggt_batch, device):
 
     except Exception as e:
         print(f"Error in generate_velocity_map: {e}")
+        import traceback
+        traceback.print_exc()
+        B, S, C, H, W = vggt_batch["images"].shape
+        return torch.zeros(S, 3, H, W, device=device)
+
+
+def generate_gt_velocity_map(vggt_batch, device, flow_model):
+    """
+    生成GT velocity map可视化
+    使用光流模型计算前向光流，结合GT depth生成GT velocity
+    """
+    try:
+        # 导入必要的模块
+        from vggt.training.loss import warp_pts3d_for_gt_velocity, depth_to_world_points
+        from dust3r.utils.image import scene_flow_to_rgb
+        from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+
+        print("Computing GT velocity map...")
+
+        images = vggt_batch["images"]  # [B, S, 3, H, W]
+        B, S, C, H, W = images.shape
+
+        # 计算光流
+        print("Computing optical flow...")
+        forward_flow, backward_flow, forward_consist_mask, _, _, _ = calc_flow(
+            images, flow_model,
+            check_consistency=True,
+            geo_thresh=2,
+            photo_thresh=-1,
+            return_heatmap=False
+        )
+
+        # 获取GT数据
+        depths = vggt_batch.get('depths')  # [B, S, H, W]
+        intrinsics = vggt_batch.get('intrinsics')  # [B, S, 3, 3]
+        extrinsics = vggt_batch.get('extrinsics')  # [B, S, 4, 4]
+        point_masks = vggt_batch.get('point_masks')  # [B, S, H, W]
+
+        if depths is None or intrinsics is None or extrinsics is None:
+            print("Warning: Missing GT data for velocity computation")
+            return torch.zeros(S, 3, H, W, device=device)
+
+        if point_masks is None:
+            print("Warning: No point masks available, using all pixels")
+            point_masks = torch.ones(B, S, H, W, device=device, dtype=torch.bool)
+
+        print("Converting depth to world points...")
+        # 参考flow_loss中的正确实现
+        gt_depth_reshaped = depths.view(depths.shape[0]*depths.shape[1], depths.shape[2], depths.shape[3], 1)
+        gt_world_points = depth_to_world_points(gt_depth_reshaped, intrinsics)
+        gt_world_points = gt_world_points.view(gt_world_points.shape[0], gt_world_points.shape[1]*gt_world_points.shape[2], 3)
+
+        extrinsic_inv = torch.linalg.inv(extrinsics)
+        gt_xyz = torch.matmul(extrinsic_inv[0, :, :3, :3], gt_world_points.transpose(-1, -2)).transpose(-1, -2) + \
+            extrinsic_inv[0, :, :3, 3:4].transpose(-1, -2)
+
+        gt_gaussian_means = gt_xyz.reshape(B, S, H, W, 3).permute(0, 1, 4, 2, 3).contiguous()
+
+        print("Computing GT velocity from optical flow...")
+        # 计算GT velocity
+        gt_fwd_vel, gt_fwd_mask = warp_pts3d_for_gt_velocity(
+            gt_gaussian_means, point_masks,
+            forward_flow, forward_consist_mask,
+            direction="forward", interval=1
+        )
+
+        # 提取第一个batch的速度 [S, 3, H, W]
+        velocity_xyz = gt_fwd_vel[0]  # [S, 3, H, W]
+
+        # 转换为 [S, H, W, 3] 格式用于可视化
+        velocity_xyz = velocity_xyz.permute(0, 2, 3, 1)  # [S, H, W, 3]
+
+        # 坐标系调整一下(x=z, y=x, z=-y)
+        velocity_xyz = velocity_xyz[:, :, :, [2, 0, 1]]
+        velocity_xyz[:, :, :, 2] = -velocity_xyz[:, :, :, 2]
+
+        print("Generating velocity visualization...")
+        # 按照loss.py中的方法实现velocity可视化
+        velocity_img_forward = scene_flow_to_rgb(velocity_xyz, 0.01).permute(0, 3, 1, 2)
+
+        print(f"GT velocity map generated with shape: {velocity_img_forward.shape}")
+        return velocity_img_forward  # [S, 3, H, W]
+
+    except Exception as e:
+        print(f"Error in generate_gt_velocity_map: {e}")
         import traceback
         traceback.print_exc()
         B, S, C, H, W = vggt_batch["images"].shape
@@ -454,120 +598,84 @@ def fix_views_data_types(views, device):
 
 def safe_cut3r_batch_to_vggt(views, device):
     """
-    安全版本的cut3r_batch_to_vggt，避免维度不匹配的问题
+    参考src/train.py中cut3r_batch_to_vggt的正确实现
     """
     try:
         from dust3r.utils.misc import tf32_off
 
         print(f"Processing {len(views)} views")
 
-        # 收集所有的tensor
-        imgs = []
-        depths = []
-        intrinsics = []
-        extrinsics = []
-        point_masks = []
-        world_points = []
+        # 按照train.py的方式构建：先构建[S, B, ...]格式
+        imgs = [v['img'] for v in views]  # List of [B,3,H,W]
+        imgs = torch.stack(imgs, dim=0)  # [S,B,3,H,W]
 
-        for i, view in enumerate(views):
-            # 处理图像
-            img = view.get('img')
-            if img is not None:
-                if img.dim() == 3:  # [3, H, W] -> [1, 3, H, W]
-                    img = img.unsqueeze(0)
-                imgs.append(img)
-                print(f"View {i} img shape: {img.shape}")
+        vggt_batch = {
+            'images': imgs * 0.5 + 0.5,  # [S,B,3,H,W], 归一化到[0,1]
+            'depths': torch.stack([v['depthmap'] for v in views], dim=0) if 'depthmap' in views[0] else None,
+            'intrinsics': torch.stack([v['camera_intrinsics'] for v in views], dim=0) if 'camera_intrinsics' in views[0] else None,
+            'extrinsics': torch.stack([v['camera_pose'] for v in views], dim=0) if 'camera_pose' in views[0] else None,
+            'point_masks': torch.stack([v['valid_mask'] for v in views], dim=0) if 'valid_mask' in views[0] else None,
+            'world_points': torch.stack([v['pts3d'] for v in views], dim=0) if 'pts3d' in views[0] else None,
+        }
 
-            # 处理其他数据
-            if 'depthmap' in view and view['depthmap'] is not None:
-                depths.append(view['depthmap'])
+        print(f"Initial shapes - images: {vggt_batch['images'].shape}")
+        if vggt_batch['depths'] is not None:
+            print(f"depths: {vggt_batch['depths'].shape}")
+        if vggt_batch['world_points'] is not None:
+            print(f"world_points: {vggt_batch['world_points'].shape}")
 
-            if 'camera_intrinsics' in view and view['camera_intrinsics'] is not None:
-                intrinsics.append(view['camera_intrinsics'])
+        # 执行坐标转换和非metric化（如果有必要的数据）
+        with tf32_off(), torch.amp.autocast("cuda", enabled=False):
+            # 转换world points的坐标系到第一帧相机坐标系
+            if vggt_batch['world_points'] is not None:
+                # 检查维度并添加batch维度（如果需要）
+                if vggt_batch['world_points'].dim() == 4:  # [S, H, W, 3]
+                    vggt_batch['world_points'] = vggt_batch['world_points'].unsqueeze(1)  # [S, 1, H, W, 3]
+                    vggt_batch['depths'] = vggt_batch['depths'].unsqueeze(1) if vggt_batch['depths'] is not None else None
+                    vggt_batch['intrinsics'] = vggt_batch['intrinsics'].unsqueeze(1) if vggt_batch['intrinsics'] is not None else None
+                    vggt_batch['extrinsics'] = vggt_batch['extrinsics'].unsqueeze(1) if vggt_batch['extrinsics'] is not None else None
+                    vggt_batch['point_masks'] = vggt_batch['point_masks'].unsqueeze(1) if vggt_batch['point_masks'] is not None else None
+                    print(f"Added batch dimension - world_points: {vggt_batch['world_points'].shape}")
 
-            if 'camera_pose' in view and view['camera_pose'] is not None:
-                extrinsics.append(view['camera_pose'])
-
-            if 'valid_mask' in view and view['valid_mask'] is not None:
-                point_masks.append(view['valid_mask'])
-
-            if 'pts3d' in view and view['pts3d'] is not None:
-                world_points.append(view['pts3d'])
-
-        # 构建vggt_batch
-        vggt_batch = {}
-
-        # 处理图像 - 应该是 [1, S, 3, H, W]
-        if imgs:
-            imgs_tensor = torch.stack(imgs, dim=0)  # [S, 1, 3, H, W]
-            imgs_tensor = imgs_tensor.squeeze(1)    # [S, 3, H, W]
-            imgs_tensor = imgs_tensor.unsqueeze(0)  # [1, S, 3, H, W]
-            vggt_batch['images'] = imgs_tensor * 0.5 + 0.5  # 归一化到[0,1]
-            print(f"Final images shape: {vggt_batch['images'].shape}")
-
-        # 处理深度
-        if depths:
-            depths_tensor = torch.stack(depths, dim=0)  # [S, H, W]
-            vggt_batch['depths'] = depths_tensor.unsqueeze(0)  # [1, S, H, W]
-            print(f"Depths shape: {vggt_batch['depths'].shape}")
-        else:
-            vggt_batch['depths'] = None
-
-        # 处理内参
-        if intrinsics:
-            intrinsics_tensor = torch.stack(intrinsics, dim=0)  # [S, 3, 3]
-            vggt_batch['intrinsics'] = intrinsics_tensor.unsqueeze(0)  # [1, S, 3, 3]
-            print(f"Intrinsics shape: {vggt_batch['intrinsics'].shape}")
-        else:
-            vggt_batch['intrinsics'] = None
-
-        # 处理外参
-        if extrinsics:
-            extrinsics_tensor = torch.stack(extrinsics, dim=0)  # [S, 4, 4]
-            vggt_batch['extrinsics'] = extrinsics_tensor.unsqueeze(0)  # [1, S, 4, 4]
-            print(f"Extrinsics shape: {vggt_batch['extrinsics'].shape}")
-        else:
-            vggt_batch['extrinsics'] = None
-
-        # 处理点掩码
-        if point_masks:
-            masks_tensor = torch.stack(point_masks, dim=0)  # [S, H, W]
-            vggt_batch['point_masks'] = masks_tensor.unsqueeze(0)  # [1, S, H, W]
-            print(f"Point masks shape: {vggt_batch['point_masks'].shape}")
-        else:
-            vggt_batch['point_masks'] = None
-
-        # 处理世界坐标点
-        if world_points:
-            points_tensor = torch.stack(world_points, dim=0)  # [S, H, W, 3]
-            vggt_batch['world_points'] = points_tensor.unsqueeze(0)  # [1, S, H, W, 3]
-            print(f"World points shape: {vggt_batch['world_points'].shape}")
-        else:
-            vggt_batch['world_points'] = None
-
-        # 执行坐标转换（如果有必要的数据）
-        if vggt_batch['world_points'] is not None and vggt_batch['extrinsics'] is not None:
-            with tf32_off(), torch.amp.autocast("cuda", enabled=False):
-                print("Performing coordinate transformation...")
                 B, S, H, W, _ = vggt_batch['world_points'].shape
-                print(f"world_points shape for transformation: B={B}, S={S}, H={H}, W={W}")
+                world_points = vggt_batch['world_points'].reshape(B, S, H*W, 3)
+                world_points = torch.matmul(torch.linalg.inv(vggt_batch['extrinsics'][0])[:, :3, :3], world_points.transpose(-1, -2)).transpose(-1, -2) + \
+                                           torch.linalg.inv(vggt_batch['extrinsics'][0])[:, :3, 3:4].transpose(-1, -2)
+                vggt_batch['world_points'] = world_points.reshape(B, S, H, W, 3)
 
-                world_points_reshaped = vggt_batch['world_points'].reshape(B, S, H*W, 3)
-                extrinsics_inv = torch.linalg.inv(vggt_batch['extrinsics'])
-
-                # 转换到第一帧坐标系
-                transformed_points = torch.matmul(
-                    extrinsics_inv[0, :, :3, :3],
-                    world_points_reshaped.transpose(-1, -2)
-                ).transpose(-1, -2) + extrinsics_inv[0, :, :3, 3:4].transpose(-1, -2)
-
-                vggt_batch['world_points'] = transformed_points.reshape(B, S, H, W, 3)
-
-                # 转换外参
+                # 转换extrinsics的坐标系到第一帧相机坐标系
                 vggt_batch['extrinsics'] = torch.matmul(
-                    extrinsics_inv,
-                    vggt_batch['extrinsics'][0]
-                )
+                        torch.linalg.inv(vggt_batch['extrinsics']),
+                        vggt_batch['extrinsics'][0]
+                    )
+
+                # 将extrinsics(中的T)以及world_points、depth进行非metric化
+                world_points_flatten = vggt_batch['world_points'].reshape(-1, 3)
+                world_points_mask_flatten = vggt_batch['point_masks'].reshape(-1) if vggt_batch['point_masks'] is not None else torch.ones_like(world_points_flatten[:, 0], dtype=torch.bool)
+                dist_avg = world_points_flatten[world_points_mask_flatten].norm(dim=-1).mean()
+                depth_scale_factor = 1 / dist_avg
+                pose_scale_factor = depth_scale_factor
+
+                print(f"Applying non-metric normalization with scale factor: {depth_scale_factor:.6f}")
+
+                # 应用非metric化
+                vggt_batch['depths'] = vggt_batch['depths'] * depth_scale_factor
+                vggt_batch['extrinsics'][:, :, :3, 3] = vggt_batch['extrinsics'][:, :, :3, 3] * pose_scale_factor
+                vggt_batch['world_points'] = vggt_batch['world_points'] * depth_scale_factor
+
+        # 转置到[B, S, ...]格式
+        vggt_batch['images'] = vggt_batch['images'].permute(1, 0, 2, 3, 4).contiguous()
+        vggt_batch['depths'] = vggt_batch['depths'].permute(1, 0, 2, 3).contiguous() if vggt_batch['depths'] is not None else None
+        vggt_batch['intrinsics'] = vggt_batch['intrinsics'].permute(1, 0, 2, 3).contiguous() if vggt_batch['intrinsics'] is not None else None
+        vggt_batch['extrinsics'] = vggt_batch['extrinsics'].permute(1, 0, 2, 3).contiguous() if vggt_batch['extrinsics'] is not None else None
+        vggt_batch['point_masks'] = vggt_batch['point_masks'].permute(1, 0, 2, 3).contiguous() if vggt_batch['point_masks'] is not None else None
+        vggt_batch['world_points'] = vggt_batch['world_points'].permute(1, 0, 2, 3, 4).contiguous() if vggt_batch['world_points'] is not None else None
+
+        print(f"Final shapes - images: {vggt_batch['images'].shape}")
+        if vggt_batch['depths'] is not None:
+            print(f"depths: {vggt_batch['depths'].shape}")
+        if vggt_batch['world_points'] is not None:
+            print(f"world_points: {vggt_batch['world_points'].shape}")
 
         print("Safe VGGT batch conversion completed successfully")
         return vggt_batch
@@ -579,8 +687,8 @@ def safe_cut3r_batch_to_vggt(views, device):
         raise e
 
 
-def run_stage1_inference(dataset, stage1_model, device, args):
-    """执行Stage1推理 - 生成GT、self_render、velocitymap、skycolor四种图像"""
+def run_stage1_inference(dataset, stage1_model, flow_model, device, args):
+    """执行Stage1推理 - 生成GT、self_render、velocitymap、gt_velocitymap、skycolor五种图像"""
 
     # 准备输入视图
     print("Preparing input views...")
@@ -654,17 +762,23 @@ def run_stage1_inference(dataset, stage1_model, device, args):
     velocity_map = generate_velocity_map(stage1_preds, vggt_batch, device)
     print(f"Velocity map generation completed in {time.time() - start_time:.2f} seconds")
 
+    print("Generating GT velocity map...")
+    start_time = time.time()
+    gt_velocity_map = generate_gt_velocity_map(vggt_batch, device, flow_model)
+    print(f"GT velocity map generation completed in {time.time() - start_time:.2f} seconds")
+
     return {
         'gt_images': gt_images,
         'self_render_images': self_render_images,
         'velocity_map': velocity_map,
+        'gt_velocity_map': gt_velocity_map,
         'sky_color_images': sky_color_images,
         'views': views
     }
 
 
 def save_results_as_video(results, args):
-    """保存结果为视频 - 拼接GT、self_render、velocitymap、skycolor四张图片"""
+    """保存结果为视频 - 拼接GT、self_render、velocitymap、gt_velocitymap、skycolor五张图片"""
     print("Saving concatenated results as video...")
 
     # 准备输出目录
@@ -673,6 +787,7 @@ def save_results_as_video(results, args):
     gt_images = results['gt_images']  # [S, 3, H, W]
     self_render_images = results['self_render_images']  # [S, 3, H, W]
     velocity_map = results['velocity_map']  # [S, 3, H, W]
+    gt_velocity_map = results['gt_velocity_map']  # [S, 3, H, W]
     sky_color_images = results['sky_color_images']  # [S, 3, H, W]
     views = results['views']
 
@@ -684,9 +799,10 @@ def save_results_as_video(results, args):
     gt_images_np = to_uint8(gt_images)
     self_render_images_np = to_uint8(self_render_images)
     velocity_map_np = to_uint8(velocity_map)
+    gt_velocity_map_np = to_uint8(gt_velocity_map)
     sky_color_images_np = to_uint8(sky_color_images)
 
-    # 创建视频 - 四列比较：GT | Self-Render | Velocity Map | Sky Color
+    # 创建视频 - 五列比较：GT | Self-Render | Velocity Map | GT Velocity | Sky Color
     video_path = os.path.join(
         args.output_dir, f"stage1_inference_{args.idx}_{views[0]['label'].split('.')[0]}.mp4")
 
@@ -698,6 +814,7 @@ def save_results_as_video(results, args):
             gt_img = gt_images_np[frame_idx].transpose(1, 2, 0)  # [H, W, 3]
             self_render_img = self_render_images_np[frame_idx].transpose(1, 2, 0)  # [H, W, 3]
             velocity_img = velocity_map_np[frame_idx].transpose(1, 2, 0)  # [H, W, 3]
+            gt_velocity_img = gt_velocity_map_np[frame_idx].transpose(1, 2, 0)  # [H, W, 3]
             sky_color_img = sky_color_images_np[frame_idx].transpose(1, 2, 0)  # [H, W, 3]
 
             # 添加标题
@@ -710,12 +827,13 @@ def save_results_as_video(results, args):
             gt_img = add_title(gt_img, "GT")
             self_render_img = add_title(self_render_img, "Self-Render")
             velocity_img = add_title(velocity_img, "Velocity Map")
+            gt_velocity_img = add_title(gt_velocity_img, "GT Velocity")
             sky_color_img = add_title(sky_color_img, "Sky Color")
 
-            # 水平拼接四个图像
+            # 水平拼接五个图像
             combined_frame = np.concatenate([
-                gt_img, self_render_img, velocity_img, sky_color_img
-            ], axis=1)  # [H, W*4, 3]
+                gt_img, self_render_img, velocity_img, gt_velocity_img, sky_color_img
+            ], axis=1)  # [H, W*5, 3]
 
             writer.append_data(combined_frame)
 
@@ -723,7 +841,7 @@ def save_results_as_video(results, args):
     return video_path
 
 
-def run_batch_inference(dataset, stage1_model, device, args):
+def run_batch_inference(dataset, stage1_model, flow_model, device, args):
     """运行批量推理"""
     print("=" * 60)
     print("STARTING BATCH INFERENCE")
@@ -761,7 +879,7 @@ def run_batch_inference(dataset, stage1_model, device, args):
 
             # 运行单次推理
             with tf32_off():
-                results = run_stage1_inference(dataset, stage1_model, device, args)
+                results = run_stage1_inference(dataset, stage1_model, flow_model, device, args)
 
             # 保存结果
             video_path = save_results_as_video(results, args)
@@ -858,14 +976,18 @@ def main():
     # 加载模型
     print("Loading Stage1 model...")
     stage1_model = load_stage1_model(args.model_path, device)
-    print("Model loaded successfully!\n")
+    print("Stage1 model loaded successfully!")
+
+    print("Loading flow model...")
+    flow_model = load_flow_model(args.flow_model_path, device)
+    print("Flow model loaded successfully!\n")
 
     # 创建输出目录
     os.makedirs(args.output_dir, exist_ok=True)
 
     if args.batch_mode:
         # 批量推理模式
-        batch_results = run_batch_inference(dataset, stage1_model, device, args)
+        batch_results = run_batch_inference(dataset, stage1_model, flow_model, device, args)
 
         print(f"Batch inference completed!")
         if batch_results['successful_videos']:
@@ -876,7 +998,7 @@ def main():
         print(f"Running single inference for IDX {args.idx}")
 
         with tf32_off():
-            results = run_stage1_inference(dataset, stage1_model, device, args)
+            results = run_stage1_inference(dataset, stage1_model, flow_model, device, args)
 
         # 保存结果
         video_path = save_results_as_video(results, args)
