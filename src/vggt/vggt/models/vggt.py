@@ -65,6 +65,9 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         self.gaussian_head = DPTGSHead(dim_in=2 * embed_dim, output_dim=15, activation="linear", conf_activation="expp1")
         self.velocity_head = DPTGSHead(dim_in=2 * embed_dim, output_dim=4, activation="linear", conf_activation="expp1")
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size)
+
+        nn.init.zeros_(self.velocity_head.scratch.output_conv2[-1].weight)
+        nn.init.zeros_(self.velocity_head.scratch.output_conv2[-1].bias)
         
         # Sky token support - now managed at VGGT level
         self.use_sky_token = use_sky_token

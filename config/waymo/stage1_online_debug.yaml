@@ -1,7 +1,7 @@
 # Stage 1 Online Training Configuration for VGGT
 # 第一阶段在线训练配置 - 包含统一的损失权重管理
 
-debug: True
+# debug: True
 
 # =============== 模型配置 ===============
 model: "VGGT(img_size=518, patch_size=14, embed_dim=1024)"
@@ -30,7 +30,7 @@ auxiliary_models:
   dam2: DepthAnythingV2(encoder="vitb", offload=${offload_auxiliary})
 
   # VGGT teacher模型 (用于渲染损失)
-  vggt_teacher: VGGT(path="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/model.pt", offload=${offload_auxiliary})
+  # vggt_teacher: VGGT(path="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/model.pt", offload=${offload_auxiliary})
 
 offload_auxiliary: False
 
