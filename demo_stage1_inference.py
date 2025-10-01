@@ -29,7 +29,7 @@ import torch.multiprocessing
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 
-# 导入光流相关模块
+# 导入光流相关模块（保留以备将来使用）
 sys.path.append(os.path.join(os.path.dirname(__file__), "src/SEA-RAFT/core"))
 from raft import RAFT
 from vggt.utils.auxiliary import RAFTCfg, calc_flow
@@ -369,7 +369,7 @@ def generate_velocity_map(model_preds, vggt_batch, device):
         # 按照loss.py中cross_render_and_loss的方法实现velocity可视化
         from dust3r.utils.image import scene_flow_to_rgb
 
-        velocity_img_forward = scene_flow_to_rgb(velocity_xyz.reshape(S, H, W, 3), 0.01).permute(0, 3, 1, 2)
+        velocity_img_forward = scene_flow_to_rgb(velocity_xyz.reshape(S, H, W, 3), 0.2).permute(0, 3, 1, 2)
 
         return velocity_img_forward  # [S, 3, H, W]
 
@@ -381,79 +381,39 @@ def generate_velocity_map(model_preds, vggt_batch, device):
         return torch.zeros(S, 3, H, W, device=device)
 
 
-def generate_gt_velocity_map(vggt_batch, device, flow_model):
+def generate_gt_velocity_map(vggt_batch, device):
     """
     生成GT velocity map可视化
-    使用光流模型计算前向光流，结合GT depth生成GT velocity
+    使用vggt_batch中的flowmap（预处理好的GT 3D velocity）
     """
     try:
-        # 导入必要的模块
-        from vggt.training.loss import warp_pts3d_for_gt_velocity, depth_to_world_points
         from dust3r.utils.image import scene_flow_to_rgb
-        from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
-        print("Computing GT velocity map...")
+        print("Generating GT velocity map from flowmap...")
 
-        images = vggt_batch["images"]  # [B, S, 3, H, W]
-        B, S, C, H, W = images.shape
+        flowmap = vggt_batch.get("flowmap")  # [B, S, H, W, 4]
 
-        # 计算光流
-        print("Computing optical flow...")
-        forward_flow, backward_flow, forward_consist_mask, _, _, _ = calc_flow(
-            images, flow_model,
-            check_consistency=True,
-            geo_thresh=2,
-            photo_thresh=-1,
-            return_heatmap=False
-        )
-
-        # 获取GT数据
-        depths = vggt_batch.get('depths')  # [B, S, H, W]
-        intrinsics = vggt_batch.get('intrinsics')  # [B, S, 3, 3]
-        extrinsics = vggt_batch.get('extrinsics')  # [B, S, 4, 4]
-        point_masks = vggt_batch.get('point_masks')  # [B, S, H, W]
-
-        if depths is None or intrinsics is None or extrinsics is None:
-            print("Warning: Missing GT data for velocity computation")
+        if flowmap is None:
+            print("Warning: No flowmap found in vggt_batch")
+            B, S, C, H, W = vggt_batch["images"].shape
             return torch.zeros(S, 3, H, W, device=device)
 
-        if point_masks is None:
-            print("Warning: No point masks available, using all pixels")
-            point_masks = torch.ones(B, S, H, W, device=device, dtype=torch.bool)
+        B, S, H, W, _ = flowmap.shape
 
-        print("Converting depth to world points...")
-        # 参考flow_loss中的正确实现
-        gt_depth_reshaped = depths.view(depths.shape[0]*depths.shape[1], depths.shape[2], depths.shape[3], 1)
-        gt_world_points = depth_to_world_points(gt_depth_reshaped, intrinsics)
-        gt_world_points = gt_world_points.view(gt_world_points.shape[0], gt_world_points.shape[1]*gt_world_points.shape[2], 3)
+        # 提取GT velocity (前3维) 和 mask (第4维)
+        gt_velocity_3d = flowmap[0, :, :, :, :3]  # [S, H, W, 3] - 取第一个batch
+        gt_velocity_mask = flowmap[0, :, :, :, 3] != 0  # [S, H, W] - 有GT velocity的区域
 
-        extrinsic_inv = torch.linalg.inv(extrinsics)
-        gt_xyz = torch.matmul(extrinsic_inv[0, :, :3, :3], gt_world_points.transpose(-1, -2)).transpose(-1, -2) + \
-            extrinsic_inv[0, :, :3, 3:4].transpose(-1, -2)
-
-        gt_gaussian_means = gt_xyz.reshape(B, S, H, W, 3).permute(0, 1, 4, 2, 3).contiguous()
-
-        print("Computing GT velocity from optical flow...")
-        # 计算GT velocity
-        gt_fwd_vel, gt_fwd_mask = warp_pts3d_for_gt_velocity(
-            gt_gaussian_means, point_masks,
-            forward_flow, forward_consist_mask,
-            direction="forward", interval=1
-        )
-
-        # 提取第一个batch的速度 [S, 3, H, W]
-        velocity_xyz = gt_fwd_vel[0]  # [S, 3, H, W]
-
-        # 转换为 [S, H, W, 3] 格式用于可视化
-        velocity_xyz = velocity_xyz.permute(0, 2, 3, 1)  # [S, H, W, 3]
+        print(f"GT velocity statistics - min: {gt_velocity_3d.min():.4f}, max: {gt_velocity_3d.max():.4f}, mean: {gt_velocity_3d.mean():.4f}")
+        print(f"Valid pixels: {gt_velocity_mask.sum().item()}/{gt_velocity_mask.numel()} ({gt_velocity_mask.float().mean()*100:.1f}%)")
 
         # 坐标系调整一下(x=z, y=x, z=-y)
-        velocity_xyz = velocity_xyz[:, :, :, [2, 0, 1]]
+        velocity_xyz = gt_velocity_3d[:, :, :, [2, 0, 1]]
         velocity_xyz[:, :, :, 2] = -velocity_xyz[:, :, :, 2]
 
         print("Generating velocity visualization...")
         # 按照loss.py中的方法实现velocity可视化
-        velocity_img_forward = scene_flow_to_rgb(velocity_xyz, 0.01).permute(0, 3, 1, 2)
+        velocity_img_forward = scene_flow_to_rgb(velocity_xyz, 0.2).permute(0, 3, 1, 2)
 
         print(f"GT velocity map generated with shape: {velocity_img_forward.shape}")
         return velocity_img_forward  # [S, 3, H, W]
@@ -616,6 +576,7 @@ def safe_cut3r_batch_to_vggt(views, device):
             'extrinsics': torch.stack([v['camera_pose'] for v in views], dim=0) if 'camera_pose' in views[0] else None,
             'point_masks': torch.stack([v['valid_mask'] for v in views], dim=0) if 'valid_mask' in views[0] else None,
             'world_points': torch.stack([v['pts3d'] for v in views], dim=0) if 'pts3d' in views[0] else None,
+            'flowmap': torch.stack([torch.from_numpy(v['flowmap']).float().to(device) if isinstance(v['flowmap'], np.ndarray) else v['flowmap'].float().to(device) for v in views], dim=0) if 'flowmap' in views[0] and views[0]['flowmap'] is not None else None,
         }
 
         print(f"Initial shapes - images: {vggt_batch['images'].shape}")
@@ -635,6 +596,7 @@ def safe_cut3r_batch_to_vggt(views, device):
                     vggt_batch['intrinsics'] = vggt_batch['intrinsics'].unsqueeze(1) if vggt_batch['intrinsics'] is not None else None
                     vggt_batch['extrinsics'] = vggt_batch['extrinsics'].unsqueeze(1) if vggt_batch['extrinsics'] is not None else None
                     vggt_batch['point_masks'] = vggt_batch['point_masks'].unsqueeze(1) if vggt_batch['point_masks'] is not None else None
+                    vggt_batch['flowmap'] = vggt_batch['flowmap'].unsqueeze(1) if vggt_batch['flowmap'] is not None else None
                     print(f"Added batch dimension - world_points: {vggt_batch['world_points'].shape}")
 
                 B, S, H, W, _ = vggt_batch['world_points'].shape
@@ -642,6 +604,10 @@ def safe_cut3r_batch_to_vggt(views, device):
                 world_points = torch.matmul(torch.linalg.inv(vggt_batch['extrinsics'][0])[:, :3, :3], world_points.transpose(-1, -2)).transpose(-1, -2) + \
                                            torch.linalg.inv(vggt_batch['extrinsics'][0])[:, :3, 3:4].transpose(-1, -2)
                 vggt_batch['world_points'] = world_points.reshape(B, S, H, W, 3)
+
+                # 处理flowmap - 应用缩放
+                if vggt_batch['flowmap'] is not None:
+                    vggt_batch['flowmap'][..., :3] *= 0.1
 
                 # 转换extrinsics的坐标系到第一帧相机坐标系
                 vggt_batch['extrinsics'] = torch.matmul(
@@ -663,6 +629,10 @@ def safe_cut3r_batch_to_vggt(views, device):
                 vggt_batch['extrinsics'][:, :, :3, 3] = vggt_batch['extrinsics'][:, :, :3, 3] * pose_scale_factor
                 vggt_batch['world_points'] = vggt_batch['world_points'] * depth_scale_factor
 
+                # 对flowmap应用非metric化：只对velocity magnitude进行缩放
+                if vggt_batch['flowmap'] is not None:
+                    vggt_batch['flowmap'][..., :3] = vggt_batch['flowmap'][..., :3] * depth_scale_factor
+
         # 转置到[B, S, ...]格式
         vggt_batch['images'] = vggt_batch['images'].permute(1, 0, 2, 3, 4).contiguous()
         vggt_batch['depths'] = vggt_batch['depths'].permute(1, 0, 2, 3).contiguous() if vggt_batch['depths'] is not None else None
@@ -670,6 +640,7 @@ def safe_cut3r_batch_to_vggt(views, device):
         vggt_batch['extrinsics'] = vggt_batch['extrinsics'].permute(1, 0, 2, 3).contiguous() if vggt_batch['extrinsics'] is not None else None
         vggt_batch['point_masks'] = vggt_batch['point_masks'].permute(1, 0, 2, 3).contiguous() if vggt_batch['point_masks'] is not None else None
         vggt_batch['world_points'] = vggt_batch['world_points'].permute(1, 0, 2, 3, 4).contiguous() if vggt_batch['world_points'] is not None else None
+        vggt_batch['flowmap'] = vggt_batch['flowmap'].permute(1, 0, 2, 3, 4).contiguous() if vggt_batch['flowmap'] is not None else None
 
         print(f"Final shapes - images: {vggt_batch['images'].shape}")
         if vggt_batch['depths'] is not None:
@@ -764,7 +735,7 @@ def run_stage1_inference(dataset, stage1_model, flow_model, device, args):
 
     print("Generating GT velocity map...")
     start_time = time.time()
-    gt_velocity_map = generate_gt_velocity_map(vggt_batch, device, flow_model)
+    gt_velocity_map = generate_gt_velocity_map(vggt_batch, device)
     print(f"GT velocity map generation completed in {time.time() - start_time:.2f} seconds")
 
     return {

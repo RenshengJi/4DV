@@ -26,7 +26,7 @@ import sys
 # 添加vggt路径
 sys.path.append(os.path.join(os.path.dirname(__file__), 'vggt'))
 from vggt.vggt.models.vggt import VGGT
-from vggt.training.loss import camera_loss, depth_loss, point_loss, cross_render_and_loss, flow_loss, self_render_and_loss, velocity_loss, sky_opacity_loss, sky_color_loss, vggt_distillation_loss
+from vggt.training.loss import camera_loss, depth_loss, point_loss, cross_render_and_loss, flow_loss, gt_flow_loss, self_render_and_loss, velocity_loss, sky_opacity_loss, sky_color_loss, vggt_distillation_loss
 from vggt.utils.auxiliary import RAFTCfg, calc_flow
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri, extri_intri_to_pose_encoding
 
@@ -571,6 +571,7 @@ def train(args):
                 loss_weights = {
                     'self_render_weight': getattr(args, 'self_render_weight', 1.0),
                     'flow_loss_weight': getattr(args, 'flow_loss_weight', 1.0),
+                    'gt_flow_loss_weight': getattr(args, 'gt_flow_loss_weight', 0.0),  # GT flowmap 监督损失
                     'sam2_velocity_weight': getattr(args, 'sam2_velocity_weight', 1.0),
                     'sky_opacity_weight': getattr(args, 'sky_opacity_weight', 1.0),
                     'sky_color_weight': getattr(args, 'sky_color_weight', 1.0),
@@ -684,7 +685,20 @@ def train(args):
                     except Exception as e:
                         print(f"Error in flow loss computation: {e}")
 
-                # 3. SAM2 Velocity Consistency Loss (辅助velocity head监督)
+                # 3. GT Flow Loss (直接使用GT flowmap监督velocity head)
+                if loss_weights['gt_flow_loss_weight'] > 0 and preds.get("velocity") is not None and vggt_batch.get("flowmap") is not None:
+                    try:
+                        gt_flow_loss_dict = gt_flow_loss(
+                            preds["velocity"],
+                            vggt_batch
+                        )
+                        gt_flow_loss_value = gt_flow_loss_dict.get("gt_flow_loss", 0.0)
+                        loss += loss_weights['gt_flow_loss_weight'] * gt_flow_loss_value
+                        loss_dict.update(gt_flow_loss_dict)
+                    except Exception as e:
+                        print(f"Error in GT flow loss computation: {e}")
+
+                # 4. SAM2 Velocity Consistency Loss (辅助velocity head监督)
                 if loss_weights['sam2_velocity_weight'] > 0 and vggt_batch.get("images") is not None:
                     use_preprocessed_sam = getattr(args, "use_preprocessed_sam", False)
                     try:
@@ -714,7 +728,7 @@ def train(args):
                     except Exception as e:
                         print(f"Error in SAM2 velocity loss computation: {e}")
 
-                # 4. Sky Opacity Loss (监督gaussian head的opacity参数)
+                # 5. Sky Opacity Loss (监督gaussian head的opacity参数)
                 if loss_weights['sky_opacity_weight'] > 0 and preds.get("gaussian_params") is not None and sky_masks is not None:
                     try:
                         sky_opacity_loss_dict = sky_opacity_loss(
@@ -728,7 +742,7 @@ def train(args):
                     except Exception as e:
                         print(f"Error in sky opacity loss computation: {e}")
 
-                # 5. Sky Color Loss (监督sky token以及sky head学习)
+                # 6. Sky Color Loss (监督sky token以及sky head学习)
                 if loss_weights['sky_color_weight'] > 0 and preds.get("pred_sky_colors") is not None and sky_masks is not None:
                     try:
                         sky_color_loss_dict = sky_color_loss(
@@ -1641,6 +1655,7 @@ def cut3r_batch_to_vggt(views):
         'extrinsics': torch.stack([v['camera_pose'] for v in views], dim=0) if 'camera_pose' in views[0] else None,
         'point_masks': torch.stack([v['valid_mask'] for v in views], dim=0) if 'valid_mask' in views[0] else None,
         'world_points': torch.stack([v['pts3d'] for v in views], dim=0) if 'pts3d' in views[0] else None,
+        'flowmap': torch.stack([torch.from_numpy(v['flowmap']).float() if isinstance(v['flowmap'], np.ndarray) else v['flowmap'].float() for v in views], dim=0) if 'flowmap' in views[0] and views[0]['flowmap'] is not None else None,
     }
 
     # 处理SAM掩码（如果存在）
@@ -1686,6 +1701,10 @@ def cut3r_batch_to_vggt(views):
                                        torch.linalg.inv(vggt_batch['extrinsics'][0])[:, :3, 3:4].transpose(-1, -2)
             vggt_batch['world_points'] = world_points.reshape(B, S, H, W, 3)
 
+            # 处理flowmap
+            if vggt_batch['flowmap'] is not None:
+                vggt_batch['flowmap'][..., :3] *=  0.1
+
             # 转换extrinsics的坐标系到第一帧相机坐标系
             vggt_batch['extrinsics'] = torch.matmul(
                     torch.linalg.inv(vggt_batch['extrinsics']),
@@ -1704,6 +1723,10 @@ def cut3r_batch_to_vggt(views):
             vggt_batch['extrinsics'][:, :, :3, 3] = vggt_batch['extrinsics'][:, :, :3, 3] * pose_scale_factor
             vggt_batch['world_points'] = vggt_batch['world_points'] * depth_scale_factor
 
+            # 对flowmap应用非metric化：只对velocity magnitude进行缩放
+            if vggt_batch['flowmap'] is not None:
+                vggt_batch['flowmap'][..., :3] = vggt_batch['flowmap'][..., :3] * depth_scale_factor
+
 
     vggt_batch['images'] = vggt_batch['images'].permute(1, 0, 2, 3, 4).contiguous()
     vggt_batch['depths'] = vggt_batch['depths'].permute(1, 0, 2, 3).contiguous() if vggt_batch['depths'] is not None else None
@@ -1711,6 +1734,7 @@ def cut3r_batch_to_vggt(views):
     vggt_batch['extrinsics'] = vggt_batch['extrinsics'].permute(1, 0, 2, 3).contiguous() if vggt_batch['extrinsics'] is not None else None
     vggt_batch['point_masks'] = vggt_batch['point_masks'].permute(1, 0, 2, 3).contiguous() if vggt_batch['point_masks'] is not None else None
     vggt_batch['world_points'] = vggt_batch['world_points'].permute(1, 0, 2, 3, 4).contiguous() if vggt_batch['world_points'] is not None else None
+    vggt_batch['flowmap'] = vggt_batch['flowmap'].permute(1, 0, 2, 3, 4).contiguous() if vggt_batch['flowmap'] is not None else None
     
     # 处理SAM掩码的维度转换
     if 'sam_masks' in vggt_batch:

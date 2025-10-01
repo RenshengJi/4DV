@@ -295,6 +295,70 @@ def cross_render_and_loss(conf, interval, forward_consist_mask, backward_consist
         return gaussian_loss_dict, img_dict
 
 
+def gt_flow_loss(velocity, vggt_batch):
+    """
+    使用GT flowmap对velocity head进行直接监督
+
+    Args:
+        velocity: [B, S, H*W, 3] - 预测的velocity
+        vggt_batch: dict - 包含GT flowmap的batch数据
+            - 'flowmap': [B, S, H, W, 4] - GT flowmap，前3维是3D velocity（在各帧相机坐标系下），第4维是类别（0表示无GT信息）
+            - 'extrinsics': [B, S, 4, 4] - 相机外参（已转换为从第一帧到各帧的变换）
+
+    Returns:
+        dict: 包含gt_flow_loss的损失字典
+    """
+    with tf32_off():
+        # 获取GT flowmap
+        gt_flowmap = vggt_batch.get('flowmap')  # [B, S, H, W, 4]
+
+        if gt_flowmap is None:
+            # 如果没有GT flowmap，返回0损失
+            return {
+                "gt_flow_loss": torch.tensor(0.0, device=velocity.device, requires_grad=True)
+            }
+
+        # 使用GT的pose（从vggt_batch获取）
+        gt_extrinsic = vggt_batch['extrinsics']  # [B, S, 4, 4] - GT extrinsics
+
+        B, S, H, W, flow_dim = gt_flowmap.shape
+
+        # 提取GT velocity (前3维) 和 mask (第4维)
+        gt_velocity_3d = gt_flowmap[..., :3]  # [B, S, H, W, 3]
+        gt_velocity_mask = gt_flowmap[..., 3] != 0  # [B, S, H, W] - 有GT velocity的区域
+
+        # 检查是否有有效的GT velocity
+        if gt_velocity_mask.sum() == 0:
+            return {
+                "gt_flow_loss": torch.tensor(0.0, device=velocity.device, requires_grad=True),
+                "gt_flow_num_valid": 0
+            }
+
+        # 将velocity reshape为与gt_velocity相同的格式
+        velocity = velocity.reshape(B, S, H, W, 3)  # [B, S, H, W, 3]
+
+        # 将预测的velocity从原始输出转换（应用exp变换）
+        velocity = torch.sign(velocity) * (torch.exp(torch.abs(velocity)) - 1)
+
+        # 只在有GT velocity的位置计算loss
+        # 扩展mask以匹配velocity的维度
+        valid_mask_expanded = gt_velocity_mask.unsqueeze(-1).expand(-1, -1, -1, -1, 3)  # [B, S, H, W, 3]
+
+        # 提取有效位置的velocity
+        pred_velocity_valid = velocity[valid_mask_expanded]  # [N_valid]
+        gt_velocity_valid = gt_velocity_3d[valid_mask_expanded]  # [N_valid]
+
+        # 计算L1 loss
+        loss = F.l1_loss(pred_velocity_valid, gt_velocity_valid)
+        loss = check_and_fix_inf_nan(loss, "gt_flow_loss")
+
+        # 返回损失字典
+        return {
+            "gt_flow_loss": loss,
+            "gt_flow_num_valid": gt_velocity_mask.sum().item()
+        }
+
+
 def flow_loss(conf, interval, forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, depth, velocity, pose_enc, extrinsic, intrinsic, gt_rgb, vggt_batch, sky_masks=None):
     # 使用GT depth计算GT velocity并与预测velocity比较
     # vggt_batch: 包含gt depth和point_masks的batch数据

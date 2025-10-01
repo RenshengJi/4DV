@@ -22,9 +22,9 @@ from collections import defaultdict
 # 导入现有的聚类和光流配准系统
 import sys
 import os
-from cuml.cluster import DBSCAN
+# from cuml.cluster import DBSCAN
 from sklearn.cluster import DBSCAN as SklearnDBSCAN
-import cupy as cp
+# import cupy as cp
 from scipy.optimize import linear_sum_assignment
 
 

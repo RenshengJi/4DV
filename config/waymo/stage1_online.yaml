@@ -14,18 +14,18 @@ vggt_freeze_strategy: null
 
 # =============== 辅助模型配置 ===============
 auxiliary_models:
-  # 光流模型 (用于flow_loss)
-  flow: RAFT(RAFTCfg(name="kitti-M", dataset="kitti", path="Tartan-C-T-TSKH-kitti432x960-M.pth",
-    use_var=True, var_min=0, var_max=10, pretrain="resnet34", initial_dim=64, block_dims=[64, 128, 256],
-    radius=4, dim=128, num_blocks=2, iters=4, image_size=[432, 960],
-    offload=${offload_auxiliary}, geo_thresh=2, photo_thresh=-1))
+  # # 光流模型 (用于flow_loss)
+  # flow: RAFT(RAFTCfg(name="kitti-M", dataset="kitti", path="Tartan-C-T-TSKH-kitti432x960-M.pth",
+  #   use_var=True, var_min=0, var_max=10, pretrain="resnet34", initial_dim=64, block_dims=[64, 128, 256],
+  #   radius=4, dim=128, num_blocks=2, iters=4, image_size=[432, 960],
+  #   offload=${offload_auxiliary}, geo_thresh=2, photo_thresh=-1))
 
   # SAM2模型 (用于velocity consistency loss)
   # sam2: SAM2Base(config_file="sam2.1_hiera_t", path="sam2.1_hiera_tiny.pt",
   #   offload=${offload_auxiliary})
 
-  # DAM2模型 (用于生成sky masks)
-  dam2: DepthAnythingV2(encoder="vitb", offload=${offload_auxiliary})
+  # # DAM2模型 (用于生成sky masks)
+  # dam2: DepthAnythingV2(encoder="vitb", offload=${offload_auxiliary})
 
   # # VGGT teacher模型 (用于渲染损失)
   # vggt_teacher: VGGT(path="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/model.pt", offload=${offload_auxiliary})
@@ -53,35 +53,38 @@ training_stage: 'stage1'
 # 权重为0则完全不计算该损失
 
 # 1. Self Render Loss (训练gaussian head)
-self_render_weight: 1.0                    # Gaussian参数学习的主要损失 (已弃用，使用下面的分项权重)
+self_render_weight: 0.0                    # Gaussian参数学习的主要损失 (已弃用，使用下面的分项权重)
 self_render_rgb_weight: 1.0                # RGB损失权重
 self_render_lpips_weight: 0.1              # LPIPS感知损失权重
 self_render_depth_weight: 1.0              # 深度损失权重
 
 # 2. Flow Loss (训练velocity head)
-flow_loss_weight: 0.5                      # 光流监督velocity学习
+flow_loss_weight: 0.0                      # 光流监督velocity学习
 flow_interval: 1                           # 光流计算的帧间隔
 
-# 3. SAM2 Velocity Consistency Loss (辅助velocity head监督)
+# 3. GT Flow Loss (直接使用GT flowmap监督velocity head)
+gt_flow_loss_weight: 1.0                   # GT flowmap直接监督velocity学习
+
+# 4. SAM2 Velocity Consistency Loss (辅助velocity head监督)
 sam2_velocity_weight: 0.0                  # SAM2掩码一致性监督
 use_preprocessed_sam: false                 # false=在线推理SAM2, true=使用预处理掩码
 
-# 4. Sky Opacity Loss (监督gaussian head的opacity参数)
-sky_opacity_weight: 0.2                    # 天空区域opacity约束
+# 5. Sky Opacity Loss (监督gaussian head的opacity参数)
+sky_opacity_weight: 0.0                    # 天空区域opacity约束
 
-# 5. Sky Color Loss (监督sky token以及sky head学习)
+# 6. Sky Color Loss (监督sky token以及sky head学习)
 sky_color_weight: 0.0                      # 天空颜色预测监督 (已融合到self_render_loss中)
 
-# 6. Velocity Regularization Loss (约束velocity值)
-velocity_reg_weight: 0.05                 # 速度正则化约束
+# 7. Velocity Regularization Loss (约束velocity值)
+velocity_reg_weight: 0.0                 # 速度正则化约束
 
-# 7. VGGT Distillation Loss (蒸馏损失，监督depth head、camera head等)
+# 8. VGGT Distillation Loss (蒸馏损失，监督depth head、camera head等)
 vggt_distill_weight: 0.0                  # VGGT teacher蒸馏监督，防止unfreeze backbone时输出漂移
 
-# 8. Camera Loss (监督camera head训练)
+# 9. Camera Loss (监督camera head训练)
 camera_loss_weight: 1.0                   # 相机参数预测损失权重
 
-# 9. Depth Loss (监督depth head训练)
+# 10. Depth Loss (监督depth head训练)
 depth_loss_weight: 1.0                    # 深度预测损失权重
 
 # =============== 数据集配置 ===============
@@ -89,13 +92,13 @@ depth_loss_weight: 1.0                    # 深度预测损失权重
 allow_repeat: False
 
 train_dataset: Waymo_Multi(allow_repeat=${allow_repeat}, split=None,
-  ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train",
+  ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train_with_flow",
   img_ray_mask_p=[1.0, 0.0, 0.0], valid_camera_id_list=["1", "2", "3"],
   aug_crop=0, resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], transform=ImgNorm,
   num_views=${num_views}, n_corres=${n_corres_train}, seq_aug_crop=True, load_sam_masks=False)
 
 test_dataset: 1000 @ Waymo_Multi(split=None,
-  ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train",
+  ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train_with_flow",
   img_ray_mask_p=[1.0, 0.0, 0.0], valid_camera_id_list=["1", "2", "3"],
   resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], num_views=${num_test_views}, seed=42, n_corres=${n_corres_test})
 
@@ -131,7 +134,7 @@ num_imgs_vis: 4
 
 # =============== 输出配置 ===============
 save_dir: 'checkpoints/waymo_stage1_online'
-exp_name: 'stage1_online_unfreeze+newsky+highvelocity+flownosky+gt+fixedextrinsic+detach'
+exp_name: 'stage1_gtflow'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/

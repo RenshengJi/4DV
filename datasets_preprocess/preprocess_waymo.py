@@ -39,17 +39,15 @@ from datasets_preprocess.utils import cropping
 
 # 导入SAM预处理模块
 from sam_preprocessing import SAMPreprocessor
-# from src.dust3r.viz import show_raw_pointcloud
 
 
 def get_parser():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--waymo_dir", required=True)
-    # parser.add_argument("--precomputed_pairs", required=True)
+    parser.add_argument("--waymo_dir", default="/mnt/raw-datasets/waymo/raw/train")
     parser.add_argument("--precomputed_pairs")
-    parser.add_argument("--output_dir", default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/val")
+    parser.add_argument("--output_dir", default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train_with_flow")
     parser.add_argument("--workers", type=int, default=100)
     parser.add_argument("--enable_sam", action="store_true", help="Enable SAM mask generation")
     parser.add_argument("--sam_model_type", default="sam2", choices=["sam2", "sam"], help="SAM model type")
@@ -122,8 +120,343 @@ def process_one_seq(db_root, output_dir, seq):
 
 
 def extract_frames_one_seq(filename):
+
     from waymo_open_dataset import dataset_pb2 as open_dataset
-    from waymo_open_dataset.utils import frame_utils
+    from waymo_open_dataset.utils import frame_utils, transform_utils, range_image_utils
+
+    def parse_range_image_flow_and_camera_projection(frame):
+        range_images = {}
+        camera_projections = {}
+        range_image_top_pose = None
+        for laser in frame.lasers:
+            if (
+                len(laser.ri_return1.range_image_flow_compressed) > 0
+            ):  # pylint: disable=g-explicit-length-test
+                range_image_str_tensor = tf.io.decode_compressed(
+                    laser.ri_return1.range_image_flow_compressed, "ZLIB"
+                )
+                ri = open_dataset.MatrixFloat()
+                ri.ParseFromString(bytearray(range_image_str_tensor.numpy()))
+                range_images[laser.name] = [ri]
+
+                if laser.name == open_dataset.LaserName.TOP:
+                    range_image_top_pose_str_tensor = tf.io.decode_compressed(
+                        laser.ri_return1.range_image_pose_compressed, "ZLIB"
+                    )
+                    range_image_top_pose = open_dataset.MatrixFloat()
+                    range_image_top_pose.ParseFromString(
+                        bytearray(range_image_top_pose_str_tensor.numpy())
+                    )
+
+                camera_projection_str_tensor = tf.io.decode_compressed(
+                    laser.ri_return1.camera_projection_compressed, "ZLIB"
+                )
+                cp = open_dataset.MatrixInt32()
+                cp.ParseFromString(bytearray(camera_projection_str_tensor.numpy()))
+                camera_projections[laser.name] = [cp]
+            if (
+                len(laser.ri_return2.range_image_flow_compressed) > 0
+            ):  # pylint: disable=g-explicit-length-test
+                range_image_str_tensor = tf.io.decode_compressed(
+                    laser.ri_return2.range_image_flow_compressed, "ZLIB"
+                )
+                ri = open_dataset.MatrixFloat()
+                ri.ParseFromString(bytearray(range_image_str_tensor.numpy()))
+                range_images[laser.name].append(ri)
+
+                camera_projection_str_tensor = tf.io.decode_compressed(
+                    laser.ri_return2.camera_projection_compressed, "ZLIB"
+                )
+                cp = open_dataset.MatrixInt32()
+                cp.ParseFromString(bytearray(camera_projection_str_tensor.numpy()))
+                camera_projections[laser.name].append(cp)
+        return range_images, camera_projections, range_image_top_pose
+
+
+    def compute_range_image_cartesian(
+        range_image_polar,
+        extrinsic,
+        pixel_pose=None,
+        frame_pose=None,
+        dtype=tf.float32,
+        scope=None,
+    ):
+        """Computes range image cartesian coordinates from polar ones.
+
+        Args:
+        range_image_polar: [B, H, W, 3] float tensor. Lidar range image in polar
+            coordinate in sensor frame.
+        extrinsic: [B, 4, 4] float tensor. Lidar extrinsic.
+        pixel_pose: [B, H, W, 4, 4] float tensor. If not None, it sets pose for each
+            range image pixel.
+        frame_pose: [B, 4, 4] float tensor. This must be set when pixel_pose is set.
+            It decides the vehicle frame at which the cartesian points are computed.
+        dtype: float type to use internally. This is needed as extrinsic and
+            inclination sometimes have higher resolution than range_image.
+        scope: the name scope.
+
+        Returns:
+        range_image_cartesian: [B, H, W, 3] cartesian coordinates.
+        """
+        range_image_polar_dtype = range_image_polar.dtype
+        range_image_polar = tf.cast(range_image_polar, dtype=dtype)
+        extrinsic = tf.cast(extrinsic, dtype=dtype)
+        if pixel_pose is not None:
+            pixel_pose = tf.cast(pixel_pose, dtype=dtype)
+        if frame_pose is not None:
+            frame_pose = tf.cast(frame_pose, dtype=dtype)
+
+        with tf.compat.v1.name_scope(
+            scope,
+            "ComputeRangeImageCartesian",
+            [range_image_polar, extrinsic, pixel_pose, frame_pose],
+        ):
+            azimuth, inclination, range_image_range = tf.unstack(range_image_polar, axis=-1)
+
+            cos_azimuth = tf.cos(azimuth)
+            sin_azimuth = tf.sin(azimuth)
+            cos_incl = tf.cos(inclination)
+            sin_incl = tf.sin(inclination)
+
+            # [B, H, W].
+            x = cos_azimuth * cos_incl * range_image_range
+            y = sin_azimuth * cos_incl * range_image_range
+            z = sin_incl * range_image_range
+
+            # [B, H, W, 3]
+            range_image_points = tf.stack([x, y, z], -1)
+            range_image_origins = tf.zeros_like(range_image_points)
+            # [B, 3, 3]
+            rotation = extrinsic[..., 0:3, 0:3]
+            # translation [B, 1, 3]
+            translation = tf.expand_dims(tf.expand_dims(extrinsic[..., 0:3, 3], 1), 1)
+
+            # To vehicle frame.
+            # [B, H, W, 3]
+            range_image_points = tf.einsum("bkr,bijr->bijk", rotation, range_image_points) + translation
+            range_image_origins = (
+                tf.einsum("bkr,bijr->bijk", rotation, range_image_origins) + translation
+            )
+            if pixel_pose is not None:
+                # To global frame.
+                # [B, H, W, 3, 3]
+                pixel_pose_rotation = pixel_pose[..., 0:3, 0:3]
+                # [B, H, W, 3]
+                pixel_pose_translation = pixel_pose[..., 0:3, 3]
+                # [B, H, W, 3]
+                range_image_points = (
+                    tf.einsum("bhwij,bhwj->bhwi", pixel_pose_rotation, range_image_points)
+                    + pixel_pose_translation
+                )
+                range_image_origins = (
+                    tf.einsum("bhwij,bhwj->bhwi", pixel_pose_rotation, range_image_origins)
+                    + pixel_pose_translation
+                )
+
+                if frame_pose is None:
+                    raise ValueError("frame_pose must be set when pixel_pose is set.")
+                # To vehicle frame corresponding to the given frame_pose
+                # [B, 4, 4]
+                world_to_vehicle = tf.linalg.inv(frame_pose)
+                world_to_vehicle_rotation = world_to_vehicle[:, 0:3, 0:3]
+                world_to_vehicle_translation = world_to_vehicle[:, 0:3, 3]
+                # [B, H, W, 3]
+                range_image_points = (
+                    tf.einsum("bij,bhwj->bhwi", world_to_vehicle_rotation, range_image_points)
+                    + world_to_vehicle_translation[:, tf.newaxis, tf.newaxis, :]
+                )
+                range_image_origins = (
+                    tf.einsum("bij,bhwj->bhwi", world_to_vehicle_rotation, range_image_origins)
+                    + world_to_vehicle_translation[:, tf.newaxis, tf.newaxis, :]
+                )
+
+            range_image_points = tf.cast(range_image_points, dtype=range_image_polar_dtype)
+            range_image_origins = tf.cast(range_image_origins, dtype=range_image_polar_dtype)
+            return range_image_points, range_image_origins
+
+
+    def extract_point_cloud_from_range_image(
+        range_image,
+        extrinsic,
+        inclination,
+        pixel_pose=None,
+        frame_pose=None,
+        dtype=tf.float32,
+        scope=None,
+    ):
+        """Extracts point cloud from range image.
+
+        Args:
+        range_image: [B, H, W] tensor. Lidar range images.
+        extrinsic: [B, 4, 4] tensor. Lidar extrinsic.
+        inclination: [B, H] tensor. Inclination for each row of the range image.
+            0-th entry corresponds to the 0-th row of the range image.
+        pixel_pose: [B, H, W, 4, 4] tensor. If not None, it sets pose for each range
+            image pixel.
+        frame_pose: [B, 4, 4] tensor. This must be set when pixel_pose is set. It
+            decides the vehicle frame at which the cartesian points are computed.
+        dtype: float type to use internally. This is needed as extrinsic and
+            inclination sometimes have higher resolution than range_image.
+        scope: the name scope.
+
+        Returns:
+        range_image_points: [B, H, W, 3] with {x, y, z} as inner dims in vehicle frame.
+        range_image_origins: [B, H, W, 3] with {x, y, z}, the origin of the range image
+        """
+        with tf.compat.v1.name_scope(
+            scope,
+            "ExtractPointCloudFromRangeImage",
+            [range_image, extrinsic, inclination, pixel_pose, frame_pose],
+        ):
+            range_image_polar = range_image_utils.compute_range_image_polar(
+                range_image, extrinsic, inclination, dtype=dtype
+            )
+            (
+                range_image_points_cartesian,
+                range_image_origins_cartesian,
+            ) = compute_range_image_cartesian(
+                range_image_polar,
+                extrinsic,
+                pixel_pose=pixel_pose,
+                frame_pose=frame_pose,
+                dtype=dtype,
+            )
+            return range_image_origins_cartesian, range_image_points_cartesian
+
+
+    def convert_range_image_to_point_cloud_flow(
+        frame,
+        range_images,
+        range_images_flow,
+        camera_projections,
+        range_image_top_pose,
+        ri_index=0,
+    ):
+        """
+        Modified from the codes of Waymo Open Dataset.
+        Convert range images to point cloud.
+        Convert range images flow to scene flow.
+        Args:
+            frame: open dataset frame
+            range_images: A dict of {laser_name, [range_image_first_return, range_image_second_return]}.
+            range_imaages_flow: A dict similar to range_images.
+            camera_projections: A dict of {laser_name,
+                [camera_projection_from_first_return, camera_projection_from_second_return]}.
+            range_image_top_pose: range image pixel pose for top lidar.
+            ri_index: 0 for the first return, 1 for the second return.
+
+        Returns:
+            points: {[N, 3]} list of 3d lidar points of length 5 (number of lidars).
+            points_flow: {[N, 3]} list of scene flow vector of each point.
+            cp_points: {[N, 6]} list of camera projections of length 5 (number of lidars).
+        """
+        calibrations = sorted(frame.context.laser_calibrations, key=lambda c: c.name)
+        origins, points, cp_points = [], [], []
+        points_intensity = []
+        points_elongation = []
+        points_flow = []
+        laser_ids = []
+
+        frame_pose = tf.convert_to_tensor(np.reshape(np.array(frame.pose.transform), [4, 4]))
+        # [H, W, 6]
+        range_image_top_pose_tensor = tf.reshape(
+            tf.convert_to_tensor(range_image_top_pose.data), range_image_top_pose.shape.dims
+        )
+        # [H, W, 3, 3]
+        range_image_top_pose_tensor_rotation = transform_utils.get_rotation_matrix(
+            range_image_top_pose_tensor[..., 0],
+            range_image_top_pose_tensor[..., 1],
+            range_image_top_pose_tensor[..., 2],
+        )
+        range_image_top_pose_tensor_translation = range_image_top_pose_tensor[..., 3:]
+        range_image_top_pose_tensor = transform_utils.get_transform(
+            range_image_top_pose_tensor_rotation, range_image_top_pose_tensor_translation
+        )   
+        for c in calibrations:
+            range_image = range_images[c.name][ri_index]
+            range_image_flow = range_images_flow[c.name][ri_index]
+            if len(c.beam_inclinations) == 0:  # pylint: disable=g-explicit-length-test
+                beam_inclinations = range_image_utils.compute_inclination(
+                    tf.constant([c.beam_inclination_min, c.beam_inclination_max]),
+                    height=range_image.shape.dims[0],
+                )
+            else:
+                beam_inclinations = tf.constant(c.beam_inclinations)
+
+            beam_inclinations = tf.reverse(beam_inclinations, axis=[-1])
+            extrinsic = np.reshape(np.array(c.extrinsic.transform), [4, 4])
+
+            range_image_tensor = tf.reshape(
+                tf.convert_to_tensor(range_image.data), range_image.shape.dims
+            )
+            range_image_flow_tensor = tf.reshape(
+                tf.convert_to_tensor(range_image_flow.data), range_image_flow.shape.dims
+            )
+            pixel_pose_local = None
+            frame_pose_local = None
+            if c.name == open_dataset.LaserName.TOP:
+                pixel_pose_local = range_image_top_pose_tensor
+                pixel_pose_local = tf.expand_dims(pixel_pose_local, axis=0)
+                frame_pose_local = tf.expand_dims(frame_pose, axis=0)
+            range_image_mask = range_image_tensor[..., 0] > 0
+            range_image_intensity = range_image_tensor[..., 1]
+            range_image_elongation = range_image_tensor[..., 2]
+
+            flow_x = range_image_flow_tensor[..., 0]
+            flow_y = range_image_flow_tensor[..., 1]
+            flow_z = range_image_flow_tensor[..., 2]
+            flow_class = range_image_flow_tensor[..., 3]
+
+            mask_index = tf.where(range_image_mask)
+
+            (origins_cartesian, points_cartesian,) = extract_point_cloud_from_range_image(
+                tf.expand_dims(range_image_tensor[..., 0], axis=0),
+                tf.expand_dims(extrinsic, axis=0),
+                tf.expand_dims(tf.convert_to_tensor(beam_inclinations), axis=0),
+                pixel_pose=pixel_pose_local,
+                frame_pose=frame_pose_local,
+            )
+            origins_cartesian = tf.squeeze(origins_cartesian, axis=0)
+            points_cartesian = tf.squeeze(points_cartesian, axis=0)
+
+            origins_tensor = tf.gather_nd(origins_cartesian, mask_index)
+            points_tensor = tf.gather_nd(points_cartesian, mask_index)
+
+            points_intensity_tensor = tf.gather_nd(range_image_intensity, mask_index)
+            points_elongation_tensor = tf.gather_nd(range_image_elongation, mask_index)
+
+            points_flow_x_tensor = tf.expand_dims(tf.gather_nd(flow_x, mask_index), axis=1)
+            points_flow_y_tensor = tf.expand_dims(tf.gather_nd(flow_y, mask_index), axis=1)
+            points_flow_z_tensor = tf.expand_dims(tf.gather_nd(flow_z, mask_index), axis=1)
+            points_flow_class_tensor = tf.expand_dims(tf.gather_nd(flow_class, mask_index), axis=1)
+
+            origins.append(origins_tensor.numpy())
+            points.append(points_tensor.numpy())
+            points_intensity.append(points_intensity_tensor.numpy())
+            points_elongation.append(points_elongation_tensor.numpy())
+            laser_ids.append(np.full_like(points_intensity_tensor.numpy(), c.name - 1))
+
+            points_flow.append(
+                tf.concat(
+                    [
+                        points_flow_x_tensor,
+                        points_flow_y_tensor,
+                        points_flow_z_tensor,
+                        points_flow_class_tensor,
+                    ],
+                    axis=-1,
+                ).numpy()
+            )
+
+        return (
+            origins,
+            points,
+            points_flow,
+            cp_points,
+            points_intensity,
+            points_elongation,
+            laser_ids,
+        )
 
     print(">> Opening", filename)
     dataset = tf.data.TFRecordDataset(filename, compression_type="")
@@ -137,6 +470,8 @@ def extract_frames_one_seq(filename):
 
         content = frame_utils.parse_range_image_and_camera_projection(frame)
         range_images, camera_projections, _, range_image_top_pose = content
+
+        range_images_flow, _, _ = parse_range_image_flow_and_camera_projection(frame)
 
         views = {}
         frames.append((frame.context.name, views))
@@ -162,8 +497,26 @@ def extract_frames_one_seq(filename):
             frame, range_images, camera_projections, range_image_top_pose
         )
 
+        (
+            origins,
+            points_new,
+            flows,
+            cp_points_new,
+            intensity,
+            elongation,
+            laser_ids,
+        ) = convert_range_image_to_point_cloud_flow(
+            frame,
+            range_images,
+            range_images_flow,
+            camera_projections,
+            range_image_top_pose,
+            ri_index=0,
+        )
+
         # 3d points in vehicle frame.
         points_all = np.concatenate(points, axis=0)
+        flows_all = np.concatenate(flows, axis=0)
         cp_points_all = np.concatenate(cp_points, axis=0)
 
         # The distance between lidar points and vehicle frame origin.
@@ -183,9 +536,10 @@ def extract_frames_one_seq(filename):
 
             pix = cp_points_msk_tensor[..., 1:3].numpy().round().astype(np.int16)
             pts3d = points_all[mask.numpy()]
+            flows = flows_all[mask.numpy()]
 
             views[image.name] = dict(
-                img=rgb, pose=pose, pixels=pix, pts3d=pts3d, timestamp=timestamp
+                img=rgb, pose=pose, pixels=pix, pts3d=pts3d, timestamp=timestamp, flows=flows
             )
 
         # if not "show full point cloud":
@@ -268,7 +622,17 @@ def crop_one_seq(input_dir, output_dir, seq, enable_sam=False, sam_model_type="s
         pos2d = data["pixels"].round().astype(np.uint16)
         x, y = pos2d.T
         pts3d = data["pts3d"]  # already in the car frame
+        flows = data["flows"]
         pts3d = geotrf(axes_transformation @ inv(cam_to_car[cam_idx]), pts3d)
+        # Transform flows from car coordinate system to camera coordinate system
+        # Only transform the first 3 dimensions, keep the 4th dimension (flow category) unchanged
+        flows_xyz = flows[:, :3]  # Extract first 3 dimensions
+        # For velocity vectors, only apply rotation transformation (no translation)
+        rotation_matrix = (axes_transformation @ inv(cam_to_car[cam_idx]))[:3, :3]
+        flows_xyz = flows_xyz @ rotation_matrix.T  # Apply rotation only
+        flows[:, -1] += 1 # add 1 to the category(-1 -> 0)
+        flows = np.concatenate([flows_xyz, flows[:, 3:]], axis=1)  # Combine transformed xyz with original category
+
         # X=LEFT_RIGHT y=ALTITUDE z=DEPTH
 
         # load image
@@ -279,7 +643,7 @@ def crop_one_seq(input_dir, output_dir, seq, enable_sam=False, sam_model_type="s
         image, _, intrinsics2 = cropping.rescale_image_depthmap(
             image, None, cam_K[cam_idx], output_resolution
         )
-        image.save(osp.join(out_dir, frame + "jpg"), quality=80)
+        image.save(osp.join(out_dir, frame + "jpg"))
 
         # save as an EXR file? yes it's smaller (and easier to load)
         W, H = image.size
@@ -290,6 +654,12 @@ def crop_one_seq(input_dir, output_dir, seq, enable_sam=False, sam_model_type="s
         x, y = pos2d.T
         depthmap[y.clip(min=0, max=H - 1), x.clip(min=0, max=W - 1)] = pts3d[:, 2]
         cv2.imwrite(osp.join(out_dir, frame + "exr"), depthmap)
+
+        # save flow
+        flowmap = np.zeros((H, W, 4), dtype=np.float32)  # [x_flow, y_flow, z_flow, category]
+        valid_mask = (x >= 0) & (x < W) & (y >= 0) & (y < H)
+        flowmap[y[valid_mask], x[valid_mask]] = flows[valid_mask]
+        np.save(osp.join(out_dir, frame + "npy"), flowmap)
 
         # save camera parametes
         cam2world = car_to_world @ cam_to_car[cam_idx] @ inv(axes_transformation)

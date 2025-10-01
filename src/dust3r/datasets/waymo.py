@@ -166,13 +166,23 @@ class Waymo_Multi(BaseMultiViewDataset):
             image = imread_cv2(osp.join(scene_dir, impath + ".jpg"))
             depthmap = imread_cv2(osp.join(scene_dir, impath + ".exr"))
             camera_params = np.load(osp.join(scene_dir, impath + ".npz"))
+            # Load flow data
+            flow_path = osp.join(scene_dir, impath + ".npy")
+            flowmap = None
+            if osp.exists(flow_path):
+                flowmap = np.load(flow_path)
 
             intrinsics = np.float32(camera_params["intrinsics"])
             camera_pose = np.float32(camera_params["cam2world"])
 
-            image, depthmap, intrinsics = self._crop_resize_if_necessary(
-                image, depthmap, intrinsics, resolution, rng, info=(scene_dir, impath)
-            )
+            if flowmap is not None:
+                image, depthmap, intrinsics, flowmap = self._crop_resize_if_necessary(
+                    image, depthmap, intrinsics, resolution, rng, info=(scene_dir, impath), flowmap=flowmap
+                )
+            else:
+                image, depthmap, intrinsics = self._crop_resize_if_necessary(
+                    image, depthmap, intrinsics, resolution, rng, info=(scene_dir, impath)
+                )
 
             # generate img mask and raymap mask
             img_mask, ray_mask = self.get_img_and_ray_masks(
@@ -201,6 +211,7 @@ class Waymo_Multi(BaseMultiViewDataset):
                 depth_only=False,
                 single_view=False,
                 reset=False,
+                flowmap=flowmap,
             )
             
             # 如果加载了SAM掩码，添加到view_dict中
