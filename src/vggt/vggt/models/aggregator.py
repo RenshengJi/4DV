@@ -68,6 +68,7 @@ class Aggregator(nn.Module):
         rope_freq=100,
         init_values=0.01,
         use_sky_token=True,
+        use_scale_token=True,
         memory_efficient=True,  # Enable memory efficient mode
         output_layers=None,  # Specific layers to output (0-indexed)
     ):
@@ -147,13 +148,17 @@ class Aggregator(nn.Module):
         self.camera_token = nn.Parameter(torch.randn(1, 2, 1, embed_dim))
         self.register_token = nn.Parameter(torch.randn(1, 2, num_register_tokens, embed_dim))
 
-        # Sky token support (managed externally by VGGT main model)
+        # Sky token and scale token support (managed externally by VGGT main model)
         self.use_sky_token = use_sky_token
+        self.use_scale_token = use_scale_token
+
+        # Calculate patch_start_idx based on special tokens
+        num_special_tokens = 1 + num_register_tokens  # camera + register
         if self.use_sky_token:
-            # The patch tokens start after the sky token, the camera and register tokens
-            self.patch_start_idx = 1 + 1 + num_register_tokens
-        else:
-            self.patch_start_idx = 1 + num_register_tokens
+            num_special_tokens += 1  # add sky token
+        if self.use_scale_token:
+            num_special_tokens += 1  # add scale token
+        self.patch_start_idx = num_special_tokens
 
         # Initialize parameters with small values
         nn.init.normal_(self.camera_token, std=1e-6)
@@ -206,13 +211,15 @@ class Aggregator(nn.Module):
             if hasattr(self.patch_embed, "mask_token"):
                 self.patch_embed.mask_token.requires_grad_(False)
 
-    def forward(self, images: torch.Tensor, sky_token: torch.Tensor = None) -> Tuple[List[torch.Tensor], int]:
+    def forward(self, images: torch.Tensor, sky_token: torch.Tensor = None, scale_token: torch.Tensor = None) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
             images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
                 B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
             sky_token (torch.Tensor, optional): Sky token with shape [1, 1, embed_dim].
                 Required if use_sky_token=True.
+            scale_token (torch.Tensor, optional): Scale token with shape [1, 1, embed_dim].
+                Required if use_scale_token=True.
 
         Returns:
             (list[torch.Tensor], int):
@@ -240,16 +247,21 @@ class Aggregator(nn.Module):
         camera_token = slice_expand_and_flatten(self.camera_token, B, S)
         register_token = slice_expand_and_flatten(self.register_token, B, S)
 
-        # Add sky token if enabled
+        # Add sky token and scale token if enabled
+        special_tokens = []
         if self.use_sky_token:
             if sky_token is None:
                 raise ValueError("sky_token must be provided when use_sky_token=True")
             sky_token_expanded = sky_token.repeat(B * S, 1, 1)
-            # Concatenate special tokens with patch tokens
-            tokens = torch.cat([sky_token_expanded, camera_token, register_token, patch_tokens], dim=1)
-        else:
-            # Concatenate special tokens with patch tokens
-            tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
+            special_tokens.append(sky_token_expanded)
+        if self.use_scale_token:
+            if scale_token is None:
+                raise ValueError("scale_token must be provided when use_scale_token=True")
+            scale_token_expanded = scale_token.repeat(B * S, 1, 1)
+            special_tokens.append(scale_token_expanded)
+
+        # Concatenate all tokens: [special_tokens, camera_token, register_token, patch_tokens]
+        tokens = torch.cat(special_tokens + [camera_token, register_token, patch_tokens], dim=1)
 
         pos = None
         if self.rope is not None:

@@ -3,8 +3,8 @@
 
 # =============== 模型配置 ===============
 model: "VGGT(img_size=518, patch_size=14, embed_dim=1024)"
-# pretrained: model.pt
-pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow/checkpoint-epoch_7_9968.pth"
+pretrained: model.pt
+pretrained_velocity: False
 
 # VGGT冻结策略配置
 # 可选值: "none", "encoder", "encoder_frame", "backbone", "backbone_camera", "backbone_pts",
@@ -65,9 +65,9 @@ flow_interval: 1                           # 光流计算的帧间隔
 
 # 3. GT Flow Loss (直接使用GT flowmap监督velocity head)
 # 类似depth loss，返回三个损失：conf、reg、grad
-conf_flow_loss_weight: 1.0                 # GT flowmap conf损失权重
-grad_flow_loss_weight: 1.0                 # GT flowmap gradient损失权重
-reg_flow_loss_weight: 1.0                  # GT flowmap reg损失权重
+conf_flow_loss_weight: 0.0                 # GT flowmap conf损失权重
+grad_flow_loss_weight: 0.0                 # GT flowmap gradient损失权重
+reg_flow_loss_weight: 0.0                  # GT flowmap reg损失权重
 
 # 4. SAM2 Velocity Consistency Loss (辅助velocity head监督)
 sam2_velocity_weight: 0.0                  # SAM2掩码一致性监督
@@ -149,7 +149,7 @@ num_imgs_vis: 4
 
 # =============== 输出配置 ===============
 save_dir: 'checkpoints/waymo_stage1_online'
-exp_name: 'stage1_gtflow+depthgrad(true)+depth+flowgradconf+aggregatorenderloss+fixopacity'
+exp_name: 'stage1_gtflow+depthgrad(true)+depth+flowgradconf+aggregatorenderloss+self+fixopacity'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/

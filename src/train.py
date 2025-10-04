@@ -26,7 +26,7 @@ import sys
 # 添加vggt路径
 sys.path.append(os.path.join(os.path.dirname(__file__), 'vggt'))
 from vggt.vggt.models.vggt import VGGT
-from vggt.training.loss import camera_loss, depth_loss, point_loss, cross_render_and_loss, flow_loss, gt_flow_loss, self_render_and_loss, velocity_loss, sky_opacity_loss, sky_color_loss, vggt_distillation_loss
+from vggt.training.loss import camera_loss, depth_loss, point_loss, cross_render_and_loss, flow_loss, gt_flow_loss, self_render_and_loss, velocity_loss, sky_opacity_loss, sky_color_loss, vggt_distillation_loss, scale_loss, aggregator_render_loss
 from vggt.utils.auxiliary import RAFTCfg, calc_flow
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri, extri_intri_to_pose_encoding
 
@@ -259,12 +259,18 @@ def train(args):
 
     model.to(device)
 
-    if args.pretrained and not args.resume:
+    if not args.pretrained_velocity:
         printer.info(f"Loading pretrained: {args.pretrained}")
         ckpt = torch.load(args.pretrained, map_location=device, weights_only=True)
         model.load_state_dict(ckpt, strict=False)
         del ckpt
-        
+    else:
+        printer.info(f"Resume from: {args.pretrained_velocity}")
+        checkpoint = torch.load(args.pretrained_velocity, map_location=device)
+        ckpt = strip_module(checkpoint.get('model', checkpoint))  # Handle both wrapped and direct state_dict
+        model.load_state_dict(ckpt, strict=False)
+        del ckpt, checkpoint
+    
 
     # 检查是否使用预处理的SAM掩码
     # use_preprocessed_sam = getattr(args, "use_preprocessed_sam", False)
@@ -551,13 +557,15 @@ def train(args):
                 # 将sky masks添加到vggt_batch中，供后续使用
                 vggt_batch["sky_masks"] = sky_masks
 
-                # For VGGT model, extract images from vggt_batch  
+                # For VGGT model, extract images from vggt_batch
                 if vggt_batch.get("images") is not None:
+                    # Get frame sample ratio from config for aggregator_render_loss
+                    frame_sample_ratio = getattr(args, 'aggregator_frame_sample_ratio', 0.25)
                     preds = model(
                         vggt_batch["images"],
-                        compute_sky_color_loss=True,
-                        sky_masks=vggt_batch.get("sky_masks"),
-                        gt_images=vggt_batch.get("images")
+                        gt_extrinsics=vggt_batch.get("extrinsics"),
+                        gt_intrinsics=vggt_batch.get("intrinsics"),
+                        frame_sample_ratio=frame_sample_ratio
                     )
                 else:
                     # Fallback for other models
@@ -582,7 +590,11 @@ def train(args):
                     'camera_loss_weight': getattr(args, 'camera_loss_weight', 1.0),
                     'conf_depth_loss_weight': getattr(args, 'conf_depth_loss_weight', 1.0),
                     'grad_depth_loss_weight': getattr(args, 'grad_depth_loss_weight', 1.0),
-                    'reg_depth_loss_weight': getattr(args, 'reg_depth_loss_weight', 1.0)
+                    'reg_depth_loss_weight': getattr(args, 'reg_depth_loss_weight', 1.0),
+                    'scale_loss_weight': getattr(args, 'scale_loss_weight', 1.0),
+                    'aggregator_render_rgb_weight': getattr(args, 'aggregator_render_rgb_weight', 1.0),
+                    'aggregator_render_depth_weight': getattr(args, 'aggregator_render_depth_weight', 1.0),
+                    'aggregator_render_lpips_weight': getattr(args, 'aggregator_render_lpips_weight', 0.0),
                 }
 
                 # VGGT teacher predictions
@@ -843,7 +855,72 @@ def train(args):
                     except Exception as e:
                         print(f"Error in depth loss computation: {e}")
 
+                # 10. Scale Loss (监督scale head训练，使用depth_scale_factor作为GT)
+                if loss_weights['scale_loss_weight'] > 0 and preds.get("scale") is not None and vggt_batch.get("depth_scale_factor") is not None:
+                    try:
+                        scale_loss_dict = scale_loss(
+                            preds["scale"],
+                            vggt_batch["depth_scale_factor"]
+                        )
+                        scale_loss_value = scale_loss_dict.get("scale_loss", 0.0)
+                        loss += loss_weights['scale_loss_weight'] * scale_loss_value
+                        loss_dict.update(scale_loss_dict)
+                    except Exception as e:
+                        print(f"Error in scale loss computation: {e}")
 
+                # 11. Aggregator Render Loss (监督gaussian_head，辅助监督depth和velocity)
+                if (loss_weights['aggregator_render_rgb_weight'] > 0 or
+                    loss_weights['aggregator_render_depth_weight'] > 0 or
+                    loss_weights['aggregator_render_lpips_weight'] > 0) and \
+                   preds.get("gaussian_params") is not None and \
+                   preds.get("depth") is not None and \
+                   preds.get("velocity") is not None and \
+                   vggt_batch.get("depth_scale_factor") is not None:
+                    try:
+                        # Get sky masks if available
+                        sky_masks = vggt_batch.get("sky_masks")  # [B, S, H, W]
+
+                        # Get voxel size from config
+                        voxel_size = getattr(args, 'aggregator_voxel_size', 0.05)
+
+                        # Get GT scale factor
+                        gt_scale_factor = vggt_batch["depth_scale_factor"]
+
+                        # Get pre-computed sky colors and sampled frame indices from model forward
+                        sky_colors = preds.get("sky_colors")  # [B, num_frames, 3, H, W] or None
+                        sampled_frame_indices = preds.get("sampled_frame_indices")  # list or None
+
+                        # Compute aggregator render loss
+                        aggregator_loss_dict = aggregator_render_loss(
+                            gaussian_params=preds["gaussian_params"],
+                            depth=preds["depth"],
+                            velocity=preds["velocity"],
+                            sky_masks=sky_masks,
+                            gt_extrinsic=vggt_batch["extrinsics"],
+                            gt_intrinsic=vggt_batch["intrinsics"],
+                            gt_rgb=vggt_batch["images"],
+                            gt_depth=vggt_batch["depths"],
+                            gt_depth_mask=vggt_batch.get("point_masks"),
+                            voxel_size=voxel_size,
+                            gt_scale=gt_scale_factor,
+                            sky_colors=sky_colors,
+                            sampled_frame_indices=sampled_frame_indices,
+                            use_lpips=(loss_weights['aggregator_render_lpips_weight'] > 0),
+                        )
+
+                        # Add weighted losses
+                        if aggregator_loss_dict.get("aggregator_render_rgb_loss") is not None:
+                            loss += loss_weights['aggregator_render_rgb_weight'] * aggregator_loss_dict["aggregator_render_rgb_loss"]
+                        if aggregator_loss_dict.get("aggregator_render_depth_loss") is not None:
+                            loss += loss_weights['aggregator_render_depth_weight'] * aggregator_loss_dict["aggregator_render_depth_loss"]
+                        if aggregator_loss_dict.get("aggregator_render_lpips_loss") is not None:
+                            loss += loss_weights['aggregator_render_lpips_weight'] * aggregator_loss_dict["aggregator_render_lpips_loss"]
+
+                        loss_dict.update(aggregator_loss_dict)
+                    except Exception as e:
+                        print(f"Error in aggregator render loss computation: {e}")
+                        import traceback
+                        traceback.print_exc()
 
                 lr = optimizer.param_groups[0]["lr"]
                 metric_logger.update(epoch=epoch)
@@ -1744,6 +1821,9 @@ def cut3r_batch_to_vggt(views):
             dist_avg = world_points_flatten[world_points_mask_flatten].norm(dim=-1).mean()
             depth_scale_factor = 1 / dist_avg
             pose_scale_factor = depth_scale_factor
+
+            # 保存depth_scale_factor到batch中用于scale loss监督
+            vggt_batch['depth_scale_factor'] = depth_scale_factor
 
             # 应用非metric化
             vggt_batch['depths'] = vggt_batch['depths'] * depth_scale_factor

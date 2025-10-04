@@ -49,13 +49,14 @@ def freeze_all_params(modules):
 
 
 class VGGT(nn.Module, PyTorchModelHubMixin):
-    def __init__(self, img_size=518, patch_size=14, embed_dim=1024, use_sky_token=True, memory_efficient=True):
+    def __init__(self, img_size=518, patch_size=14, embed_dim=1024, use_sky_token=True, use_scale_token=True, memory_efficient=True):
         super().__init__()
         self.aggregator = Aggregator(
             img_size=img_size,
             patch_size=patch_size,
             embed_dim=embed_dim,
             use_sky_token=use_sky_token,
+            use_scale_token=use_scale_token,
             memory_efficient=memory_efficient,
             output_layers=[4, 11, 17, 23] if memory_efficient else None
         )
@@ -68,7 +69,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
 
         # nn.init.zeros_(self.velocity_head.scratch.output_conv2[-1].weight)
         # nn.init.zeros_(self.velocity_head.scratch.output_conv2[-1].bias)
-        
+
         # Sky token support - now managed at VGGT level
         self.use_sky_token = use_sky_token
         if self.use_sky_token:
@@ -81,7 +82,22 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 condition_channels=embed_dim*2,
                 out_channels=3,  # RGB output
             )
-        
+
+        # Scale token support - similar to map-anything for scene scale prediction
+        self.use_scale_token = use_scale_token
+        if self.use_scale_token:
+            # Scale token for global scene scale learning
+            self.scale_token = nn.Parameter(torch.zeros(embed_dim))
+            torch.nn.init.trunc_normal_(self.scale_token, std=0.02)
+            # MLP head for scale prediction (outputs single scalar per batch)
+            self.scale_head = nn.Sequential(
+                nn.Linear(embed_dim * 2, 512),
+                nn.ReLU(),
+                nn.Linear(512, 256),
+                nn.ReLU(),
+                nn.Linear(256, 1),
+            )
+
         # self.set_freeze(freeze="all")
 
     def set_freeze(self, freeze):
@@ -146,9 +162,6 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 self.gaussian_head,
                 self.depth_head,
                 self.velocity_head,
-                self.sky_head,
-                self.sky_token,
-                self.plucker_embedder,
             ],
             "old": [
                 self.aggregator,
@@ -175,11 +188,16 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             modules.append(self.track_head)
         if hasattr(self, "gaussian_head"):
             modules.append(self.gaussian_head)
+        if hasattr(self, "sky_head"):
+            modules.append(self.sky_head)
+        # scale_head is too small, no need for gradient checkpointing
 
         for module in modules:
             set_gradient_checkpointing(module)
 
-    def forward(self, images: torch.Tensor, query_points: torch.Tensor = None, compute_sky_color_loss=False, sky_masks=None, gt_images=None):
+    def forward(self, images: torch.Tensor, query_points: torch.Tensor = None,
+                gt_extrinsics: torch.Tensor = None, gt_intrinsics: torch.Tensor = None,
+                frame_sample_ratio: float = 0.25):
         """
         Forward pass of the VGGT model.
 
@@ -198,6 +216,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 - world_points (torch.Tensor): 3D world coordinates for each pixel with shape [B, S, H, W, 3]
                 - world_points_conf (torch.Tensor): Confidence scores for world points with shape [B, S, H, W]
                 - images (torch.Tensor): Original input images, preserved for visualization
+                - scale (torch.Tensor): Predicted scene scale with shape [B] (if use_scale_token=True)
 
                 If query_points is provided, also includes:
                 - track (torch.Tensor): Point tracks with shape [B, S, N, 2] (from the last iteration), in pixel coordinates
@@ -211,11 +230,15 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         if query_points is not None and len(query_points.shape) == 2:
             query_points = query_points.unsqueeze(0)
 
-        # Pass sky_token to aggregator if enabled
+        # Pass sky_token and scale_token to aggregator if enabled
+        kwargs = {}
         if self.use_sky_token:
-            aggregated_tokens_list, patch_start_idx = self.aggregator(images, sky_token=self.sky_token)
-        else:
-            aggregated_tokens_list, patch_start_idx = self.aggregator(images)
+            kwargs['sky_token'] = self.sky_token
+        if self.use_scale_token:
+            # Expand scale_token to [1, 1, embed_dim] to match sky_token format
+            kwargs['scale_token'] = self.scale_token.unsqueeze(0).unsqueeze(0)
+
+        aggregated_tokens_list, patch_start_idx = self.aggregator(images, **kwargs)
 
         predictions = {}
 
@@ -231,18 +254,36 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 predictions["depth"] = depth
                 predictions["depth_conf"] = depth_conf
 
-            if self.point_head is not None:
-                pts3d, pts3d_conf = self.point_head(
-                    aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
-                )
-                predictions["world_points"] = pts3d
-                predictions["world_points_conf"] = pts3d_conf
+            # if self.point_head is not None:
+            #     pts3d, pts3d_conf = self.point_head(
+            #         aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
+            #     )
+            #     predictions["world_points"] = pts3d
+            #     predictions["world_points_conf"] = pts3d_conf
 
             if self.gaussian_head is not None:
-                gaussian_params, gaussian_conf = self.gaussian_head(
+                gaussian_params_raw, gaussian_conf = self.gaussian_head(
                     aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
                 )
-                predictions["gaussian_params"] = gaussian_params
+                # Apply activation to gaussian parameters (moved from loss functions)
+                # gaussian_params_raw shape: [B, S, H, W, 14]
+                # 14 channels: [xyz_offset(3), scale(3), color(3), rotation(4), opacity(1)]
+                B, S, H, W, _ = gaussian_params_raw.shape
+                gaussian_params_activated = gaussian_params_raw.clone()
+
+                # Scale activation: 0.05 * exp(scale), clamped to max 0.3
+                gaussian_params_activated[..., 3:6] = (0.05 * torch.exp(gaussian_params_raw[..., 3:6])).clamp_max(0.3)
+
+                # Rotation normalization
+                rotations = gaussian_params_raw[..., 9:13]
+                rotation_norms = torch.norm(rotations, dim=-1, keepdim=True).clamp(min=1e-8)
+                gaussian_params_activated[..., 9:13] = rotations / rotation_norms
+
+                # Opacity activation: sigmoid
+                gaussian_params_activated[..., 13:14] = gaussian_params_raw[..., 13:14].sigmoid()
+
+                predictions["gaussian_params"] = gaussian_params_activated  # Activated params
+                predictions["gaussian_params_raw"] = gaussian_params_raw  # Keep raw for backward compatibility
                 predictions["gaussian_conf"] = gaussian_conf
 
             if self.velocity_head is not None:
@@ -265,25 +306,54 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         # Add sky token processing if enabled
         if self.use_sky_token:
             # Extract sky token from the first aggregated tokens (last iteration)
-            sky_token = aggregated_tokens_list[-1][:, :, :1]  # [B, S,1, embed_dim]
+            sky_token = aggregated_tokens_list[-1][:, :, :1]  # [B, S, 1, embed_dim]
             predictions["sky_token"] = sky_token
 
-        if compute_sky_color_loss and gt_images is not None:
-            pred_extrinsics, pred_intrinsics = pose_encoding_to_extri_intri(
-                predictions["pose_enc"].detach(), (images.shape[-2], images.shape[-1])
-            )
-            pred_extrinsics = torch.cat([pred_extrinsics, torch.tensor([0, 0, 0, 1], device=pred_extrinsics.device)[None,None,None,:].repeat(1,pred_extrinsics.shape[1],1,1)], dim=-2)
-            ray_directions = self.generate_ray_directions(
-                pred_intrinsics, pred_extrinsics, image_size=(images.shape[-2], images.shape[-1])
-            )
-            pred_sky_colors = self.generate_sky_color(
-                ray_directions.view(-1, ray_directions.shape[-3], ray_directions.shape[-2], 3),
-                predictions["sky_token"].view(-1, 1, predictions["sky_token"].shape[-1])
-            )
-            B, S = images.shape[:2]
-            H, W = pred_sky_colors.shape[1:3]
-            pred_sky_colors = pred_sky_colors.view(B, S, H, W, 3)
-            predictions["pred_sky_colors"] = pred_sky_colors
+            # Pre-compute sky colors if GT camera parameters are provided (for training)
+            if gt_extrinsics is not None and gt_intrinsics is not None:
+                import random
+                B, S = sky_token.shape[:2]
+                H, W = images.shape[-2:]  # Get height and width from last two dimensions
+
+                # Randomly sample frames for rendering to save memory (default: 1/4 of frames)
+                num_frames_to_render = max(1, int(S * frame_sample_ratio))
+                sampled_frame_indices = random.sample(range(S), num_frames_to_render)
+                sampled_frame_indices = sorted(sampled_frame_indices)  # Keep order for consistency
+
+                # Generate ray directions using plucker embedder (only for sampled frames)
+                sampled_intrinsics = gt_intrinsics[0, sampled_frame_indices]  # [num_frames, 3, 3]
+                sampled_extrinsics = gt_extrinsics[0, sampled_frame_indices]  # [num_frames, 4, 4]
+
+                ray_dict = self.plucker_embedder(
+                    sampled_intrinsics,
+                    sampled_extrinsics,
+                    image_size=(H, W)
+                )
+                ray_dirs = ray_dict["dirs"]  # [num_frames, H, W, 3]
+
+                # Generate sky colors using sky_head (only for sampled frames)
+                sampled_sky_token = sky_token[0, sampled_frame_indices, 0]  # [num_frames, embed_dim]
+                sky_colors_sampled = self.sky_head(
+                    ray_dirs.reshape(num_frames_to_render, H * W, 3),
+                    sampled_sky_token
+                )  # [num_frames, H*W, 3]
+                sky_colors_sampled = sky_colors_sampled.view(num_frames_to_render, H, W, 3).permute(0, 3, 1, 2)  # [num_frames, 3, H, W]
+
+                # Store sampled sky colors and indices for use in loss function
+                predictions["sky_colors"] = sky_colors_sampled.unsqueeze(0)  # [B, num_frames, 3, H, W]
+                predictions["sampled_frame_indices"] = sampled_frame_indices
+
+        # Add scale token processing if enabled
+        if self.use_scale_token:
+            # Extract scale token from aggregated tokens (last iteration)
+            # Scale token is typically placed after sky_token if both are enabled
+            token_idx = 1 if self.use_sky_token else 0
+            scale_token_features = aggregated_tokens_list[-1][:, :, token_idx:token_idx+1]  # [B, S, 1, embed_dim]
+            # Average across sequence dimension to get global scale
+            scale_token_pooled = scale_token_features.mean(dim=1).squeeze(1)  # [B, embed_dim]
+            # Pass through scale head to get predicted scale
+            predicted_scale = self.scale_head(scale_token_pooled)  # [B, 1]
+            predictions["scale"] = predicted_scale.squeeze(-1)  # [B]
 
         return predictions
 

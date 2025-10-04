@@ -132,7 +132,7 @@ def load_stage1_model(model_path, device):
         img_size=518,
         patch_size=14,
         embed_dim=1024,
-        use_sky_token=True  # 启用sky token以便生成skycolor
+        use_sky_token=True,  # 启用sky token以便生成skycolor
     )
 
     # 加载检查点（按照train.py中的正确方式）
