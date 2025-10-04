@@ -295,18 +295,25 @@ def cross_render_and_loss(conf, interval, forward_consist_mask, backward_consist
         return gaussian_loss_dict, img_dict
 
 
-def gt_flow_loss(velocity, vggt_batch):
+def gt_flow_loss(velocity, velocity_conf, vggt_batch, gamma=1.0, alpha=0.2, gradient_loss=None, valid_range=-1, disable_conf=False, all_mean=False):
     """
-    使用GT flowmap对velocity head进行直接监督
+    使用GT flowmap对velocity head进行直接监督，返回conf、reg和grad三个损失
 
     Args:
         velocity: [B, S, H*W, 3] - 预测的velocity
+        velocity_conf: [B, S, H*W] - 预测的velocity confidence
         vggt_batch: dict - 包含GT flowmap的batch数据
             - 'flowmap': [B, S, H, W, 4] - GT flowmap，前3维是3D velocity（在各帧相机坐标系下），第4维是类别（0表示无GT信息）
             - 'extrinsics': [B, S, 4, 4] - 相机外参（已转换为从第一帧到各帧的变换）
+        gamma: confidence loss的gamma参数
+        alpha: confidence loss的alpha参数
+        gradient_loss: 梯度损失类型 ("grad", "grad_impl2", "normal", None)
+        valid_range: quantile过滤范围
+        disable_conf: 是否禁用confidence loss
+        all_mean: 是否对所有帧一起取mean
 
     Returns:
-        dict: 包含gt_flow_loss的损失字典
+        dict: 包含loss_conf_flow、loss_reg_flow、loss_grad_flow的损失字典
     """
     with tf32_off():
         # 获取GT flowmap
@@ -315,12 +322,12 @@ def gt_flow_loss(velocity, vggt_batch):
         if gt_flowmap is None:
             # 如果没有GT flowmap，返回0损失
             return {
-                "gt_flow_loss": torch.tensor(0.0, device=velocity.device, requires_grad=True)
+                "loss_conf_flow": torch.tensor(0.0, device=velocity.device, requires_grad=True),
+                "loss_reg_flow": torch.tensor(0.0, device=velocity.device, requires_grad=True),
+                "gt_flow_num_valid": 0
             }
 
-        # 使用GT的pose（从vggt_batch获取）
-        gt_extrinsic = vggt_batch['extrinsics']  # [B, S, 4, 4] - GT extrinsics
-
+        # 从gt_flowmap shape推断正确的B, S, H, W
         B, S, H, W, flow_dim = gt_flowmap.shape
 
         # 提取GT velocity (前3维) 和 mask (第4维)
@@ -330,33 +337,43 @@ def gt_flow_loss(velocity, vggt_batch):
         # 检查是否有有效的GT velocity
         if gt_velocity_mask.sum() == 0:
             return {
-                "gt_flow_loss": torch.tensor(0.0, device=velocity.device, requires_grad=True),
+                "loss_conf_flow": torch.tensor(0.0, device=velocity.device, requires_grad=True),
+                "loss_reg_flow": torch.tensor(0.0, device=velocity.device, requires_grad=True),
                 "gt_flow_num_valid": 0
             }
 
-        # 将velocity reshape为与gt_velocity相同的格式
-        velocity = velocity.reshape(B, S, H, W, 3)  # [B, S, H, W, 3]
+        # velocity 的 shape 可能是 [B*S, H*W, 3], [B, S, H*W, 3], 或 [B, S, H, W, 3]
+        # 统一处理为 [B, S, H, W, 3]
+        if len(velocity.shape) == 3:
+            # [B*S, H*W, 3] -> [B, S, H, W, 3]
+            velocity = velocity.reshape(B, S, H, W, 3)
+            velocity_conf = velocity_conf.reshape(B, S, H, W)
+        elif len(velocity.shape) == 4:
+            # [B, S, H*W, 3] -> [B, S, H, W, 3]
+            velocity = velocity.reshape(B, S, H, W, 3)
+            velocity_conf = velocity_conf.reshape(B, S, H, W)
+        elif len(velocity.shape) == 5:
+            # [B, S, H, W, 3] - 已经是正确格式，不需要reshape
+            pass
+        else:
+            raise ValueError(f"Unexpected velocity shape: {velocity.shape}")
 
         # 将预测的velocity从原始输出转换（应用exp变换）
         velocity = torch.sign(velocity) * (torch.exp(torch.abs(velocity)) - 1)
 
-        # 只在有GT velocity的位置计算loss
-        # 扩展mask以匹配velocity的维度
-        valid_mask_expanded = gt_velocity_mask.unsqueeze(-1).expand(-1, -1, -1, -1, 3)  # [B, S, H, W, 3]
+        # 调用conf_loss函数来计算三个损失
+        conf_loss_dict = conf_loss(
+            velocity, velocity_conf, gt_velocity_3d, gt_velocity_mask,
+            vggt_batch, normalize_pred=False, normalize_gt=False,
+            gamma=gamma, alpha=alpha, affine_inv=False,
+            gradient_loss=gradient_loss, valid_range=valid_range,
+            postfix="_flow", disable_conf=disable_conf, all_mean=all_mean
+        )
 
-        # 提取有效位置的velocity
-        pred_velocity_valid = velocity[valid_mask_expanded]  # [N_valid]
-        gt_velocity_valid = gt_velocity_3d[valid_mask_expanded]  # [N_valid]
+        # 添加额外的统计信息
+        conf_loss_dict["gt_flow_num_valid"] = gt_velocity_mask.sum().item()
 
-        # 计算L1 loss
-        loss = F.l1_loss(pred_velocity_valid, gt_velocity_valid)
-        loss = check_and_fix_inf_nan(loss, "gt_flow_loss")
-
-        # 返回损失字典
-        return {
-            "gt_flow_loss": loss,
-            "gt_flow_num_valid": gt_velocity_mask.sum().item()
-        }
+        return conf_loss_dict
 
 
 def flow_loss(conf, interval, forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, depth, velocity, pose_enc, extrinsic, intrinsic, gt_rgb, vggt_batch, sky_masks=None):
@@ -1120,6 +1137,61 @@ def normalize_pointcloud(pts3d, valid_mask, eps=1e-3):
     return pts3d, avg_scale
 
 
+def gradient_loss(prediction, target, mask, conf=None, gamma=1.0, alpha=0.2):
+    """
+    Gradient-based loss. Computes the L1 difference between adjacent pixels in x and y directions.
+
+    Args:
+        prediction: (B, H, W, C) predicted values
+        target: (B, H, W, C) ground truth values
+        mask: (B, H, W) valid pixel mask
+        conf: (B, H, W) confidence weights (optional)
+        gamma: Weight for confidence loss
+        alpha: Weight for confidence regularization
+    """
+    # Expand mask to match prediction channels
+    mask = mask[..., None].expand(-1, -1, -1, prediction.shape[-1])
+    M = torch.sum(mask, (1, 2, 3))
+
+    # Compute difference between prediction and target
+    diff = prediction - target
+    diff = torch.mul(mask, diff)
+
+    # Compute gradients in x direction (horizontal)
+    grad_x = torch.abs(diff[:, :, 1:] - diff[:, :, :-1])
+    mask_x = torch.mul(mask[:, :, 1:], mask[:, :, :-1])
+    grad_x = torch.mul(mask_x, grad_x)
+
+    # Compute gradients in y direction (vertical)
+    grad_y = torch.abs(diff[:, 1:, :] - diff[:, :-1, :])
+    mask_y = torch.mul(mask[:, 1:, :], mask[:, :-1, :])
+    grad_y = torch.mul(mask_y, grad_y)
+
+    # Clamp gradients to prevent outliers
+    grad_x = grad_x.clamp(max=100)
+    grad_y = grad_y.clamp(max=100)
+
+    # Apply confidence weighting if provided
+    if conf is not None:
+        conf = conf[..., None].expand(-1, -1, -1, prediction.shape[-1])
+        conf_x = conf[:, :, 1:]
+        conf_y = conf[:, 1:, :]
+
+        grad_x = gamma * grad_x * conf_x - alpha * torch.log(conf_x)
+        grad_y = gamma * grad_y * conf_y - alpha * torch.log(conf_y)
+
+    # Sum gradients and normalize by number of valid pixels
+    grad_loss = torch.sum(grad_x, (1, 2, 3)) + torch.sum(grad_y, (1, 2, 3))
+    divisor = torch.sum(M)
+
+    if divisor == 0:
+        return 0
+    else:
+        grad_loss = torch.sum(grad_loss) / divisor
+
+    return grad_loss
+
+
 def depth_loss(depth, depth_conf, batch, gamma=1.0, alpha=0.2, loss_type="conf", predict_disparity=False, affine_inv=False, gradient_loss=None, valid_range=-1, disable_conf=False, all_mean=False, **kwargs):
 
     gt_depth = batch['depths'].clone()
@@ -1265,10 +1337,13 @@ def conf_loss(pts3d, pts3d_conf, gt_pts3d, valid_mask,  batch, normalize_gt=True
 
         conf_loss = conf_loss_first_frame + conf_loss_other_frames
 
-    # Verified that the loss is the same
+    # Compute reg_loss for logging
+    reg_loss_value = (loss_reg_first_frame.mean() if loss_reg_first_frame.numel() > 0 else 0) + \
+               (loss_reg_other_frames.mean() if loss_reg_other_frames.numel() > 0 else 0)
 
     loss_dict = {
         f"loss_conf{postfix}": conf_loss,
+        f"loss_reg{postfix}": reg_loss_value,
         f"loss_reg1{postfix}": loss_reg_first_frame.detach().mean() if loss_reg_first_frame.numel() > 0 else 0,
         f"loss_reg2{postfix}": loss_reg_other_frames.detach().mean() if loss_reg_other_frames.numel() > 0 else 0,
         f"loss_conf1{postfix}": conf_loss_first_frame,

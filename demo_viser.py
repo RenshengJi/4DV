@@ -436,9 +436,9 @@ def get_next_pts(preds, pred_pts=False):
 
 
 parser = argparse.ArgumentParser(description="VGGT demo with viser for 3D visualization")
-parser.add_argument(
-    "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/val/segment-1505698981571943321_1186_773_1206_773_with_camera_labels.tfrecord", help="Path to folder containing images"
-)
+# parser.add_argument(
+#     "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/val/segment-1505698981571943321_1186_773_1206_773_with_camera_labels.tfrecord", help="Path to folder containing images"
+# )
 # parser.add_argument(
 #     "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train/segment-15795616688853411272_1245_000_1265_000_with_camera_labels.tfrecord", help="Path to folder containing images"
 # )
@@ -446,11 +446,11 @@ parser.add_argument(
 #     "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train/segment-10023947602400723454_1120_000_1140_000_with_camera_labels.tfrecord", help="Path to folder containing images"
 # )
 # parser.add_argument(
-#     "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train/segment-10023947602400723454_1120_000_1140_000_with_camera_labels.tfrecord", help="Path to folder containing images"
-# )
-# parser.add_argument(
 #     "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train/segment-14830022845193837364_3488_060_3508_060_with_camera_labels.tfrecord", help="Path to folder containing images"
 # )
+parser.add_argument(
+    "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train/segment-1005081002024129653_5313_150_5333_150_with_camera_labels.tfrecord", help="Path to folder containing images"
+)
 parser.add_argument(
     "--image_interval", type=int, default=1, help="Interval for selecting images from the folder"
 )
@@ -497,7 +497,8 @@ def main():
 
     model = VGGT()
     # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(true+fixmodel+lowlr!+nolpips+onlyflow+velocitylocal+fromscratch)/checkpoint-epoch_2_17880.pth", map_location=device)['model']
-    ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow/checkpoint-epoch_1_11392.pth", map_location=device)['model']
+    # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow+depthgrad(true)+depth+flowgradconf/checkpoint-epoch_1_45570.pth", map_location=device)['model']
+    ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow/checkpoint-epoch_4_24208.pth", map_location=device)['model']
     ckpt = {k.replace("module.", ""): v for k, v in ckpt.items()}
     model.load_state_dict(ckpt, strict=False)
     # model = VGGT(use_sky_token=False)
@@ -522,7 +523,7 @@ def main():
     # 只提取_后面是1.jpg或.png的图片
     image_names = [name for name in image_names if name.split("/")[-1].split("_")[-1] in ["1.jpg", "1.png"]]
     # image_names = sorted(image_names)[::5]
-    image_names = sorted(image_names)[40:48]
+    image_names = sorted(image_names)[160:168]
     # 第一个不变，其他逆序
     # image_names = [image_names[0]] + image_names[1:][::-1]
     print(f"Found {len(image_names)} images")

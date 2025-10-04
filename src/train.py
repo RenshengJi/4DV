@@ -571,14 +571,18 @@ def train(args):
                 loss_weights = {
                     'self_render_weight': getattr(args, 'self_render_weight', 1.0),
                     'flow_loss_weight': getattr(args, 'flow_loss_weight', 1.0),
-                    'gt_flow_loss_weight': getattr(args, 'gt_flow_loss_weight', 0.0),  # GT flowmap 监督损失
+                    'conf_flow_loss_weight': getattr(args, 'conf_flow_loss_weight', 1.0),  # GT flowmap conf损失
+                    'grad_flow_loss_weight': getattr(args, 'grad_flow_loss_weight', 1.0),  # GT flowmap grad损失
+                    'reg_flow_loss_weight': getattr(args, 'reg_flow_loss_weight', 1.0),   # GT flowmap reg损失
                     'sam2_velocity_weight': getattr(args, 'sam2_velocity_weight', 1.0),
                     'sky_opacity_weight': getattr(args, 'sky_opacity_weight', 1.0),
                     'sky_color_weight': getattr(args, 'sky_color_weight', 1.0),
                     'velocity_reg_weight': getattr(args, 'velocity_reg_weight', 0.001),
                     'vggt_distill_weight': getattr(args, 'vggt_distill_weight', 1.0),
                     'camera_loss_weight': getattr(args, 'camera_loss_weight', 1.0),
-                    'depth_loss_weight': getattr(args, 'depth_loss_weight', 1.0)
+                    'conf_depth_loss_weight': getattr(args, 'conf_depth_loss_weight', 1.0),
+                    'grad_depth_loss_weight': getattr(args, 'grad_depth_loss_weight', 1.0),
+                    'reg_depth_loss_weight': getattr(args, 'reg_depth_loss_weight', 1.0)
                 }
 
                 # VGGT teacher predictions
@@ -686,17 +690,36 @@ def train(args):
                         print(f"Error in flow loss computation: {e}")
 
                 # 3. GT Flow Loss (直接使用GT flowmap监督velocity head)
-                if loss_weights['gt_flow_loss_weight'] > 0 and preds.get("velocity") is not None and vggt_batch.get("flowmap") is not None:
+                # 返回三个损失：loss_conf_flow, loss_reg_flow, loss_grad_flow
+                if (loss_weights['conf_flow_loss_weight'] > 0 or
+                    loss_weights['grad_flow_loss_weight'] > 0 or
+                    loss_weights['reg_flow_loss_weight'] > 0) and \
+                   preds.get("velocity") is not None and \
+                   preds.get("velocity_conf") is not None and \
+                   vggt_batch.get("flowmap") is not None:
                     try:
                         gt_flow_loss_dict = gt_flow_loss(
                             preds["velocity"],
-                            vggt_batch
+                            preds["velocity_conf"],
+                            vggt_batch,
+                            gradient_loss="grad",
+                            valid_range=0.98
                         )
-                        gt_flow_loss_value = gt_flow_loss_dict.get("gt_flow_loss", 0.0)
-                        loss += loss_weights['gt_flow_loss_weight'] * gt_flow_loss_value
+
+                        # 分别计算三个损失
+                        conf_flow_loss = gt_flow_loss_dict.get("loss_conf_flow", 1.0)
+                        reg_flow_loss = gt_flow_loss_dict.get("loss_reg_flow", 1.0)
+                        grad_flow_loss = gt_flow_loss_dict.get("loss_grad_flow", 1.0)
+
+                        loss += loss_weights['conf_flow_loss_weight'] * conf_flow_loss
+                        loss += loss_weights['reg_flow_loss_weight'] * reg_flow_loss
+                        loss += loss_weights['grad_flow_loss_weight'] * grad_flow_loss
+
                         loss_dict.update(gt_flow_loss_dict)
                     except Exception as e:
                         print(f"Error in GT flow loss computation: {e}")
+                        import traceback
+                        traceback.print_exc()
 
                 # 4. SAM2 Velocity Consistency Loss (辅助velocity head监督)
                 if loss_weights['sam2_velocity_weight'] > 0 and vggt_batch.get("images") is not None:
@@ -803,15 +826,19 @@ def train(args):
                         print(f"Error in camera loss computation: {e}")
 
                 # 9. Depth Loss (监督depth head训练)
-                if loss_weights['depth_loss_weight'] > 0 and preds.get("depth") is not None and preds.get("depth_conf") is not None and vggt_batch.get("depths") is not None:
+                if loss_weights['conf_depth_loss_weight'] > 0 and preds.get("depth") is not None and preds.get("depth_conf") is not None and vggt_batch.get("depths") is not None:
                     try:
                         depth_loss_dict = depth_loss(
                             preds["depth"],
                             preds["depth_conf"],
                             vggt_batch,
+                            gradient_loss="grad",
+                            valid_range=0.98
                         )
                         depth_loss_value = depth_loss_dict.get("loss_conf_depth", 0.0)
-                        loss += loss_weights['depth_loss_weight'] * depth_loss_value
+                        gradient_loss_value = depth_loss_dict.get("loss_grad_depth", 0.0)
+                        reg_loss_value = depth_loss_dict.get("loss_reg_depth", 0.0)
+                        loss += loss_weights['conf_depth_loss_weight'] * depth_loss_value + loss_weights['grad_depth_loss_weight'] * gradient_loss_value + loss_weights['reg_depth_loss_weight'] * reg_loss_value
                         loss_dict.update(depth_loss_dict)
                     except Exception as e:
                         print(f"Error in depth loss computation: {e}")

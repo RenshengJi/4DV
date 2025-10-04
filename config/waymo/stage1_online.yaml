@@ -63,7 +63,10 @@ flow_loss_weight: 0.0                      # 光流监督velocity学习
 flow_interval: 1                           # 光流计算的帧间隔
 
 # 3. GT Flow Loss (直接使用GT flowmap监督velocity head)
-gt_flow_loss_weight: 1.0                   # GT flowmap直接监督velocity学习
+# 类似depth loss，返回三个损失：conf、reg、grad
+conf_flow_loss_weight: 1.0                 # GT flowmap conf损失权重
+grad_flow_loss_weight: 1.0                 # GT flowmap gradient损失权重
+reg_flow_loss_weight: 1.0                  # GT flowmap reg损失权重
 
 # 4. SAM2 Velocity Consistency Loss (辅助velocity head监督)
 sam2_velocity_weight: 0.0                  # SAM2掩码一致性监督
@@ -82,11 +85,12 @@ velocity_reg_weight: 0.0                 # 速度正则化约束
 vggt_distill_weight: 0.0                  # VGGT teacher蒸馏监督，防止unfreeze backbone时输出漂移
 
 # 9. Camera Loss (监督camera head训练)
-camera_loss_weight: 1.0                   # 相机参数预测损失权重
+camera_loss_weight: 5.0                   # 相机参数预测损失权重
 
 # 10. Depth Loss (监督depth head训练)
-depth_loss_weight: 1.0                    # 深度预测损失权重
-
+conf_depth_loss_weight: 1.0                    # 深度预测损失权重
+grad_depth_loss_weight: 1.0                 # 深度梯度损失权重
+reg_depth_loss_weight: 1.0                      # 深度正则化损失权重
 # =============== 数据集配置 ===============
 
 allow_repeat: False
@@ -107,12 +111,12 @@ seed: 0
 batch_size: 1
 accum_iter: 4
 gradient_checkpointing: True
-epochs: 10
+epochs: 2
 start_epoch: 0
 weight_decay: 0.05
-lr: 3e-5
+lr: 1e-4
 min_lr: 1e-8
-warmup_epochs: 0.005
+warmup_epochs: 0.02
 amp: 1
 
 # =============== 训练监控配置 ===============
@@ -134,7 +138,7 @@ num_imgs_vis: 4
 
 # =============== 输出配置 ===============
 save_dir: 'checkpoints/waymo_stage1_online'
-exp_name: 'stage1_gtflow'
+exp_name: 'stage1_gtflow+depthgrad(true)+depth+flowgradconf'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/

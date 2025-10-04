@@ -10,3 +10,6 @@
 [submodule "src/storm"]
 	path = src/storm
 	url = https://github.com/NVlabs/GaussianSTORM.git
+[submodule "src/map-anything"]
+	path = src/map-anything
+	url = https://github.com/facebookresearch/map-anything.git
