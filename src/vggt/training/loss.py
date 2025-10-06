@@ -757,19 +757,22 @@ def sam2_velocity_consistency_loss_impl(images, velocity, sam2_model, device):
     }
 
 
-def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic, gt_rgb, pred_sky_colors=None, sky_masks=None):
+def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic, gt_rgb, pred_sky_colors=None, sky_masks=None, sampled_frame_indices=None, iteration=0, lpips_start_iter=5000):
     """
     自渲染损失函数：每一帧自己进行渲染与监督，支持天空区域的mask替代
 
     Args:
         depth: [B, S, H, W] 深度图
-        gaussian_params: [B, S, H*W, 14] 高斯参数
+        gaussian_params: [B, S, H*W, 14] 高斯参数 (已激活)
         pose_enc: [B, S, 7] 姿态编码
         extrinsic: [B, S, 4, 4] 外参矩阵
         intrinsic: [B, S, 3, 3] 内参矩阵
         gt_rgb: [B, S, 3, H, W] 真实RGB图像
         pred_sky_colors: [B, S, H, W, 3] 预测的天空颜色 (可选)
         sky_masks: [B, S, H, W] 天空mask，1表示天空区域 (可选)
+        sampled_frame_indices: list 采样的帧索引 (可选，如果为None则渲染所有帧)
+        iteration: int 当前训练iteration (用于控制LPIPS loss启动时机)
+        lpips_start_iter: int LPIPS loss开始计算的iteration (default: 5000)
 
     Returns:
         dict: 损失字典
@@ -799,31 +802,29 @@ def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic,
         xyz = xyz.reshape(xyz.shape[0], image_height *
                           image_width, 3)  # [S, H*W, 3]
 
-        # 处理高斯参数
+        # 处理高斯参数 (已在forward中激活，直接使用)
         gaussian_params = gaussian_params.reshape(
             1, -1, image_height * image_width, 14)  # [S, H*W, 14]
-        scale = gaussian_params[0, ..., 3:6]
-        scale = (0.05 * torch.exp(scale)).clamp_max(0.3)  # [S, H*W, 3]
-        color = gaussian_params[0, ..., 6:9].unsqueeze(-2)  # [S, H*W, 1, 3]
-        rotations = gaussian_params[0, ..., 9:13]
-
-        # 旋转归一化
-        rotation_norms = torch.norm(rotations, dim=-1, keepdim=True)
-        rotation_norms = torch.clamp(rotation_norms, min=1e-8)
-        rotations = rotations / rotation_norms
-
-        opacity = gaussian_params[0, ...,
-                                  13:14].sigmoid().squeeze(-1)  # [S, H*W]
+        scale = gaussian_params[0, ..., 3:6]  # [S, H*W, 3] (already activated)
+        color = gaussian_params[0, ..., 6:9].unsqueeze(-2)  # [S, H*W, 1, 3] (already activated)
+        rotations = gaussian_params[0, ..., 9:13]  # [S, H*W, 4] (already normalized)
+        opacity = gaussian_params[0, ..., 13]  # [S, H*W] (already activated)
 
         # 准备渲染参数
         viewmat = extrinsic.permute(1, 0, 2, 3)
         K = intrinsic.permute(1, 0, 2, 3)
 
-        # Pre-allocate tensors for results (optimization: avoid list append + stack)
-        render_colors_tensor = torch.zeros(S, image_height, image_width, 4, device=gt_rgb.device, dtype=xyz.dtype)
+        # Determine which frames to render
+        if sampled_frame_indices is None:
+            # Render all frames if not specified
+            sampled_frame_indices = list(range(S))
+        num_frames_to_render = len(sampled_frame_indices)
 
-        # 对每一帧进行自渲染
-        for i in range(S):
+        # Pre-allocate tensors for results (only for sampled frames)
+        render_colors_tensor = torch.zeros(num_frames_to_render, image_height, image_width, 4, device=gt_rgb.device, dtype=xyz.dtype)
+
+        # 对采样的帧进行自渲染
+        for render_idx, i in enumerate(sampled_frame_indices):
             # 使用当前帧的3D点进行渲染（不使用velocity，因为是自己渲染自己）
             mean_current = xyz[i]  # 不使用velocity，直接使用当前帧的3D点
 
@@ -860,19 +861,19 @@ def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic,
                     eps2d=0.3,
                 )
 
-            # Write directly to pre-allocated tensor
-            render_colors_tensor[i] = render_color
+            # Write directly to pre-allocated tensor using render_idx
+            render_colors_tensor[render_idx] = render_color
 
-        # Extract RGB and depth from render results
-        gt_colors = gt_rgb[0]  # [S, 3, H, W]
-        gt_depths = depth.view(B * S, image_height, image_width).view(S, image_height, image_width)  # [S, H, W]
+        # Extract RGB and depth from render results (only sampled frames)
+        gt_colors_sampled = gt_rgb[0, sampled_frame_indices]  # [num_frames_to_render, 3, H, W]
+        gt_depths_sampled = depth.view(B * S, image_height, image_width)[sampled_frame_indices]  # [num_frames_to_render, H, W]
 
-        pred_rgb = render_colors_tensor[..., :3].permute(0, 3, 1, 2)   # [S, 3, H, W]
+        pred_rgb = render_colors_tensor[..., :3].permute(0, 3, 1, 2)   # [num_frames_to_render, 3, H, W]
         pred_rgb = torch.clamp(pred_rgb, min=0, max=1)
 
         # 如果有天空颜色预测和天空mask，用天空颜色替换天空区域
         if pred_sky_colors is not None and sky_masks is not None:
-            for i in range(S):
+            for render_idx, i in enumerate(sampled_frame_indices):
                 current_sky_mask_2d = sky_masks[0, i]  # [H, W]
                 sky_colors_frame = pred_sky_colors[0, i]  # [H, W, 3]
 
@@ -881,30 +882,34 @@ def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic,
                 if sky_mask_bool.any():
                     # 将天空颜色从[H, W, 3]转换为[3, H, W]然后替换
                     sky_colors_chw = sky_colors_frame.permute(2, 0, 1)  # [3, H, W]
-                    pred_rgb[i, :, sky_mask_bool] = sky_colors_chw[:, sky_mask_bool]
+                    pred_rgb[render_idx, :, sky_mask_bool] = sky_colors_chw[:, sky_mask_bool]
 
-        pred_depth = render_colors_tensor[..., -1]  # [S, H, W]
+        pred_depth = render_colors_tensor[..., -1]  # [num_frames_to_render, H, W]
 
-        # 计算损失
-        # 对于depth loss，如果有天空mask，需要排除天空区域
+        # 计算损失 (only on sampled frames)
+        # 对于depth loss，如果有天空mask��需要排除天空区域
         if sky_masks is not None:
-            # 创建非天空区域的mask
-            non_sky_mask = ~sky_masks[0].bool()  # [S, H, W]
+            # 创建非天空区域的mask (only for sampled frames)
+            non_sky_mask = ~sky_masks[0, sampled_frame_indices].bool()  # [num_frames_to_render, H, W]
             # 只在非天空区域计算depth loss
             if non_sky_mask.sum() > 0:
-                depth_loss = F.l1_loss(pred_depth[non_sky_mask], gt_depths[non_sky_mask])
+                depth_loss = F.l1_loss(pred_depth[non_sky_mask], gt_depths_sampled[non_sky_mask])
             else:
                 depth_loss = torch.tensor(0.0, device=gt_rgb.device, requires_grad=True)
         else:
             # 没有天空mask，计算全图depth loss
-            depth_loss = F.l1_loss(pred_depth, gt_depths)
+            depth_loss = F.l1_loss(pred_depth, gt_depths_sampled)
         depth_loss = check_and_fix_inf_nan(depth_loss, "self_depth_loss")
 
-        rgb_loss = F.l1_loss(pred_rgb, gt_colors)
+        rgb_loss = F.l1_loss(pred_rgb, gt_colors_sampled)
         rgb_loss = check_and_fix_inf_nan(rgb_loss, "self_rgb_mse")
 
-        lpips_loss = compute_lpips(pred_rgb, gt_colors).mean()
-        lpips_loss = check_and_fix_inf_nan(lpips_loss, "self_lpips_loss")
+        # Only compute LPIPS loss after lpips_start_iter
+        if iteration >= lpips_start_iter:
+            lpips_loss = compute_lpips(pred_rgb, gt_colors_sampled).mean()
+            lpips_loss = check_and_fix_inf_nan(lpips_loss, "self_lpips_loss")
+        else:
+            lpips_loss = torch.tensor(0.0, device=gt_rgb.device, requires_grad=True)
 
         self_loss_dict = {
             "loss_self_render_rgb": rgb_loss,
@@ -914,9 +919,9 @@ def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic,
 
         img_dict = {
             "self_rgb_pred": pred_rgb,
-            "self_rgb_gt": gt_colors,
+            "self_rgb_gt": gt_colors_sampled,
             "self_depth_pred": pred_depth.unsqueeze(1),
-            "self_depth_gt": gt_depths.unsqueeze(1),
+            "self_depth_gt": gt_depths_sampled.unsqueeze(1),
         }
 
         return self_loss_dict, img_dict
@@ -927,7 +932,7 @@ def sky_opacity_loss(gaussian_params, sky_masks, weight=1.0):
     Loss to encourage gaussian opacity to be 0 in sky regions and 1 in non-sky regions.
 
     Args:
-        gaussian_params (torch.Tensor): Gaussian parameters [B, S, H, W, 15]
+        gaussian_params (torch.Tensor): Gaussian parameters [B, S, H, W, 14]
         sky_masks (torch.Tensor): Sky masks [B, S, H, W] where 1 indicates sky regions
         weight (float): Loss weight
 
@@ -953,7 +958,7 @@ def sky_opacity_loss(gaussian_params, sky_masks, weight=1.0):
     non_sky_loss = torch.mean(torch.abs(non_sky_opacity - 1.0))
 
     # Combine both losses
-    total_loss = sky_loss + non_sky_loss
+    total_loss = sky_loss # + non_sky_loss
 
     return {
         "sky_opacity_loss": total_loss * weight
@@ -1886,7 +1891,7 @@ def aggregator_render_loss(
     gt_extrinsic, gt_intrinsic, gt_rgb, gt_depth, gt_depth_mask=None,
     voxel_size=0.05, gt_scale=1.0,
     sky_colors=None, sampled_frame_indices=None,
-    use_lpips=True
+    use_lpips=True, iteration=0, lpips_start_iter=5000
 ):
     """
     Aggregator Render Loss - 监督gaussian_head, 辅助监督depth和velocity
@@ -1983,6 +1988,15 @@ def aggregator_render_loss(
         depth_all = depth_flat.reshape(B * S * H * W)  # [N]
         sky_mask_all = sky_masks_flat.reshape(B * S * H * W)  # [N]
 
+        # for debug: prepare gt_color_all for debug visualization
+        # gt_rgb_flat = gt_rgb.view(B * S, 3, H, W).permute(0, 2, 3, 1)  # [BS, H, W, 3]
+        # gt_color_all = gt_rgb_flat.reshape(B * S * H * W, 3)  # [N, 3]
+        # # Replace color (indices 6:9) with gt_color and scale (indices 3:6) with 0.01
+        # gt_color_all =  (gt_color_all - 0.5) / 0.28209479177387814
+        # gaussian_params_all[:, 6:9] = gt_color_all  # Replace color with GT
+        # gaussian_params_all[:, 3:6] = 0.001  # Set uniform scale to 0.01
+        # gaussian_params_all[:, 13] = 0.8  # Set opacity to 1.0 for debug
+
         # === Step 2-5: For each sampled target frame, transform all xyz, quantize, render ===
         for render_idx, target_frame in enumerate(sampled_frame_indices):
             # Transform all frames' xyz to target_frame (vectorized)
@@ -1992,7 +2006,7 @@ def aggregator_render_loss(
 
             # Vectorized transformation: xyz + velocity * time_offset for all frames
             # xyz_per_frame: [S, H*W, 3], velocity_global_per_frame: [S, H*W, 3]
-            xyz_at_target_all = xyz_per_frame + velocity_global_per_frame * time_offsets[:, None, None]  # [S, H*W, 3]
+            xyz_at_target_all = xyz_per_frame - velocity_global_per_frame * time_offsets[:, None, None]  # [S, H*W, 3]
             xyz_at_target_all = xyz_at_target_all.reshape(S * H * W, 3)  # [S*H*W, 3]
 
             # Create attributes dictionary (reuse pre-computed tensors)
@@ -2002,11 +2016,19 @@ def aggregator_render_loss(
                 'depth': depth_all,
             }
 
-            # Voxel quantization at target frame
-            selected_xyz, selected_attrs = voxel_quantize_random_sampling(
-                xyz_at_target_all, attributes_dict, sky_mask_all,
-                voxel_size=voxel_size, gt_scale=gt_scale
-            )
+            # Voxel quantization at target frame (skip if voxel_size <= 0)
+            if voxel_size > 0:
+                selected_xyz, selected_attrs = voxel_quantize_random_sampling(
+                    xyz_at_target_all, attributes_dict, sky_mask_all,
+                    voxel_size=voxel_size, gt_scale=gt_scale
+                )
+            else:
+                # No voxel quantization, use all non-sky points
+                non_sky_mask = ~sky_mask_all.bool()
+                selected_xyz = xyz_at_target_all[non_sky_mask]
+                selected_attrs = {
+                    key: val[non_sky_mask] for key, val in attributes_dict.items()
+                }
 
             if selected_xyz.shape[0] == 0:
                 # No valid points, render_colors and render_depths already initialized to zeros
@@ -2064,9 +2086,9 @@ def aggregator_render_loss(
         else:
             depth_loss = F.l1_loss(render_depths, gt_depths_stack)
 
-        # LPIPS loss
+        # LPIPS loss - Only compute after lpips_start_iter
         lpips_loss = torch.tensor(0.0, device=device)
-        if use_lpips:
+        if use_lpips and iteration >= lpips_start_iter:
             lpips_loss = compute_lpips(render_colors, gt_colors_stack).mean()
 
         return {

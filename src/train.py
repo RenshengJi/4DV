@@ -261,7 +261,7 @@ def train(args):
 
     if not args.pretrained_velocity:
         printer.info(f"Loading pretrained: {args.pretrained}")
-        ckpt = torch.load(args.pretrained, map_location=device, weights_only=True)
+        ckpt = torch.load(args.pretrained, map_location=device)
         model.load_state_dict(ckpt, strict=False)
         del ckpt
     else:
@@ -659,7 +659,9 @@ def train(args):
                             vggt_batch["intrinsics"],
                             vggt_batch["images"],
                             pred_sky_colors=preds.get("pred_sky_colors"),
-                            sky_masks=vggt_batch.get("sky_masks")
+                            sky_masks=vggt_batch.get("sky_masks"),
+                            iteration=epoch * len(data_loader_train) + data_iter_step,
+                            lpips_start_iter=getattr(args, 'lpips_start_iter', 5000)
                         )
                         # 将所有self_render损失加入到总loss中
                         self_render_rgb_loss = self_loss_dict.get("loss_self_render_rgb", 0.0)
@@ -906,6 +908,8 @@ def train(args):
                             sky_colors=sky_colors,
                             sampled_frame_indices=sampled_frame_indices,
                             use_lpips=(loss_weights['aggregator_render_lpips_weight'] > 0),
+                            iteration=epoch * len(data_loader_train) + data_iter_step,
+                            lpips_start_iter=getattr(args, 'lpips_start_iter', 5000)
                         )
 
                         # Add weighted losses

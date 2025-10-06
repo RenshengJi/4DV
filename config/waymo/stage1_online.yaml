@@ -4,7 +4,9 @@
 # =============== 模型配置 ===============
 model: "VGGT(img_size=518, patch_size=14, embed_dim=1024)"
 # pretrained: model.pt
-pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow/checkpoint-epoch_7_9968.pth"
+# pretrained_velocity: False
+# pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow/checkpoint-epoch_7_9968.pth"
+pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow+depthgrad(true)+depth+flowgradconf+aggregatorenderloss+fixopacity+no1opacityloss+fixdirection+fromvresume+lpips+quantize0.05/checkpoint-epoch_0_8544.pth"
 
 # VGGT冻结策略配置
 # 可选值: "none", "encoder", "encoder_frame", "backbone", "backbone_camera", "backbone_pts",
@@ -39,7 +41,7 @@ long_context: True
 fixed_length: False
 resume: null
 benchmark: False
-num_views: 16
+num_views: 8
 num_test_views: 16
 n_corres_train: 0
 n_corres_test: 0
@@ -53,11 +55,13 @@ training_stage: 'stage1'
 # =============== 第一阶段损失权重配置 ===============
 # 权重为0则完全不计算该损失
 
+lpips_start_iter: 0                     # LPIPS loss开始计算的iteration
+
 # 1. Self Render Loss (训练gaussian head)
 self_render_weight: 0.0                    # Gaussian参数学习的主要损失 (已弃用，使用下面的分项权重)
-self_render_rgb_weight: 1.0                # RGB损失权重
-self_render_lpips_weight: 0.1              # LPIPS感知损失权重
-self_render_depth_weight: 1.0              # 深度损失权重
+self_render_rgb_weight: 0.0                # RGB损失权重
+self_render_lpips_weight: 0.0              # LPIPS感知损失权重
+self_render_depth_weight: 0.0              # 深度损失权重
 
 # 2. Flow Loss (训练velocity head)
 flow_loss_weight: 0.0                      # 光流监督velocity学习
@@ -66,7 +70,7 @@ flow_interval: 1                           # 光流计算的帧间隔
 # 3. GT Flow Loss (直接使用GT flowmap监督velocity head)
 # 类似depth loss，返回三个损失：conf、reg、grad
 conf_flow_loss_weight: 1.0                 # GT flowmap conf损失权重
-grad_flow_loss_weight: 1.0                 # GT flowmap gradient损失权重
+grad_flow_loss_weight: 0.0                 # GT flowmap gradient损失权重
 reg_flow_loss_weight: 1.0                  # GT flowmap reg损失权重
 
 # 4. SAM2 Velocity Consistency Loss (辅助velocity head监督)
@@ -100,7 +104,7 @@ scale_loss_weight: 1.0                      # 场景尺度预测损失权重
 aggregator_render_rgb_weight: 1.0           # Aggregator render RGB损失权重
 aggregator_render_depth_weight: 1.0         # Aggregator render depth损失权重
 aggregator_render_lpips_weight: 0.1         # Aggregator render LPIPS损失权重
-aggregator_voxel_size: 0.2                # 体素量化大小(metric尺度, 单位m)
+aggregator_voxel_size: 0.05                # 体素量化大小(metric尺度, 单位m)
 
 # =============== 数据集配置 ===============
 
@@ -149,7 +153,7 @@ num_imgs_vis: 4
 
 # =============== 输出配置 ===============
 save_dir: 'checkpoints/waymo_stage1_online'
-exp_name: 'stage1_gtflow+depthgrad(true)+depth+flowgradconf+aggregatorenderloss+fixopacity'
+exp_name: 'aggregator_resume_noflowgrad'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/
