@@ -6,8 +6,8 @@ debug: true
 # =============== 模型配置 ===============
 model: "VGGT(img_size=518, patch_size=14, embed_dim=1024)"
 # pretrained: model.pt
-pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow+depthgrad(true)+depth+flowgradconf+aggregatorenderloss+fixopacity+no1opacityloss+fixdirection+fromvresume+lpips/checkpoint-epoch_0_2848.pth"
-# pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow/checkpoint-epoch_7_9968.pth"
+# pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow+depthgrad(true)+depth+flowgradconf+aggregatorenderloss+fixopacity+no1opacityloss+fixdirection+fromvresume+lpips/checkpoint-epoch_0_2848.pth"
+pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow/checkpoint-epoch_7_9968.pth"
 
 
 
@@ -105,7 +105,8 @@ scale_loss_weight: 1.0                      # 场景尺度预测损失权重
 aggregator_render_rgb_weight: 1.0           # Aggregator render RGB损失权重
 aggregator_render_depth_weight: 1.0         # Aggregator render depth损失权重
 aggregator_render_lpips_weight: 0.1         # Aggregator render LPIPS损失权重
-aggregator_voxel_size: 0.2                # 体素量化大小(metric尺度, 单位m)
+aggregator_voxel_size: 0.05                # 体素量化大小(metric尺度, 单位m)
+aggregator_dynamic_threshold: 0.1          # 动静态分离的速度阈值(metric尺度, 单位m/s)
 
 # =============== 数据集配置 ===============
 

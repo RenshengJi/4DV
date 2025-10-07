@@ -6,7 +6,7 @@ model: "VGGT(img_size=518, patch_size=14, embed_dim=1024)"
 # pretrained: model.pt
 # pretrained_velocity: False
 # pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow/checkpoint-epoch_7_9968.pth"
-pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow+depthgrad(true)+depth+flowgradconf+aggregatorenderloss+fixopacity+no1opacityloss+fixdirection+fromvresume+lpips+quantize0.05/checkpoint-epoch_0_8544.pth"
+pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/aggregator_resume_noflowgrad_nearestdynamic/checkpoint-epoch_0_35805.pth"
 
 # VGGT冻结策略配置
 # 可选值: "none", "encoder", "encoder_frame", "backbone", "backbone_camera", "backbone_pts",
@@ -105,6 +105,7 @@ aggregator_render_rgb_weight: 1.0           # Aggregator render RGB损失权重
 aggregator_render_depth_weight: 1.0         # Aggregator render depth损失权重
 aggregator_render_lpips_weight: 0.1         # Aggregator render LPIPS损失权重
 aggregator_voxel_size: 0.05                # 体素量化大小(metric尺度, 单位m)
+aggregator_dynamic_threshold: 0.1          # 动静态分离的速度阈值(metric尺度, 单位m/s)
 
 # =============== 数据集配置 ===============
 
@@ -153,7 +154,7 @@ num_imgs_vis: 4
 
 # =============== 输出配置 ===============
 save_dir: 'checkpoints/waymo_stage1_online'
-exp_name: 'aggregator_resume_noflowgrad'
+exp_name: 'aggregator_resume_noflowgrad_nearestdynamic_resume_0point1'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/

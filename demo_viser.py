@@ -501,7 +501,7 @@ def main():
     # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow/checkpoint-epoch_4_24208.pth", map_location=device)['model']
     ckpt = {k.replace("module.", ""): v for k, v in ckpt.items()}
     model.load_state_dict(ckpt, strict=False)
-    # model = VGGT(use_sky_token=False)
+    # model = VGGT(use_sky_token=False, use_scale_token=False)    
     # model.load_state_dict(torch.load("src/model.pt"), strict=False)
 
     model.eval()

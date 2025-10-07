@@ -1826,14 +1826,14 @@ def scale_loss(predicted_scale, gt_scale):
         }
 
 
-def voxel_quantize_random_sampling(xyz, attributes_dict, sky_mask, voxel_size=0.05, gt_scale=1.0):
+def voxel_quantize_random_sampling(xyz, attributes_dict, sky_mask=None, voxel_size=0.05, gt_scale=1.0):
     """
     体素量化with随机采样 - 每个体素随机选择一个pixel
 
     Args:
         xyz: [N, 3] - 3D positions in metric scale
         attributes_dict: dict of tensors with shape [N, ...] - attributes to aggregate (gaussian params, depth, etc.)
-        sky_mask: [N] - Boolean mask, True for sky pixels (to be filtered out)
+        sky_mask: [N] or None - Boolean mask, True for sky pixels (to be filtered out). If None, no sky filtering.
         voxel_size: float - Voxel size in metric scale (e.g., 0.05 for 5cm)
         gt_scale: float or tensor - GT scale factor to convert to metric scale
 
@@ -1842,14 +1842,19 @@ def voxel_quantize_random_sampling(xyz, attributes_dict, sky_mask, voxel_size=0.
         selected_attributes: dict of tensors [M, ...] - Selected attributes
     """
     with tf32_off():
-        # Filter out sky pixels
-        valid_mask = ~sky_mask.bool()
-        xyz_valid = xyz[valid_mask]  # [N_valid, 3]
+        # Filter out sky pixels (if sky_mask is provided)
+        if sky_mask is not None:
+            valid_mask = ~sky_mask.bool()
+            xyz_valid = xyz[valid_mask]  # [N_valid, 3]
 
-        if xyz_valid.shape[0] == 0:
-            # No valid points, return empty
-            empty_result = {k: v[valid_mask] for k, v in attributes_dict.items()}
-            return xyz_valid, empty_result
+            if xyz_valid.shape[0] == 0:
+                # No valid points, return empty
+                empty_result = {k: v[valid_mask] for k, v in attributes_dict.items()}
+                return xyz_valid, empty_result
+        else:
+            # No sky filtering, use all points
+            xyz_valid = xyz
+            valid_mask = None
 
         # Convert to metric scale
         xyz_metric = xyz_valid / gt_scale
@@ -1879,9 +1884,15 @@ def voxel_quantize_random_sampling(xyz, attributes_dict, sky_mask, voxel_size=0.
         # Select xyz and attributes
         selected_xyz = xyz_valid[selected_indices]
         selected_attributes = {}
-        for k, v in attributes_dict.items():
-            v_valid = v[valid_mask]
-            selected_attributes[k] = v_valid[selected_indices]
+        if valid_mask is not None:
+            # Sky mask was provided, need to filter attributes first
+            for k, v in attributes_dict.items():
+                v_valid = v[valid_mask]
+                selected_attributes[k] = v_valid[selected_indices]
+        else:
+            # No sky filtering, directly index attributes
+            for k, v in attributes_dict.items():
+                selected_attributes[k] = v[selected_indices]
 
         return selected_xyz, selected_attributes
 
@@ -1891,18 +1902,23 @@ def aggregator_render_loss(
     gt_extrinsic, gt_intrinsic, gt_rgb, gt_depth, gt_depth_mask=None,
     voxel_size=0.05, gt_scale=1.0,
     sky_colors=None, sampled_frame_indices=None,
-    use_lpips=True, iteration=0, lpips_start_iter=5000
+    use_lpips=True, iteration=0, lpips_start_iter=5000,
+    dynamic_threshold=0.1
 ):
     """
     Aggregator Render Loss - 监督gaussian_head, 辅助监督depth和velocity
 
-    工作流程:
+    改进的工作流程（动静态分离）:
     1. Accumulate所有pixel的depth和gaussian参数
     2. 使用sky_masks过滤sky部分
-    3. 体素量化（metric尺度下固定大小，随机选择每个体素的一个pixel）
-    4. Render到所有帧
-    5. 叠加sky_head的sky_image
-    6. 计算RGB、LPIPS、depth loss
+    3. 使用velocity阈值分离动态和静态gaussian
+    4. 对静态gaussian进行全局体素量化（所有帧累积）
+    5. 对每个目标帧:
+       - 动态gaussian: 只使用当前帧、前一帧、后一帧（temporal window）
+       - 通过velocity transform到目标帧，然后体素量化
+       - 合并静态和动态gaussian进行渲染
+    6. 叠加sky_head的sky_image
+    7. 计算RGB、LPIPS、depth loss
 
     Args:
         gaussian_params: [B, S, H, W, 14] - Activated gaussian parameters
@@ -1919,6 +1935,7 @@ def aggregator_render_loss(
         sky_colors: [B, num_frames, 3, H, W] - Pre-computed sky colors for sampled frames (optional)
         sampled_frame_indices: list - Pre-sampled frame indices from model forward (optional)
         use_lpips: bool - Whether to compute LPIPS loss
+        dynamic_threshold: float - Velocity threshold for dynamic-static separation (m/s, default 0.1)
 
     Returns:
         dict: Loss dictionary with aggregator_render_rgb_loss, aggregator_render_depth_loss, etc.
@@ -1997,45 +2014,132 @@ def aggregator_render_loss(
         # gaussian_params_all[:, 3:6] = 0.001  # Set uniform scale to 0.01
         # gaussian_params_all[:, 13] = 0.8  # Set opacity to 1.0 for debug
 
-        # === Step 2-5: For each sampled target frame, transform all xyz, quantize, render ===
-        for render_idx, target_frame in enumerate(sampled_frame_indices):
-            # Transform all frames' xyz to target_frame (vectorized)
-            # frame s -> target_frame: xyz + velocity * (target_frame - s)
-            # Create time offset vector: [S]
-            time_offsets = torch.arange(S, device=device) - target_frame  # [-target, ..., 0, ..., S-1-target]
+        # === Step 1.5: Filter out sky pixels first ===
+        non_sky_mask = ~sky_mask_all.bool()  # [N]
+        xyz_per_frame_flat = xyz_per_frame.reshape(B * S * H * W, 3)  # [N, 3]
 
-            # Vectorized transformation: xyz + velocity * time_offset for all frames
-            # xyz_per_frame: [S, H*W, 3], velocity_global_per_frame: [S, H*W, 3]
-            xyz_at_target_all = xyz_per_frame - velocity_global_per_frame * time_offsets[:, None, None]  # [S, H*W, 3]
-            xyz_at_target_all = xyz_at_target_all.reshape(S * H * W, 3)  # [S*H*W, 3]
+        # Apply sky filtering
+        xyz_non_sky = xyz_per_frame_flat[non_sky_mask]  # [N_valid, 3]
+        gaussian_params_non_sky = gaussian_params_all[non_sky_mask]  # [N_valid, 14]
+        velocity_global_non_sky = velocity_global_all[non_sky_mask]  # [N_valid, 3]
+        depth_non_sky = depth_all[non_sky_mask]  # [N_valid]
 
-            # Create attributes dictionary (reuse pre-computed tensors)
-            attributes_dict = {
-                'gaussian_params': gaussian_params_all,
-                'velocity': velocity_global_all,
-                'depth': depth_all,
+        # Keep track of which frame each point belongs to
+        frame_indices = torch.arange(B * S, device=device).repeat_interleave(H * W)  # [N]
+        frame_indices_non_sky = frame_indices[non_sky_mask]  # [N_valid]
+
+        # === Step 2: Dynamic-static separation ===
+        # Compute velocity magnitude in metric scale (velocity is in non-metric scale)
+        # Convert gt_scale to tensor if it's a scalar
+        if not isinstance(gt_scale, torch.Tensor):
+            gt_scale_tensor = torch.tensor(gt_scale, device=device, dtype=velocity_global_non_sky.dtype)
+        else:
+            gt_scale_tensor = gt_scale
+
+        # Convert velocity to metric scale: velocity_metric = velocity / gt_scale
+        velocity_global_non_sky_metric = velocity_global_non_sky / gt_scale_tensor
+        velocity_magnitude_metric = torch.norm(velocity_global_non_sky_metric, dim=-1)  # [N_valid], in m/s
+
+        # Separate dynamic and static gaussians using metric-scale threshold
+        is_dynamic = velocity_magnitude_metric > dynamic_threshold  # [N_valid]
+        is_static = ~is_dynamic  # [N_valid]
+
+        # Static gaussians (accumulated across all frames)
+        xyz_static = xyz_non_sky[is_static]  # [N_static, 3]
+        gaussian_params_static = gaussian_params_non_sky[is_static]  # [N_static, 14]
+        depth_static = depth_non_sky[is_static]  # [N_static]
+
+        # Dynamic gaussians (per-frame, for temporal window)
+        xyz_dynamic_per_frame = []  # List of [N_dynamic_i, 3] for each frame
+        gaussian_params_dynamic_per_frame = []  # List of [N_dynamic_i, 14] for each frame
+        velocity_dynamic_per_frame = []  # List of [N_dynamic_i, 3] for each frame
+        depth_dynamic_per_frame = []  # List of [N_dynamic_i] for each frame
+
+        for frame_idx in range(S):
+            frame_mask = (frame_indices_non_sky == frame_idx) & is_dynamic  # [N_valid]
+            xyz_dynamic_per_frame.append(xyz_non_sky[frame_mask])
+            gaussian_params_dynamic_per_frame.append(gaussian_params_non_sky[frame_mask])
+            velocity_dynamic_per_frame.append(velocity_global_non_sky[frame_mask])
+            depth_dynamic_per_frame.append(depth_non_sky[frame_mask])
+
+        # === Step 3: Voxel quantize static gaussians (globally, no velocity transform) ===
+        if voxel_size > 0 and xyz_static.shape[0] > 0:
+            static_attributes = {
+                'gaussian_params': gaussian_params_static,
+                'depth': depth_static,
             }
+            xyz_static_quantized, static_attrs_quantized = voxel_quantize_random_sampling(
+                xyz_static, static_attributes, sky_mask=None,  # sky already filtered
+                voxel_size=voxel_size, gt_scale=gt_scale
+            )
+            gaussian_params_static_quantized = static_attrs_quantized['gaussian_params']
+        else:
+            # No voxel quantization or no static points
+            xyz_static_quantized = xyz_static
+            gaussian_params_static_quantized = gaussian_params_static
 
-            # Voxel quantization at target frame (skip if voxel_size <= 0)
-            if voxel_size > 0:
-                selected_xyz, selected_attrs = voxel_quantize_random_sampling(
-                    xyz_at_target_all, attributes_dict, sky_mask_all,
-                    voxel_size=voxel_size, gt_scale=gt_scale
-                )
+        # === Step 4: For each sampled target frame, process dynamic gaussians and render ===
+        for render_idx, target_frame in enumerate(sampled_frame_indices):
+            # Define temporal window: [target_frame-1, target_frame, target_frame+1]
+            temporal_window = []
+            if target_frame > 0:
+                temporal_window.append(target_frame - 1)  # Previous frame
+            temporal_window.append(target_frame)  # Current frame
+            if target_frame < S - 1:
+                temporal_window.append(target_frame + 1)  # Next frame
+
+            # Collect dynamic gaussians from temporal window
+            xyz_dynamic_list = []
+            gaussian_params_dynamic_list = []
+
+            for source_frame in temporal_window:
+                if xyz_dynamic_per_frame[source_frame].shape[0] == 0:
+                    continue  # No dynamic gaussians in this frame
+
+                # Transform to target frame: xyz - velocity * (target_frame + source_frame)
+                time_offset = target_frame - source_frame
+                xyz_transformed = xyz_dynamic_per_frame[source_frame] + \
+                                velocity_dynamic_per_frame[source_frame] * time_offset
+
+                xyz_dynamic_list.append(xyz_transformed)
+                gaussian_params_dynamic_list.append(gaussian_params_dynamic_per_frame[source_frame])
+
+            # Concatenate dynamic gaussians from temporal window
+            if len(xyz_dynamic_list) > 0:
+                xyz_dynamic_concat = torch.cat(xyz_dynamic_list, dim=0)  # [N_dynamic_total, 3]
+                gaussian_params_dynamic_concat = torch.cat(gaussian_params_dynamic_list, dim=0)  # [N_dynamic_total, 14]
+
+                # Voxel quantize dynamic gaussians
+                if voxel_size > 0:
+                    dynamic_attributes = {
+                        'gaussian_params': gaussian_params_dynamic_concat,
+                    }
+                    xyz_dynamic_quantized, dynamic_attrs_quantized = voxel_quantize_random_sampling(
+                        xyz_dynamic_concat, dynamic_attributes, sky_mask=None,  # sky already filtered
+                        voxel_size=voxel_size, gt_scale=gt_scale
+                    )
+                    gaussian_params_dynamic_quantized = dynamic_attrs_quantized['gaussian_params']
+                else:
+                    xyz_dynamic_quantized = xyz_dynamic_concat
+                    gaussian_params_dynamic_quantized = gaussian_params_dynamic_concat
             else:
-                # No voxel quantization, use all non-sky points
-                non_sky_mask = ~sky_mask_all.bool()
-                selected_xyz = xyz_at_target_all[non_sky_mask]
-                selected_attrs = {
-                    key: val[non_sky_mask] for key, val in attributes_dict.items()
-                }
+                # No dynamic gaussians in temporal window
+                xyz_dynamic_quantized = torch.empty(0, 3, device=device, dtype=xyz_static_quantized.dtype)
+                gaussian_params_dynamic_quantized = torch.empty(0, 14, device=device, dtype=gaussian_params_static_quantized.dtype)
 
-            if selected_xyz.shape[0] == 0:
-                # No valid points, render_colors and render_depths already initialized to zeros
+            # Merge static and dynamic gaussians
+            if xyz_static_quantized.shape[0] > 0 and xyz_dynamic_quantized.shape[0] > 0:
+                selected_xyz = torch.cat([xyz_static_quantized, xyz_dynamic_quantized], dim=0)
+                selected_gaussian_params = torch.cat([gaussian_params_static_quantized, gaussian_params_dynamic_quantized], dim=0)
+            elif xyz_static_quantized.shape[0] > 0:
+                selected_xyz = xyz_static_quantized
+                selected_gaussian_params = gaussian_params_static_quantized
+            elif xyz_dynamic_quantized.shape[0] > 0:
+                selected_xyz = xyz_dynamic_quantized
+                selected_gaussian_params = gaussian_params_dynamic_quantized
+            else:
+                # No valid gaussians, skip rendering
                 continue
-
-            # Extract selected attributes
-            selected_gaussian_params = selected_attrs['gaussian_params']  # [M, 14]
 
             # Parse gaussian parameters (already activated in forward)
             scale = selected_gaussian_params[:, 3:6]  # [M, 3]

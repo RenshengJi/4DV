@@ -909,7 +909,8 @@ def train(args):
                             sampled_frame_indices=sampled_frame_indices,
                             use_lpips=(loss_weights['aggregator_render_lpips_weight'] > 0),
                             iteration=epoch * len(data_loader_train) + data_iter_step,
-                            lpips_start_iter=getattr(args, 'lpips_start_iter', 5000)
+                            lpips_start_iter=getattr(args, 'lpips_start_iter', 5000),
+                            dynamic_threshold=getattr(args, 'aggregator_dynamic_threshold', 0.1)
                         )
 
                         # Add weighted losses
