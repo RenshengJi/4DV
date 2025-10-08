@@ -6,7 +6,6 @@
 
 from dust3r.utils.misc import tf32_off
 from gsplat.rendering import rasterization
-from dust3r.utils.metrics import compute_lpips
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 import torch
 import torch.nn as nn
@@ -67,15 +66,11 @@ class Stage2RenderLoss(nn.Module):
     def __init__(
         self,
         rgb_weight: float = 1.0,
-        depth_weight: float = 0.0,  # 禁用depth loss
-        lpips_weight: float = 0.1,
-        consistency_weight: float = 0.0  # 禁用consistency loss
+        depth_weight: float = 0.0  # 禁用depth loss
     ):
         super().__init__()
         self.rgb_weight = rgb_weight
         self.depth_weight = depth_weight
-        self.lpips_weight = lpips_weight
-        self.consistency_weight = consistency_weight
 
     def forward(
         self,
@@ -105,8 +100,6 @@ class Stage2RenderLoss(nn.Module):
 
         total_rgb_loss = torch.tensor(0.0, device=device)
         total_depth_loss = torch.tensor(0.0, device=device)
-        total_lpips_loss = torch.tensor(0.0, device=device)
-        total_consistency_loss = torch.tensor(0.0, device=device)
 
         rendered_images = []
         rendered_depths = []
@@ -155,29 +148,12 @@ class Stage2RenderLoss(nn.Module):
                     )
                     total_depth_loss += depth_loss
 
-        # LPIPS损失（批量计算）
-        if len(rendered_images) > 0:
-            rendered_stack = torch.stack(
-                rendered_images, dim=0)  # [S, 3, H, W]
-            gt_stack = gt_images[0]  # [S, 3, H, W]
-
-            lpips_loss = compute_lpips(rendered_stack, gt_stack).mean()
-            total_lpips_loss = lpips_loss
-
-        # 一致性损失 - 仅在权重大于0时计算
-        if self.consistency_weight > 0:
-            consistency_loss = self._compute_consistency_loss(
-                rendered_images, rendered_depths)
-            total_consistency_loss = consistency_loss
-
         # 平均损失
         num_frames = max(S, 1)
 
         loss_dict = {
             'stage2_rgb_loss': self.rgb_weight * (total_rgb_loss / num_frames),
             'stage2_depth_loss': torch.tensor(0.0, device=device) if self.depth_weight == 0 else self.depth_weight * (total_depth_loss / num_frames),
-            'stage2_lpips_loss': self.lpips_weight * total_lpips_loss,
-            'stage2_consistency_loss': torch.tensor(0.0, device=device) if self.consistency_weight == 0 else self.consistency_weight * total_consistency_loss,
         }
 
         # 总损失
@@ -385,8 +361,14 @@ class Stage2RenderLoss(nn.Module):
                     rendered_depth = torch.zeros(height, width, device=device)
                 else:
                     try:
-                        rendered_rgb = rendered_image[0, ..., :3].permute(
-                            2, 0, 1)  # [3, H, W]
+                        # rendered_image shape: [1, H, W, C] where C includes RGB channels
+                        # Extract RGB channels and permute to [3, H, W]
+                        if rendered_image.dim() == 4:
+                            # Shape is [1, H, W, C]
+                            rendered_rgb = rendered_image[0, :, :, :3].permute(2, 0, 1)  # [3, H, W]
+                        else:
+                            # Fallback: assume shape is already [H, W, C]
+                            rendered_rgb = rendered_image[:, :, :3].permute(2, 0, 1)  # [3, H, W]
 
                         # 应用天空替换：对opacity < 0.01的区域使用sky_colors
                         if sky_colors is not None and rendered_alphas is not None:
@@ -398,13 +380,17 @@ class Stage2RenderLoss(nn.Module):
                         rendered_rgb = torch.clamp(rendered_rgb, 0.0, 1.0)
 
                     except Exception as e:
+                        print(f"Error in RGB extraction: {e}, rendered_image.shape={rendered_image.shape}")
                         rendered_rgb = torch.zeros(
                             3, height, width, device=device)
 
                     try:
                         # 正确提取depth：从rendered_image的最后一个维度
                         # 参考cross_render_and_loss中的实现：pred_depth = render_colors[..., -1]
-                        rendered_depth = rendered_image[0, ..., -1]  # [H, W]
+                        if rendered_image.dim() == 4:
+                            rendered_depth = rendered_image[0, :, :, -1]  # [H, W]
+                        else:
+                            rendered_depth = rendered_image[:, :, -1]  # [H, W]
 
                         # 确保depth的维度正确
                         if rendered_depth.dim() != 2:
@@ -693,153 +679,13 @@ class Stage2RenderLoss(nn.Module):
 
         return torch.tensor([w, x, y, z], device=R.device)
 
-    def _compute_consistency_loss(
-        self,
-        rendered_images: List[torch.Tensor],
-        rendered_depths: List[torch.Tensor]
-    ) -> torch.Tensor:
-        """计算跨帧一致性损失"""
-        if len(rendered_images) < 2:
-            return torch.tensor(0.0, device=rendered_images[0].device)
-
-        consistency_loss = 0.0
-        num_pairs = 0
-
-        # 计算相邻帧的一致性
-        for i in range(len(rendered_images) - 1):
-            img1 = rendered_images[i]
-            img2 = rendered_images[i + 1]
-
-            # 图像梯度一致性
-            grad1_x = torch.abs(img1[:, :, 1:] - img1[:, :, :-1])
-            grad1_y = torch.abs(img1[:, 1:, :] - img1[:, :-1, :])
-            grad2_x = torch.abs(img2[:, :, 1:] - img2[:, :, :-1])
-            grad2_y = torch.abs(img2[:, 1:, :] - img2[:, :-1, :])
-
-            grad_consistency = F.l1_loss(
-                grad1_x, grad2_x) + F.l1_loss(grad1_y, grad2_y)
-            consistency_loss += grad_consistency
-            num_pairs += 1
-
-        return consistency_loss / max(num_pairs, 1)
-
-
-class Stage2GeometricLoss(nn.Module):
-    """第二阶段几何损失"""
-
-    def __init__(
-        self,
-        gaussian_regularization_weight: float = 0.0,  # 禁用gaussian regularization
-        pose_regularization_weight: float = 0.0,  # 禁用pose regularization
-        temporal_smoothness_weight: float = 0.0  # 禁用temporal smoothness
-    ):
-        super().__init__()
-        self.gaussian_reg_weight = gaussian_regularization_weight
-        self.pose_reg_weight = pose_regularization_weight
-        self.temporal_smoothness_weight = temporal_smoothness_weight
-
-    def forward(self, refinement_results: Dict) -> Dict[str, torch.Tensor]:
-        """
-        计算几何正则化损失
-
-        Args:
-            refinement_results: Stage2Refiner的输出结果
-
-        Returns:
-            loss_dict: 几何损失字典
-        """
-        loss_dict = {}
-        # 安全地获取设备信息
-        device = torch.device('cuda')
-        if refinement_results['refined_dynamic_objects']:
-            for obj_data in refinement_results['refined_dynamic_objects']:
-                if obj_data.get('gaussian_deltas') is not None:
-                    device = obj_data['gaussian_deltas'].device
-                    break
-                elif obj_data.get('refined_gaussians') is not None:
-                    device = obj_data['refined_gaussians'].device
-                    break
-
-        total_gaussian_reg = torch.tensor(0.0, device=device)
-        total_pose_reg = torch.tensor(0.0, device=device)
-        total_temporal_smooth = torch.tensor(0.0, device=device)
-        num_objects = 0
-
-        for obj_data in refinement_results['refined_dynamic_objects']:
-            num_objects += 1
-
-            # Gaussian参数正则化 - 仅在权重大于0时计算
-            if self.gaussian_reg_weight > 0 and obj_data['gaussian_deltas'] is not None:
-                gaussian_deltas = obj_data['gaussian_deltas']
-
-                # L1正则化：鼓励稀疏的变化
-                gaussian_l1_reg = torch.mean(torch.abs(gaussian_deltas))
-                total_gaussian_reg += gaussian_l1_reg
-
-                # 尺度正则化：防止过大的尺度变化
-                scale_deltas = gaussian_deltas[:, 3:6]
-                scale_reg = torch.mean(torch.abs(scale_deltas))
-                total_gaussian_reg += 0.5 * scale_reg
-
-                # 透明度正则化：防止透明度剧变
-                if gaussian_deltas.shape[1] > 10:
-                    opacity_deltas = gaussian_deltas[:, 10:11]
-                    opacity_reg = torch.mean(torch.abs(opacity_deltas))
-                    total_gaussian_reg += 0.5 * opacity_reg
-
-            # 位姿参数正则化 - 仅在权重大于0时计算
-            if self.pose_reg_weight > 0 and obj_data['pose_deltas']:
-                pose_deltas = torch.stack(
-                    obj_data['pose_deltas'])  # [num_frames, 6]
-
-                # L1正则化：鼓励小的位姿变化
-                pose_l1_reg = torch.mean(torch.abs(pose_deltas))
-                total_pose_reg += pose_l1_reg
-
-                # 旋转和平移分别正则化
-                rot_deltas = pose_deltas[:, :3]
-                trans_deltas = pose_deltas[:, 3:6]
-
-                rot_reg = torch.mean(torch.abs(rot_deltas))
-                trans_reg = torch.mean(torch.abs(trans_deltas))
-
-                total_pose_reg += 0.3 * rot_reg + 0.7 * trans_reg
-
-            # 时间平滑性：相邻帧的位姿变化应该平滑 - 仅在权重大于0时计算
-            if self.temporal_smoothness_weight > 0 and obj_data['pose_deltas']:
-                pose_deltas = torch.stack(
-                    obj_data['pose_deltas'])  # [num_frames, 6]
-                if pose_deltas.shape[0] > 1:
-                    temporal_diff = pose_deltas[1:] - pose_deltas[:-1]
-                    temporal_smooth = torch.mean(torch.abs(temporal_diff))
-                    total_temporal_smooth += temporal_smooth
-
-        # 平均损失
-        if num_objects > 0:
-            total_gaussian_reg /= num_objects
-            total_pose_reg /= num_objects
-            total_temporal_smooth /= num_objects
-
-        loss_dict = {
-            'stage2_gaussian_reg': torch.tensor(0.0, device=device) if self.gaussian_reg_weight == 0 else self.gaussian_reg_weight * total_gaussian_reg,
-            'stage2_pose_reg': torch.tensor(0.0, device=device) if self.pose_reg_weight == 0 else self.pose_reg_weight * total_pose_reg,
-            'stage2_temporal_smooth': torch.tensor(0.0, device=device) if self.temporal_smoothness_weight == 0 else self.temporal_smoothness_weight * total_temporal_smooth,
-        }
-
-        # 检查和修复异常值
-        for key, value in loss_dict.items():
-            loss_dict[key] = check_and_fix_inf_nan(value, key)
-
-        return loss_dict
-
 
 class Stage2CompleteLoss(nn.Module):
     """第二阶段完整损失函数"""
 
     def __init__(
         self,
-        render_loss_config: Optional[Dict] = None,
-        geometric_loss_config: Optional[Dict] = None
+        render_loss_config: Optional[Dict] = None
     ):
         super().__init__()
 
@@ -848,19 +694,9 @@ class Stage2CompleteLoss(nn.Module):
             render_loss_config = {
                 'rgb_weight': 1.0,
                 'depth_weight': 0.0,  # 禁用depth loss
-                'lpips_weight': 0.1,
-                'consistency_weight': 0.0  # 禁用consistency loss
-            }
-
-        if geometric_loss_config is None:
-            geometric_loss_config = {
-                'gaussian_regularization_weight': 0.0,  # 禁用gaussian regularization
-                'pose_regularization_weight': 0.0,  # 禁用pose regularization
-                'temporal_smoothness_weight': 0.0  # 禁用temporal smoothness
             }
 
         self.render_loss = Stage2RenderLoss(**render_loss_config)
-        self.geometric_loss = Stage2GeometricLoss(**geometric_loss_config)
 
     def forward(
         self,
@@ -893,17 +729,8 @@ class Stage2CompleteLoss(nn.Module):
             intrinsics, extrinsics, frame_masks
         )
 
-        # 几何损失
-        geometric_loss_dict = self.geometric_loss(refinement_results)
-
-        # 合并损失
-        complete_loss_dict = {**render_loss_dict, **geometric_loss_dict}
-
-        # 计算总损失
-        total_loss = render_loss_dict['stage2_total_loss']
-        for key, value in geometric_loss_dict.items():
-            total_loss = total_loss + value
-
-        complete_loss_dict['stage2_final_total_loss'] = total_loss
+        # 直接使用渲染损失作为完整损失
+        complete_loss_dict = render_loss_dict.copy()
+        complete_loss_dict['stage2_final_total_loss'] = render_loss_dict['stage2_total_loss']
 
         return complete_loss_dict

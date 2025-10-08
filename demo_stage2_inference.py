@@ -156,28 +156,21 @@ def load_stage2_components(stage2_model_path, device):
     """加载Stage2组件"""
     print(f"Loading Stage2 components...")
 
-    # Stage2配置
+    # Stage2配置（使用稀疏卷积）
     stage2_config = {
         'training_mode': 'gaussian_only',
-        'input_gaussian_dim': 14,  # 添加输入Gaussian维度配置
-        'output_gaussian_dim': 14,  # 添加输出Gaussian维度配置
+        'input_gaussian_dim': 14,
+        'output_gaussian_dim': 14,
         'gaussian_feature_dim': 128,
-        'gaussian_num_layers': 4,
-        'gaussian_num_heads': 8,
-        'gaussian_mlp_ratio': 4.0,
-        'k_neighbors': 20,
-        'use_local_attention': True,
+        'gaussian_num_conv_layers': 2,
+        'gaussian_voxel_size': 0.05,
+        'max_num_points_per_voxel': 5,
         'pose_feature_dim': 128,
-        'pose_num_heads': 8,
-        'pose_num_layers': 3,
-        'max_points_per_object': 2048,
+        'pose_num_conv_layers': 2,
+        'pose_voxel_size': 0.1,
+        'max_points_per_object': 4096,
         'rgb_loss_weight': 1.0,
         'depth_loss_weight': 0.0,
-        'lpips_loss_weight': 0.1,
-        'consistency_loss_weight': 0.0,
-        'gaussian_reg_weight': 0.0,
-        'pose_reg_weight': 0.0,
-        'temporal_smooth_weight': 0.0,
     }
 
     # 创建Stage2训练器
@@ -202,9 +195,7 @@ def load_stage2_components(stage2_model_path, device):
     # 创建Stage2渲染损失（仅用于渲染）
     render_loss_config = {
         'rgb_weight': 1.0,
-        'depth_weight': 0.0,
-        'lpips_weight': 0.0,
-        'consistency_weight': 0.0
+        'depth_weight': 0.0
     }
 
     stage2_render_loss = Stage2RenderLoss(**render_loss_config)
@@ -249,11 +240,11 @@ def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, 
             clustering_results.append({
                 'points': frame_points,
                 'labels': torch.full((len(frame_points),), -1, dtype=torch.long),
-                'dynamic_mask': dynamic_mask,
                 'num_clusters': 0,
                 'cluster_centers': [],
                 'cluster_velocities': [],
-                'cluster_sizes': []
+                'cluster_sizes': [],
+                'cluster_indices': []
             })
             continue
 
@@ -276,6 +267,7 @@ def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, 
         cluster_centers = []
         cluster_velocities = []
         cluster_sizes = []
+        cluster_indices = []
         valid_labels = []
 
         for label in sorted(all_unique_labels):
@@ -295,11 +287,15 @@ def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, 
                 cluster_velocities.append(avg_velocity)
                 cluster_sizes.append(cluster_size)
                 valid_labels.append(label)
+                # 计算聚类的点索引
+                cluster_point_indices = np.where(cluster_mask)[0]
+                dynamic_indices = torch.where(dynamic_mask)[0]
+                cluster_indices.append(dynamic_indices[cluster_point_indices].cpu().numpy().tolist())
             else:
                 # 将过滤掉的聚类重新标记为静态点（-1）
-                cluster_indices = np.where(cluster_mask)[0]
+                cluster_point_indices = np.where(cluster_mask)[0]
                 dynamic_indices = torch.where(dynamic_mask)[0]
-                filtered_indices = dynamic_indices[cluster_indices]
+                filtered_indices = dynamic_indices[cluster_point_indices]
                 full_labels[filtered_indices] = -1
 
         # 更新聚类数量
@@ -318,13 +314,11 @@ def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, 
         clustering_results.append({
             'points': frame_points,
             'labels': full_labels,
-            'dynamic_mask': dynamic_mask,
             'num_clusters': num_clusters,
-            'dynamic_points': dynamic_points,
-            'cluster_labels': torch.from_numpy(cluster_labels),
             'cluster_centers': cluster_centers,
             'cluster_velocities': cluster_velocities,
-            'cluster_sizes': cluster_sizes
+            'cluster_sizes': cluster_sizes,
+            'cluster_indices': cluster_indices
         })
 
     return clustering_results
@@ -778,10 +772,7 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
     start_time = time.time()
     with torch.no_grad():
         stage1_preds = stage1_model(
-            vggt_batch["images"],
-            compute_sky_color_loss=True,  # 启用天空颜色预测
-            sky_masks=vggt_batch.get("sky_masks"),
-            gt_images=vggt_batch["images"],
+            vggt_batch["images"]
         )
     stage1_pred_time = time.time() - start_time
 
@@ -825,6 +816,15 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
             stage1_preds, vggt_batch, auxiliary_models
         )
         dynamic_process_time = time.time() - start_time
+
+        # 显示阶段时间统计
+        if dynamic_objects_data and 'stage_times' in dynamic_objects_data:
+            stage_times = dynamic_objects_data['stage_times']
+            print(f"[Stage Times] Preprocessing: {stage_times.get('preprocessing', 0):.3f}s | "
+                  f"Clustering+Background: {stage_times.get('clustering_background', 0):.3f}s | "
+                  f"Tracking: {stage_times.get('tracking', 0):.3f}s | "
+                  f"Aggregation: {stage_times.get('aggregation', 0):.3f}s | "
+                  f"Total: {dynamic_objects_data.get('processing_time', 0):.3f}s")
 
         if not dynamic_objects_data or len(dynamic_objects_data['dynamic_objects']) == 0:
             # 如果没有动态物体，使用静态Gaussian进行渲染

@@ -29,7 +29,7 @@ export CUDA_VISIBLE_DEVICES=0
 # STAGE1_MODEL_PATH="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow+depthgrad(true)+depth+flowgradconf+aggregatorenderloss+fixopacity+no1opacityloss+fixdirection+fromv/checkpoint-epoch_0_22784.pth"
 # STAGE1_MODEL_PATH="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow+depthgrad(true)+depth+flowgradconf+aggregatorenderloss+fixopacity+no1opacityloss+fixdirection+fromvresume+lpips+noquantize/checkpoint-epoch_0_19530.pth"
 # STAGE1_MODEL_PATH="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow+depthgrad(true)+depth+flowgradconf+aggregatorenderloss+fixopacity+no1opacityloss+fixdirection+fromvresume+lpips+quantize0.05/checkpoint-epoch_0_8544.pth"
-STAGE1_MODEL_PATH="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/aggregator_resume_noflowgrad_nearestdynamic/checkpoint-epoch_0_26040.pth"
+STAGE1_MODEL_PATH="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/aggregator_resume_noflowgrad_nearestdynamic_resume_0point1_novoxel/checkpoint-epoch_0_28480.pth"
 
 # 光流模型路径
 FLOW_MODEL_PATH="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/Tartan-C-T-TSKH-kitti432x960-M.pth"
@@ -51,7 +51,7 @@ PYTHON_CMD="/opt/miniconda/envs/vggt/bin/python demo_stage1_inference_for_aggreg
     --seq_dir \"${SEQ_DIR}\" \
     --output_dir \"${OUTPUT_DIR}\" \
     --device cuda \
-    --num_views 24 \
+    --num_views 8 \
     --voxel_size ${VOXEL_SIZE} \
     --dynamic_threshold ${DYNAMIC_THRESHOLD} \
     --continue_on_error"

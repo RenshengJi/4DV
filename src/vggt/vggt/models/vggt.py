@@ -98,77 +98,17 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 nn.Linear(256, 1),
             )
 
-        # self.set_freeze(freeze="all")
-
     def set_freeze(self, freeze):
         to_be_frozen = {
             "none": [],
-            "encoder": [
-                self.aggregator.camera_token,
-                self.aggregator.register_token,
-                self.aggregator.patch_embed,
-            ],
-            "encoder_frame": [
-                self.aggregator.camera_token,
-                self.aggregator.register_token,
-                self.aggregator.patch_embed,
-                self.aggregator.frame_blocks,
-            ],
-            "backbone": [
-                self.aggregator,
-            ],
-            "backbone_camera": [
-                self.aggregator,
-                self.camera_head,
-            ],
-            "backbone_pts": [
-                self.aggregator,
-                self.point_head,
-                self.depth_head,
-            ],
-            "vggt": [
+            "stage2": [
                 self.aggregator,
                 self.camera_head,
                 self.point_head,
                 self.depth_head,
-            ],
-            "vggt_wo_velocity": [
-                self.aggregator,
-                self.camera_head,
-                self.point_head,
-                self.gaussian_head,
-                self.depth_head,
-            ],
-            "vggt_wo_depth": [
-                self.aggregator,
-                self.camera_head,
-                self.point_head,
-                self.gaussian_head,
-                # self.depth_head,
+                # self.gaussian_head,
                 self.velocity_head,
-            ],
-            "vggt_wo_gaussian_and_velocity": [
-                # self.aggregator,
-                self.camera_head,
-                self.point_head,
-                self.gaussian_head,
-                self.depth_head,
-                # self.velocity_head,
-            ],
-            "all": [
-                self.aggregator,
-                self.camera_head,
-                self.point_head,
-                self.gaussian_head,
-                self.depth_head,
-                self.velocity_head,
-            ],
-            "old": [
-                self.aggregator,
-                self.camera_head,
-                self.point_head,
-                self.depth_head,
-                self.track_head,
+                self.scale_head,
             ],
         }
         if hasattr(self, "track_head"):

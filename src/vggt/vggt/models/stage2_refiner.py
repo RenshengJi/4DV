@@ -13,8 +13,7 @@ import time
 import logging
 
 # 导入头网络
-from vggt.heads.gaussian_refine_head import GaussianRefineHead
-from vggt.heads.pose_refine_head import PoseRefineHead
+from vggt.heads.sparse_conv_refine_head import GaussianRefineHeadSparseConv, PoseRefineHeadSparseConv
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
 
@@ -33,33 +32,29 @@ class Stage2Refiner(nn.Module):
     ):
         super().__init__()
         
-        # 默认配置 - 使用局部注意力机制优化显存
+        # 默认配置 - 使用稀疏卷积优化速度和显存
         if gaussian_refine_config is None:
             gaussian_refine_config = {
                 "input_gaussian_dim": 14,
                 "output_gaussian_dim": 14,
-                "feature_dim": 256,
-                "num_attention_layers": 4,
-                "num_heads": 8,
-                "mlp_ratio": 4.0,
-                "k_neighbors": 20,  # 局部注意力的邻居数量
-                "use_local_attention": True  # 默认使用局部注意力
+                "feature_dim": 128,
+                "num_conv_layers": 2,
+                "voxel_size": 0.05,
+                "max_num_points_per_voxel": 5
             }
-            
+
         if pose_refine_config is None:
             pose_refine_config = {
                 "input_dim": 3,
-                "feature_dim": 256,
-                "num_heads": 8,
-                "num_layers": 3,
-                "max_points": 8192,
-                "k_neighbors": 32,
-                "use_local_attention": True
+                "feature_dim": 128,
+                "num_conv_layers": 2,
+                "voxel_size": 0.1,
+                "max_points": 4096
             }
-        
-        # 初始化网络组件
-        self.gaussian_refine_head = GaussianRefineHead(**gaussian_refine_config)
-        self.pose_refine_head = PoseRefineHead(**pose_refine_config)
+
+        # 初始化网络组件 - 使用稀疏卷积版本
+        self.gaussian_refine_head = GaussianRefineHeadSparseConv(**gaussian_refine_config)
+        self.pose_refine_head = PoseRefineHeadSparseConv(**pose_refine_config)
         
         self.training_mode = training_mode
         
@@ -226,20 +221,7 @@ class Stage2Refiner(nn.Module):
                 }
             
             results['refined_dynamic_objects'].append(refined_obj)
-            
-            # Log object processing timing
-            object_time = time.time() - object_start_time
-            N = aggregated_gaussians.shape[0] if aggregated_gaussians is not None else 0
-            logger = logging.getLogger(__name__)
-            if logger.isEnabledFor(logging.INFO):
-                modes = []
-                if self.training_mode in ["joint", "gaussian_only"]:
-                    modes.append(f"gaussian({N:,})")
-                if self.training_mode in ["joint", "pose_only"]:
-                    modes.append(f"pose({len(initial_transforms)}frames)")
-                mode_str = "+".join(modes) if modes else "skip"
-                logger.info(f"Stage2Refiner obj[{obj_idx}] id={object_id}: {mode_str}, time={object_time:.4f}s")
-        
+
         return results
     
     def set_training_mode(self, mode: str):
@@ -383,8 +365,6 @@ class Stage2Refiner(nn.Module):
         return total_loss / max(num_objects, 1)
     
     def gradient_checkpointing_enable(self, enable: bool = True):
-        """启用或禁用梯度检查点"""
-        if hasattr(self.gaussian_refine_head, 'gradient_checkpointing_enable'):
-            self.gaussian_refine_head.gradient_checkpointing_enable(enable)
-        if hasattr(self.pose_refine_head, 'gradient_checkpointing_enable'):
-            self.pose_refine_head.gradient_checkpointing_enable(enable)
+        """启用或禁用梯度检查点（稀疏卷积版本不支持）"""
+        # 稀疏卷积实现不支持梯度检查点，保留此方法仅用于兼容性
+        pass

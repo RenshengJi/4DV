@@ -91,23 +91,22 @@ class OnlineStage2Trainer:
     
     def _create_stage2_model(self, config: Dict[str, Any]) -> Stage2Refiner:
         """创建第二阶段模型"""
+        # 使用稀疏卷积配置
         gaussian_refine_config = {
             "input_gaussian_dim": config.get('input_gaussian_dim', 14),
-            "output_gaussian_dim": config.get('output_gaussian_dim', 14),  # 修复：应该是14，不是11
-            "feature_dim": config.get('gaussian_feature_dim', 128),  # 减少特征维度以节省内存
-            "num_attention_layers": config.get('gaussian_num_layers', 2),  # 减少层数
-            "num_heads": config.get('gaussian_num_heads', 4),
-            "mlp_ratio": config.get('gaussian_mlp_ratio', 2.0),
-            "k_neighbors": config.get('k_neighbors', 20),  # 局部注意力邻居数
-            "use_local_attention": config.get('use_local_attention', True)  # 启用局部注意力
+            "output_gaussian_dim": config.get('output_gaussian_dim', 14),
+            "feature_dim": config.get('gaussian_feature_dim', 128),
+            "num_conv_layers": config.get('gaussian_num_conv_layers', 2),
+            "voxel_size": config.get('gaussian_voxel_size', 0.05),
+            "max_num_points_per_voxel": config.get('max_num_points_per_voxel', 5)
         }
-        
+
         pose_refine_config = {
             "input_dim": 3,
             "feature_dim": config.get('pose_feature_dim', 128),
-            "num_heads": config.get('pose_num_heads', 4),
-            "num_layers": config.get('pose_num_layers', 2),
-            "max_points": config.get('max_points_per_object', 2048)  # 减少点数以节省内存
+            "num_conv_layers": config.get('pose_num_conv_layers', 2),
+            "voxel_size": config.get('pose_voxel_size', 0.1),
+            "max_points": config.get('max_points_per_object', 4096)
         }
         
         model = Stage2Refiner(
@@ -115,10 +114,9 @@ class OnlineStage2Trainer:
             pose_refine_config=pose_refine_config,
             training_mode=config.get('training_mode', 'joint')
         )
-        
+
         model.to(self.device)
-        model.gradient_checkpointing_enable(True)  # 启用梯度检查点节省内存
-        
+
         return model
     
     def _create_stage2_criterion(self, config: Dict[str, Any]) -> Stage2CompleteLoss:
@@ -126,19 +124,10 @@ class OnlineStage2Trainer:
         render_loss_config = {
             'rgb_weight': config.get('rgb_loss_weight', 0.5),  # 降低权重避免过拟合
             'depth_weight': config.get('depth_loss_weight', 0.0),  # 使用配置中的实际值
-            'lpips_weight': config.get('lpips_loss_weight', 0.05),
-            'consistency_weight': config.get('consistency_loss_weight', 0.0)  # 使用配置中的实际值
         }
-        
-        geometric_loss_config = {
-            'gaussian_regularization_weight': config.get('gaussian_reg_weight', 0.0),  # 使用配置中的实际值
-            'pose_regularization_weight': config.get('pose_reg_weight', 0.0),  # 使用配置中的实际值
-            'temporal_smoothness_weight': config.get('temporal_smooth_weight', 0.0)  # 使用配置中的实际值
-        }
-        
+
         criterion = Stage2CompleteLoss(
-            render_loss_config=render_loss_config,
-            geometric_loss_config=geometric_loss_config
+            render_loss_config=render_loss_config
         )
         criterion.to(self.device)
         
@@ -195,17 +184,22 @@ class OnlineStage2Trainer:
             dynamic_objects_data = self.dynamic_processor.process_dynamic_objects(
                 preds, vggt_batch, auxiliary_models
             )
-            
+
+            # 显示阶段时间统计
+            if dynamic_objects_data and 'stage_times' in dynamic_objects_data:
+                stage_times = dynamic_objects_data['stage_times']
+                print(f"[Stage Times] Preprocessing: {stage_times.get('preprocessing', 0):.3f}s | "
+                      f"Clustering+Background: {stage_times.get('clustering_background', 0):.3f}s | "
+                      f"Tracking: {stage_times.get('tracking', 0):.3f}s | "
+                      f"Aggregation: {stage_times.get('aggregation', 0):.3f}s | "
+                      f"Total: {dynamic_objects_data.get('processing_time', 0):.3f}s")
+
             if not dynamic_objects_data or len(dynamic_objects_data['dynamic_objects']) == 0:
                 print(f"No dynamic objects found in iteration {iteration}")
                 # 返回零损失而不是None，这样stage2损失会显示在日志中
                 return torch.tensor(0.0, device=self.device, requires_grad=True), {
                     'stage2_rgb_loss': 0.0,
-                    'stage2_depth_loss': 0.0,
-                    'stage2_consistency_loss': 0.0,
-                    'stage2_gaussian_reg': 0.0,
-                    'stage2_pose_reg': 0.0,
-                    'stage2_temporal_smooth': 0.0
+                    'stage2_depth_loss': 0.0
                 }
             
             # 执行第二阶段前向传播

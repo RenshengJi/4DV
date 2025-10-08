@@ -167,17 +167,16 @@ def train(args):
         # 损失配置
         'rgb_loss_weight': getattr(args, 'stage2_rgb_loss_weight', 0.5),
         'depth_loss_weight': getattr(args, 'stage2_depth_loss_weight', 0.05),
-        'lpips_loss_weight': getattr(args, 'stage2_lpips_loss_weight', 0.05),
-        'consistency_loss_weight': getattr(args, 'stage2_consistency_loss_weight', 0.02),
-        'gaussian_reg_weight': getattr(args, 'stage2_gaussian_reg_weight', 0.005),
-        'pose_reg_weight': getattr(args, 'stage2_pose_reg_weight', 0.005),
-        'temporal_smooth_weight': getattr(args, 'stage2_temporal_smooth_weight', 0.002),
         
         # 动态处理器配置
         'dynamic_processor': {
             'min_object_size': getattr(args, 'min_object_size', 100),
             'max_objects_per_frame': getattr(args, 'max_objects_per_frame', 10),
-            'velocity_threshold_percentile': getattr(args, 'velocity_threshold_percentile', 0.75),
+            'velocity_threshold': getattr(args, 'velocity_threshold', 0.1),
+            'clustering_eps': getattr(args, 'clustering_eps', 0.02),
+            'clustering_min_samples': getattr(args, 'clustering_min_samples', 10),
+            'tracking_position_threshold': getattr(args, 'tracking_position_threshold', 2.0),
+            'tracking_velocity_threshold': getattr(args, 'tracking_velocity_threshold', 0.2),
             'use_optical_flow_aggregation': getattr(args, 'enable_optical_flow_aggregation', True)
         }
     }
@@ -273,11 +272,6 @@ def train(args):
     
 
     # 检查是否使用预处理的SAM掩码
-    # use_preprocessed_sam = getattr(args, "use_preprocessed_sam", False)
-    # if use_preprocessed_sam:
-    #     printer.info("Using preprocessed SAM masks - skipping SAM model loading")
-    #     auxiliary_models = dict()
-    # else:
     auxiliary_model_configs = getattr(args, "auxiliary_models", None)
     auxiliary_models = dict()
     if auxiliary_model_configs is not None:
@@ -969,12 +963,8 @@ def train(args):
                             # 注意：第二阶段的损失不加入第一阶段的总损失中
                             # 因为第二阶段有独立的参数和优化器
 
-                            # 记录第二阶段损失用于监控
-                            stage2_loss_dict_for_log = {}
-                            for k, v in stage2_loss_dict.items():
-                                if k.startswith('render'):  # 确保只包含渲染相关损失
-                                    prefixed_key = f"stage2_{k}"
-                                    stage2_loss_dict_for_log[prefixed_key] = v
+                            # 记录第二阶段损失用于监控（所有stage2损失键名已经带有stage2_前缀）
+                            stage2_loss_dict_for_log = {k: v for k, v in stage2_loss_dict.items() if k.startswith('stage2_')}
 
                             # 记录到metric_logger和tensorboard
                             metric_logger.update(**stage2_loss_dict_for_log)
@@ -1062,10 +1052,16 @@ def train(args):
 
 
                 # 更新最终的损失记录
-                metric_logger.meters["loss"].update(loss_value)
+                # Stage2模式下使用stage2_loss，否则使用stage1的loss_value
+                if training_stage == 'stage2' and stage2_loss is not None:
+                    final_loss_value = float(stage2_loss)
+                else:
+                    final_loss_value = loss_value
+
+                metric_logger.meters["loss"].update(final_loss_value)
                 if log_writer is not None:
                     step = epoch * len(data_loader_train) + data_iter_step
-                    log_writer.add_scalar("train_loss_final", loss_value, step)
+                    log_writer.add_scalar("train_loss_final", final_loss_value, step)
 
                 # 按照save_freq保存模型
                 if (
@@ -1846,7 +1842,16 @@ def cut3r_batch_to_vggt(views):
     vggt_batch['extrinsics'] = vggt_batch['extrinsics'].permute(1, 0, 2, 3).contiguous() if vggt_batch['extrinsics'] is not None else None
     vggt_batch['point_masks'] = vggt_batch['point_masks'].permute(1, 0, 2, 3).contiguous() if vggt_batch['point_masks'] is not None else None
     vggt_batch['world_points'] = vggt_batch['world_points'].permute(1, 0, 2, 3, 4).contiguous() if vggt_batch['world_points'] is not None else None
-    vggt_batch['flowmap'] = vggt_batch['flowmap'].permute(1, 0, 2, 3, 4).contiguous() if vggt_batch['flowmap'] is not None else None
+
+    # flowmap处理：根据维度判断是否需要permute
+    if vggt_batch['flowmap'] is not None:
+        if vggt_batch['flowmap'].dim() == 5:
+            # 5维: [S, B, H, W, C] -> [B, S, H, W, C]
+            vggt_batch['flowmap'] = vggt_batch['flowmap'].permute(1, 0, 2, 3, 4).contiguous()
+        elif vggt_batch['flowmap'].dim() == 4:
+            # 4维: [S, H, W, C] -> [1, S, H, W, C] (添加batch维度)
+            vggt_batch['flowmap'] = vggt_batch['flowmap'].unsqueeze(0).contiguous()
+        # 其他维度保持不变
     
     # 处理SAM掩码的维度转换
     if 'sam_masks' in vggt_batch:
@@ -1866,7 +1871,7 @@ def run(cfg: OmegaConf):
     if cfg.get("debug", False):
         cfg.num_workers = 0
         import debugpy
-        debugpy.listen(5692)
+        debugpy.listen(5691)
         print("Waiting for debugger to attach...")
         debugpy.wait_for_client()
     logdir = pathlib.Path(cfg.logdir)

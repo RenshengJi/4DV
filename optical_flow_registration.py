@@ -1197,6 +1197,17 @@ class OpticalFlowRegistration:
         # 为了减少计算量，只选取indices_src中的部分点进行匹配（随机0.1）
         # indices_src = np.random.choice(indices_src, int(len(indices_src) * 0.5), replace=False)
 
+        # # For debug: 超级简单的方法------------------
+        # src_centroid_3d = np.mean(points_3d_src, axis=0)
+        # dst_centroid_3d = np.mean(points_3d_dst, axis=0)
+        # translation_3d = dst_centroid_3d - src_centroid_3d
+        # # 构建变换矩阵
+        # transformation = np.eye(4)
+        # transformation[:3, :3] = np.eye(3)  # 单位旋转矩阵
+        # transformation[:3, 3] = translation_3d
+        # return transformation
+        # # --------------------------------------
+
         corresponding_points = self._find_corresponding_points_direct(
             indices_src, indices_dst, flow, self.max_flow_magnitude, H, W)
         correspondence_time = time.time() - correspondence_start
@@ -1229,6 +1240,19 @@ class OpticalFlowRegistration:
         points_3d_src_corr = points_3d_src[src_indices]
         points_3d_dst_corr = points_3d_dst[dst_indices]
         correspondence_prep_time = time.time() - correspondence_prep_start
+
+
+        # For debug: 超级简单的方法------------------
+        src_centroid_3d = np.mean(points_3d_src_corr, axis=0)
+        dst_centroid_3d = np.mean(points_3d_dst_corr, axis=0)
+        translation_3d = dst_centroid_3d - src_centroid_3d
+        # 构建变换矩阵
+        transformation = np.eye(4)
+        transformation[:3, :3] = np.eye(3)  # 单位旋转矩阵
+        transformation[:3, 3] = translation_3d
+        return transformation
+        # --------------------------------------
+
 
         # 5. 变换估计
         transformation_estimation_start = time.time()
@@ -1559,7 +1583,6 @@ class OpticalFlowRegistration:
             valid_points = aggregated_points_tensor[valid_mask]
             extracted_gaussians[:, :3] = valid_points
 
-            print(f"    ✅ 成功提取{len(extracted_gaussians)}个Gaussian参数 (完全匹配)")
             return extracted_gaussians
 
         except Exception as e:

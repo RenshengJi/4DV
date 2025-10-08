@@ -1,10 +1,13 @@
 # Stage 2 Online Training Configuration for VGGT
 # 第二阶段在线训练配置 - 专注于渲染损失和动态对象精细化
 
+debug: True
+
 # =============== 模型配置 ===============
 model: "VGGT(img_size=518, patch_size=14, embed_dim=1024)"
 # pretrained: model.pt  # 第二阶段需要加载第一阶段训练好的模型
-pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/aggregator_resume_noflowgrad_nearestdynamic/checkpoint-epoch_0_35805.pth"  # 或者指定第一阶段训练好的checkpoint路径
+# pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/aggregator_resume_noflowgrad_nearestdynamic/checkpoint-epoch_0_35805.pth" 
+pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/aggregator_resume_noflowgrad_nearestdynamic_resume_0point1_novoxel/checkpoint-epoch_0_31328.pth"
 
 
 # VGGT冻结策略配置
@@ -17,11 +20,11 @@ vggt_freeze_strategy: null
 
 # =============== 辅助模型配置 ===============
 auxiliary_models:
-  # # 光流模型 (用于flow_loss) - 第二阶段禁用
-  # flow: RAFT(RAFTCfg(name="kitti-M", dataset="kitti", path="Tartan-C-T-TSKH-kitti432x960-M.pth",
-  #   use_var=True, var_min=0, var_max=10, pretrain="resnet34", initial_dim=64, block_dims=[64, 128, 256],
-  #   radius=4, dim=128, num_blocks=2, iters=4, image_size=[432, 960],
-  #   offload=${offload_auxiliary}, geo_thresh=2, photo_thresh=-1))
+  # 光流模型 (用于flow_loss) - 第二阶段禁用
+  flow: RAFT(RAFTCfg(name="kitti-M", dataset="kitti", path="Tartan-C-T-TSKH-kitti432x960-M.pth",
+    use_var=True, var_min=0, var_max=10, pretrain="resnet34", initial_dim=64, block_dims=[64, 128, 256],
+    radius=4, dim=128, num_blocks=2, iters=4, image_size=[432, 960],
+    offload=${offload_auxiliary}, geo_thresh=2, photo_thresh=-1))
 
   # SAM2模型 (用于velocity consistency loss) - 第二阶段禁用
   # sam2: SAM2Base(config_file="sam2.1_hiera_t", path="sam2.1_hiera_tiny.pt",
@@ -41,7 +44,7 @@ long_context: True
 fixed_length: False
 resume: null  # 通常从第一阶段的checkpoint开始
 benchmark: False
-num_views: 32
+num_views: 8
 num_test_views: 16
 n_corres_train: 0
 n_corres_test: 0

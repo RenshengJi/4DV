@@ -22,40 +22,54 @@ from collections import defaultdict
 # 导入现有的聚类和光流配准系统
 import sys
 import os
-# from cuml.cluster import DBSCAN
-from sklearn.cluster import DBSCAN as SklearnDBSCAN
-# import cupy as cp
+from cuml.cluster import DBSCAN
+# from sklearn.cluster import DBSCAN as SklearnDBSCAN
+import cupy as cp
 from scipy.optimize import linear_sum_assignment
 
 
 
-def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, min_samples=10, area_threshold=750, conf_mask=None):
+def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, min_samples=10, area_threshold=750, conf_mask=None, gt_scale=None):
     """
     对每一帧进行动态物体聚类
 
     Args:
         xyz: [S, H*W, 3] 点云坐标
-        velocity: [S, H*W, 3] 速度向量
-        velocity_threshold: 速度阈值，用于过滤静态背景
+        velocity: [S, H*W, 3] 速度向量（非metric尺度）
+        velocity_threshold: 速度阈值（metric尺度，m/s），用于过滤静态背景
         eps: DBSCAN的邻域半径
         min_samples: DBSCAN的最小样本数
         area_threshold: 面积阈值，过滤掉面积小于此值的聚类
         conf_mask: [S, H*W] confidence掩码，True表示高置信度像素
+        gt_scale: float or tensor - GT scale factor，用于将velocity转换到metric尺度
 
     Returns:
         list: 每一帧的聚类结果，每个元素包含点云坐标和聚类标签
     """
     clustering_results = []
+    device = xyz.device
+
+    # 将gt_scale转换为tensor
+    if gt_scale is not None:
+        if not isinstance(gt_scale, torch.Tensor):
+            gt_scale_tensor = torch.tensor(gt_scale, device=device, dtype=velocity.dtype)
+        else:
+            gt_scale_tensor = gt_scale
+    else:
+        gt_scale_tensor = torch.tensor(1.0, device=device, dtype=velocity.dtype)
 
     for frame_idx in range(xyz.shape[0]):
         # 获取当前帧的点云和速度
         frame_points = xyz[frame_idx]  # [H*W, 3]
         frame_velocity = velocity[frame_idx]  # [H*W, 3]
 
-        # 计算速度大小
-        velocity_magnitude = torch.norm(frame_velocity, dim=-1)  # [H*W]
+        # 将velocity转换到metric尺度: velocity_metric = velocity / gt_scale
+        frame_velocity_metric = frame_velocity / gt_scale_tensor
 
-        # 过滤动态点（速度大于阈值的点）
+        # 计算速度大小（metric尺度，m/s）
+        velocity_magnitude = torch.norm(frame_velocity_metric, dim=-1)  # [H*W]
+
+        # 过滤动态点（速度大于阈值的点，阈值现在是metric尺度）
         dynamic_mask = velocity_magnitude > velocity_threshold
 
         # 应用confidence掩码：只有高置信度且动态的点才参与聚类
@@ -71,7 +85,6 @@ def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, 
             clustering_results.append({
                 'points': frame_points,
                 'labels': torch.full((len(frame_points),), -1, dtype=torch.long),
-                'dynamic_mask': dynamic_mask,
                 'num_clusters': 0,
                 'cluster_centers': [],
                 'cluster_velocities': [],
@@ -175,10 +188,7 @@ def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, 
         clustering_results.append({
             'points': frame_points,
             'labels': full_labels.cpu(),
-            'dynamic_mask': dynamic_mask,
             'num_clusters': num_clusters,
-            'dynamic_points': dynamic_points,
-            'cluster_labels': torch.from_numpy(cluster_labels),
             'cluster_centers': cluster_centers,
             'cluster_velocities': cluster_velocities,
             'cluster_sizes': cluster_sizes,
@@ -427,8 +437,11 @@ class OnlineDynamicProcessor:
         memory_efficient: bool = True,
         min_object_size: int = 100,
         max_objects_per_frame: int = 10,
-        velocity_threshold_percentile: float = 0.75,
-        iou_threshold: float = 0.3,
+        velocity_threshold: float = 0.1,  # metric尺度, m/s
+        clustering_eps: float = 0.02,  # DBSCAN邻域半径
+        clustering_min_samples: int = 10,  # DBSCAN最小样本数
+        tracking_position_threshold: float = 2.0,  # 跨帧跟踪位置阈值
+        tracking_velocity_threshold: float = 0.2,  # 跨帧跟踪速度阈值
         use_optical_flow_aggregation: bool = True,
         enable_temporal_cache: bool = True,
         cache_size: int = 16
@@ -441,8 +454,11 @@ class OnlineDynamicProcessor:
             memory_efficient: 是否启用内存优化
             min_object_size: 最小物体尺寸（点数）
             max_objects_per_frame: 每帧最大物体数量
-            velocity_threshold_percentile: 速度阈值百分位数
-            iou_threshold: IoU匹配阈值
+            velocity_threshold: 速度阈值（metric尺度，m/s）
+            clustering_eps: DBSCAN邻域半径
+            clustering_min_samples: DBSCAN最小样本数
+            tracking_position_threshold: 跨帧跟踪位置阈值
+            tracking_velocity_threshold: 跨帧跟踪速度阈值
             use_optical_flow_aggregation: 是否使用光流聚合
             enable_temporal_cache: 是否启用时序缓存
             cache_size: 缓存大小
@@ -451,8 +467,11 @@ class OnlineDynamicProcessor:
         self.memory_efficient = memory_efficient
         self.min_object_size = min_object_size
         self.max_objects_per_frame = max_objects_per_frame
-        self.velocity_threshold_percentile = velocity_threshold_percentile
-        self.iou_threshold = iou_threshold
+        self.velocity_threshold = velocity_threshold
+        self.clustering_eps = clustering_eps
+        self.clustering_min_samples = clustering_min_samples
+        self.tracking_position_threshold = tracking_position_threshold
+        self.tracking_velocity_threshold = tracking_velocity_threshold
         self.use_optical_flow_aggregation = use_optical_flow_aggregation
 
         # 初始化光流配准系统
@@ -512,210 +531,42 @@ class OnlineDynamicProcessor:
 
         try:
             # 获取基本信息
-            images = vggt_batch.get('images')  # [B, S, 3, H, W]
+            images = vggt_batch['images']  # [B, S, 3, H, W]
             B, S, C, H, W = images.shape
-            velocity = preds.get('velocity')  # [B, S, H, W, 3]
-            gaussian_params = preds.get('gaussian_params')  # [B, S*H*W, 14] or similar
 
-            # ========== Stage 1: 数据后处理 ==========
+            # ========== Stage 1: 数据预处理 ==========
             preprocessing_start = time.time()
-
-            # 1. Velocity后处理
-            if velocity is not None:
-                # 应用速度后处理：velocity = sign(velocity) * (exp(|velocity|) - 1)
-                velocity_processed = torch.sign(
-                    velocity) * (torch.exp(torch.abs(velocity)) - 1)
-
-                # 如果有相机参数，将速度从局部坐标转换到全局坐标
-                if 'pose_enc' in preds:
-                    from vggt.training.loss import velocity_local_to_global
-                    from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-
-                    # 获取预测的相机参数
-                    extrinsics, intrinsics = pose_encoding_to_extri_intri(
-                        preds["pose_enc"], vggt_batch["images"].shape[-2:]
-                    )
-                    # 添加齐次坐标行
-                    extrinsics = torch.cat([
-                        extrinsics,
-                        torch.tensor([0, 0, 0, 1], device=extrinsics.device)[
-                            None, None, None, :].repeat(1, extrinsics.shape[1], 1, 1)
-                    ], dim=-2)
-
-                    # 转换速度坐标系
-                    extrinsic_inv = torch.linalg.inv(
-                        extrinsics)  # [B, S, 4, 4]
-
-                    # Reshape velocity for coordinate transformation
-                    if len(velocity_processed.shape) == 5:  # [B, S, H, W, 3]
-                        B_v, S_v, H_v, W_v, _ = velocity_processed.shape
-                        velocity_flat = velocity_processed.reshape(
-                            B_v, S_v * H_v * W_v, 3)  # [B, S*H*W, 3]
-
-                        # Transform each batch separately
-                        velocity_transformed = []
-                        for b in range(B_v):
-                            # [S*H*W, 3]
-                            vel_b = velocity_flat[b].reshape(-1, 3)
-                            vel_transformed = velocity_local_to_global(
-                                vel_b, extrinsic_inv[b:b+1])
-                            velocity_transformed.append(
-                                vel_transformed.reshape(S_v, H_v, W_v, 3))
-
-                        velocity_processed = torch.stack(
-                            velocity_transformed, dim=0)  # [B, S, H, W, 3]
-
-            # 如果有数据需要后处理，复制preds避免修改原始数据
-            preds_updated = preds.copy()
-
-            if velocity is not None:
-                # 更新处理后的velocity
-                preds_updated['velocity'] = velocity_processed
-                velocity = velocity_processed
-
-            # 2. Gaussian参数后处理
-            if gaussian_params is not None:
-                # 重新整形gaussian参数为 [S, H*W, 14]
-                if gaussian_params.dim() == 3 and gaussian_params.shape[1] == S * H * W:
-                    # 情况1: [B, S*H*W, 14] -> [S, H*W, 14]
-                    gaussian_params_reshaped = gaussian_params[0].reshape(
-                        S, H * W, 14)
-                elif gaussian_params.dim() == 3 and gaussian_params.shape[0] == S:
-                    # 情况2: [S, H*W, 14] -> 已经是正确形状
-                    gaussian_params_reshaped = gaussian_params
-                else:
-                    # 其他情况，尝试重新整形
-                    gaussian_params_reshaped = gaussian_params.reshape(
-                        S, H * W, 14)
-
-                # 应用gaussian参数激活函数
-                gaussian_params_processed = self._apply_gaussian_activation(
-                    gaussian_params_reshaped)
-
-                # 用depth计算的3D坐标替换gaussian_params的前三维
-                depth_data = preds.get('depth')
-                if depth_data is not None and 'pose_enc' in preds:
-                    try:
-                        from vggt.training.loss import depth_to_world_points
-                        from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-
-                        # 获取相机参数
-                        extrinsics, intrinsics = pose_encoding_to_extri_intri(
-                            preds["pose_enc"], images.shape[-2:]
-                        )
-                        extrinsics = torch.cat([
-                            extrinsics,
-                            torch.tensor([0, 0, 0, 1], device=extrinsics.device)[
-                                None, None, None, :].repeat(1, extrinsics.shape[1], 1, 1)
-                        ], dim=-2)
-
-                        # 计算world points
-                        depth_for_points = depth_data.reshape(B*S, H, W, 1)
-                        world_points = depth_to_world_points(
-                            depth_for_points, intrinsics)
-                        world_points = world_points.reshape(
-                            world_points.shape[0], world_points.shape[1]*world_points.shape[2], 3)
-
-                        # 转换到相机坐标系
-                        extrinsic_inv = torch.linalg.inv(extrinsics)
-                        xyz_camera = torch.matmul(extrinsic_inv[0, :, :3, :3], world_points.transpose(-1, -2)).transpose(-1, -2) + \
-                            extrinsic_inv[0, :, :3, 3:4].transpose(-1, -2)
-                        xyz_camera = xyz_camera.reshape(
-                            S, H * W, 3)  # [S, H*W, 3]
-
-                        # 替换gaussian_params的前三维
-                        gaussian_params_processed[:, :, :3] = xyz_camera
-
-                    except Exception as e:
-                        pass  # 静默处理错误
-
-                # 更新处理后的gaussian_params（保持原始格式）
-                preds_updated['gaussian_params'] = gaussian_params_processed.unsqueeze(
-                    0).reshape(B, S * H * W, 14)
-                gaussian_params = preds_updated['gaussian_params']
-
-            # 使用更新后的preds
-            preds = preds_updated
+            preds = self._preprocess_predictions(preds, images, B, S, H, W)
+            velocity = preds.get('velocity')
+            gaussian_params = preds.get('gaussian_params')
             stage_times['preprocessing'] = time.time() - preprocessing_start
 
-            # ========== Stage 2: 动态物体聚类 ==========
+            # ========== Stage 2: 聚类 + 背景分离 ==========
             clustering_start = time.time()
-            clustering_results = self._perform_clustering_with_existing_method(
-                preds, vggt_batch, velocity
-            )
-            stage_times['Stage 2: 动态物体聚类'] = time.time() - clustering_start
-            print(f"Stage 2: 动态物体聚类耗时: {stage_times['Stage 2: 动态物体聚类']:.4f}s")
+            clustering_results = self._perform_clustering_with_existing_method(preds, vggt_batch, velocity)
+            static_gaussians = self._create_static_background_from_labels(preds, clustering_results, H, W, S)
+            stage_times['clustering_background'] = time.time() - clustering_start
 
-            # ========== Stage 3: 跨帧物体跟踪 ==========
+            # ========== Stage 3: 跨帧跟踪 ==========
             tracking_start = time.time()
             matched_clustering_results = match_objects_across_frames(
                 clustering_results,
-                position_threshold=2.0,
-                velocity_threshold=0.2
+                position_threshold=self.tracking_position_threshold,
+                velocity_threshold=self.tracking_velocity_threshold
             )
-            stage_times['Stage 3: 跨帧物体跟踪'] = time.time() - tracking_start
-            print(f"Stage 3: 跨帧物体跟踪耗时: {stage_times['Stage 3: 跨帧物体跟踪']:.4f}s")
+            stage_times['tracking'] = time.time() - tracking_start
 
-            # ========== Stage 4: 光流聚合 ==========
+            # ========== Stage 4: 动态物体聚合 ==========
             aggregation_start = time.time()
-            print("    开始Stage 4: 光流聚合...")
-            stage4_times = {}
-
-            dynamic_objects = []
-            if self.optical_flow_registration is not None and len(matched_clustering_results) > 0:
-                try:
-                    step41_start = time.time()
-                    print("      Step 4.1: 使用光流聚合方法...")
-                    dynamic_objects, aggregation_details = self._aggregate_with_existing_optical_flow_method(
-                        matched_clustering_results, preds, vggt_batch
-                    )
-                    stage4_times['Step 4.1: 光流聚合'] = time.time() - step41_start
-                    print(f"      Step 4.1完成: {stage4_times['Step 4.1: 光流聚合']:.4f}s")
-
-                    # 显示光流聚合的详细时间
-                    if aggregation_details:
-                        for detail_key, detail_time in aggregation_details.items():
-                            print(f"        - {detail_key}: {detail_time:.4f}s")
-
-                except Exception as e:
-                    print(f"      Step 4.1失败，回退到简单方法: {e}")
-                    step42_start = time.time()
-                    dynamic_objects = self._create_objects_from_clustering_results(
-                        matched_clustering_results, gaussian_params, H, W, preds
-                    )
-                    stage4_times['Step 4.2: 简单聚合(回退)'] = time.time() - step42_start
-                    print(f"      Step 4.2回退方法完成: {stage4_times['Step 4.2: 简单聚合(回退)']:.4f}s")
-            else:
-                step43_start = time.time()
-                print("      Step 4.3: 无光流配准器，使用简单方法...")
-                dynamic_objects = self._create_objects_from_clustering_results(
-                    matched_clustering_results, gaussian_params, H, W, preds
-                )
-                stage4_times['Step 4.3: 简单聚合(无光流)'] = time.time() - step43_start
-                print(f"      Step 4.3完成: {stage4_times['Step 4.3: 简单聚合(无光流)']:.4f}s")
-
-            stage_times['Stage 4: 光流聚合'] = time.time() - aggregation_start
-            stage_times.update({f'Stage4_{k}': v for k, v in stage4_times.items()})
-            print(f"    Stage 4: 光流聚合总耗时: {stage_times['Stage 4: 光流聚合']:.4f}s")
-
-            # ========== Stage 5: 背景分离 ==========
-            background_start = time.time()
-            static_gaussians = self._create_static_background_from_labels(
-                preds, matched_clustering_results, H, W, S
+            dynamic_objects = self._aggregate_dynamic_objects(
+                matched_clustering_results, preds, vggt_batch, gaussian_params, H, W
             )
-            stage_times['Stage 5: 背景分离'] = time.time() - background_start
-            print(f"Stage 5: 背景分离耗时: {stage_times['Stage 5: 背景分离']:.4f}s")
+            stage_times['aggregation'] = time.time() - aggregation_start
 
+            # 计算总时间和统计
             total_time = time.time() - start_time
-            print(f"总耗时: {total_time:.4f}s")
+            self._update_stats(len(dynamic_objects), total_time)
 
-            # 更新统计信息
-            self.processing_stats['total_sequences'] += 1
-            self.processing_stats['total_objects_detected'] += len(
-                dynamic_objects)
-            self.processing_stats['total_processing_time'] += total_time
-
-            # 内存清理
             if self.memory_efficient:
                 torch.cuda.empty_cache()
 
@@ -725,12 +576,130 @@ class OnlineDynamicProcessor:
                 'processing_time': total_time,
                 'num_objects': len(dynamic_objects),
                 'stage_times': stage_times,
-                'matched_clustering_results': matched_clustering_results  # 添加聚类结果用于可视化
+                'matched_clustering_results': matched_clustering_results
             }
 
         except Exception as e:
-            print(f"Error in dynamic object processing: {e}")
+            print(f"❌ 动态物体处理失败: {e}")
+            import traceback
+            traceback.print_exc()
             return {'dynamic_objects': [], 'static_gaussians': None, 'stage_times': {}}
+
+    def _preprocess_predictions(
+        self,
+        preds: Dict[str, Any],
+        images: torch.Tensor,
+        B: int, S: int, H: int, W: int
+    ) -> Dict[str, Any]:
+        """预处理VGGT预测结果：处理velocity和gaussian参数"""
+        preds_updated = preds.copy()
+
+        # 获取相机参数（一次性获取，避免重复计算）
+        extrinsics, intrinsics = None, None
+        if 'pose_enc' in preds:
+            from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+            extrinsics, intrinsics = pose_encoding_to_extri_intri(
+                preds["pose_enc"], images.shape[-2:]
+            )
+            # 添加齐次坐标行
+            extrinsics = torch.cat([
+                extrinsics,
+                torch.tensor([0, 0, 0, 1], device=extrinsics.device)[
+                    None, None, None, :].repeat(1, extrinsics.shape[1], 1, 1)
+            ], dim=-2)
+
+        # 处理velocity
+        velocity = preds.get('velocity')
+        if velocity is not None:
+            velocity_processed = torch.sign(velocity) * (torch.exp(torch.abs(velocity)) - 1)
+
+            # 转换到全局坐标系
+            if extrinsics is not None:
+                from vggt.training.loss import velocity_local_to_global
+                extrinsic_inv = torch.linalg.inv(extrinsics)
+
+                if len(velocity_processed.shape) == 5:  # [B, S, H, W, 3]
+                    B_v, S_v, H_v, W_v, _ = velocity_processed.shape
+                    velocity_flat = velocity_processed.reshape(B_v, S_v * H_v * W_v, 3)
+
+                    velocity_transformed = []
+                    for b in range(B_v):
+                        vel_b = velocity_flat[b].reshape(-1, 3)
+                        vel_transformed = velocity_local_to_global(vel_b, extrinsic_inv[b:b+1])
+                        velocity_transformed.append(vel_transformed.reshape(S_v, H_v, W_v, 3))
+
+                    velocity_processed = torch.stack(velocity_transformed, dim=0)
+
+            preds_updated['velocity'] = velocity_processed
+
+        # 处理gaussian参数
+        gaussian_params = preds.get('gaussian_params')
+        if gaussian_params is not None:
+            # 重新整形为 [S, H*W, 14]
+            if gaussian_params.dim() == 3 and gaussian_params.shape[1] == S * H * W:
+                gaussian_params_reshaped = gaussian_params[0].reshape(S, H * W, 14)
+            elif gaussian_params.dim() == 3 and gaussian_params.shape[0] == S:
+                gaussian_params_reshaped = gaussian_params
+            else:
+                gaussian_params_reshaped = gaussian_params.reshape(S, H * W, 14)
+
+            # 用depth计算的3D坐标替换前三维
+            depth_data = preds.get('depth')
+            if depth_data is not None and extrinsics is not None:
+                try:
+                    from vggt.training.loss import depth_to_world_points
+
+                    depth_for_points = depth_data.reshape(B*S, H, W, 1)
+                    world_points = depth_to_world_points(depth_for_points, intrinsics)
+                    world_points = world_points.reshape(world_points.shape[0], -1, 3)
+
+                    extrinsic_inv = torch.linalg.inv(extrinsics)
+                    xyz_camera = torch.matmul(
+                        extrinsic_inv[0, :, :3, :3],
+                        world_points.transpose(-1, -2)
+                    ).transpose(-1, -2) + extrinsic_inv[0, :, :3, 3:4].transpose(-1, -2)
+                    xyz_camera = xyz_camera.reshape(S, H * W, 3)
+
+                    gaussian_params_reshaped[:, :, :3] = xyz_camera
+                except:
+                    pass  # 静默失败
+
+            preds_updated['gaussian_params'] = gaussian_params_reshaped.unsqueeze(0).reshape(B, S * H * W, 14)
+
+        return preds_updated
+
+    def _aggregate_dynamic_objects(
+        self,
+        matched_clustering_results: List[Dict],
+        preds: Dict[str, Any],
+        vggt_batch: Dict[str, Any],
+        gaussian_params: torch.Tensor,
+        H: int, W: int
+    ) -> List[Dict]:
+        """聚合动态物体（使用光流或简单方法）"""
+        if not matched_clustering_results:
+            return []
+
+        # 尝试使用光流聚合
+        if self.optical_flow_registration is not None:
+            try:
+                dynamic_objects, _ = self._aggregate_with_existing_optical_flow_method(
+                    matched_clustering_results, preds, vggt_batch
+                )
+                return dynamic_objects
+            except Exception as e:
+                print(f"  光流聚合失败，使用简单方法: {e}")
+
+        # 回退到简单方法
+        return self._create_objects_from_clustering_results(
+            matched_clustering_results, gaussian_params, H, W, preds
+        )
+
+    def _update_stats(self, num_objects: int, total_time: float):
+        """更新处理统计信息"""
+        self.processing_stats['total_sequences'] += 1
+        self.processing_stats['total_objects_detected'] += num_objects
+        self.processing_stats['total_processing_time'] += total_time
 
     def _perform_clustering_with_existing_method(
         self,
@@ -827,10 +796,11 @@ class OnlineDynamicProcessor:
                 if len(conf_mask.shape) == 4:
                     conf_mask = conf_mask[0]  # [S, H, W]
                 conf_mask = conf_mask.reshape(S, H*W)  # [S, H*W]
-                conf_mask_ratio = conf_mask.float().mean().item()
-                print(f"  使用depth confidence掩码: {conf_mask_ratio:.3f} 的像素被保留")
-            else:
-                print("  未发现depth confidence掩码，使用所有像素")
+
+            # 获取gt_scale用于将velocity转换到metric尺度
+            gt_scale = vggt_batch.get('depth_scale_factor', 1.0)
+            if isinstance(gt_scale, torch.Tensor):
+                gt_scale = gt_scale[0] if gt_scale.ndim > 0 else gt_scale
 
             # 使用直接定义的动态物体聚类函数
             # 分离张量梯度以便在聚类中使用numpy
@@ -839,12 +809,13 @@ class OnlineDynamicProcessor:
 
             clustering_results = dynamic_object_clustering(
                 xyz_detached,  # [S, H*W, 3]
-                velocity_detached,  # [S, H*W, 3]
-                velocity_threshold=0.005,  # 速度阈值
-                eps=0.01,  # DBSCAN的邻域半径
-                min_samples=10,  # DBSCAN的最小样本数
+                velocity_detached,  # [S, H*W, 3] (非metric尺度)
+                velocity_threshold=self.velocity_threshold,  # 速度阈值(metric尺度, m/s)
+                eps=self.clustering_eps,  # DBSCAN的邻域半径
+                min_samples=self.clustering_min_samples,  # DBSCAN的最小样本数
                 area_threshold=self.min_object_size,  # 面积阈值
-                conf_mask=conf_mask  # confidence掩码
+                conf_mask=conf_mask,  # confidence掩码
+                gt_scale=gt_scale  # GT scale factor
             )
 
             return clustering_results
@@ -911,15 +882,6 @@ class OnlineDynamicProcessor:
                     )
                     object_time = time.time() - object_start
                     individual_object_times.append(object_time)
-
-                    # 检查是否有详细时间统计
-                    if aggregated_object is not None and 'step_times' in aggregated_object:
-                        object_step_times = aggregated_object['step_times']
-                        # 只打印 Gaussian参数提取 的耗时
-                        if '5. Gaussian参数提取' in object_step_times:
-                            gaussian_time = object_step_times['5. Gaussian参数提取']
-                            if isinstance(gaussian_time, (int, float)):
-                                print(f"        物体 {global_id} Gaussian参数提取: {gaussian_time:.4f}s")
 
                     if aggregated_object is not None:
                         # 使用aggregate_object_to_middle_frame已经提取的canonical_gaussians
@@ -1620,128 +1582,10 @@ class OnlineDynamicProcessor:
             else:
                 static_gaussians = torch.empty(0, 14, device=self.device)
 
-            print(f"    提取静态背景: {static_gaussians.shape[0]} 个静态gaussian")
             return static_gaussians
 
         except Exception as e:
-            print(f"❌ 从labels提取静态背景失败: {e}")
             # 回退到默认方法
-            return self._create_default_static_background(H, W)
-
-    def _create_static_background(
-        self,
-        preds: Dict[str, Any],
-        velocity: Optional[torch.Tensor],
-        clustering_results: List[Dict],
-        H: int, W: int, S: int
-    ) -> torch.Tensor:
-        """从VGGT预测的Gaussians中分离静态背景"""
-        try:
-            import time
-            stage5_times = {}
-
-            # Step 1: 获取和整形Gaussian参数
-            step1_start = time.time()
-            # [B, S*H*W, 14] or [B*S, H*W, 14]
-            gaussian_params = preds.get('gaussian_params')
-
-            if gaussian_params is None:
-                return self._create_default_static_background(H, W)
-
-            # 重新整形Gaussian参数为 [S, H*W, 14]（激活函数已在函数开头应用）
-            if gaussian_params.dim() == 3 and gaussian_params.shape[1] == S * H * W:
-                # 情况1: [B, S*H*W, 14] -> [S, H*W, 14]
-                gaussian_params = gaussian_params[0].reshape(S, H * W, 14)
-            elif gaussian_params.dim() == 3 and gaussian_params.shape[0] == S:
-                # 情况2: [S, H*W, 14] -> 已经是正确形状
-                gaussian_params = gaussian_params
-            else:
-                # 其他情况，尝试重新整形
-                gaussian_params = gaussian_params.reshape(S, H * W, 14)
-            stage5_times['Step 1: 获取和整形Gaussian参数'] = time.time() - step1_start
-
-            # Step 2: 处理速度信息
-            step2_start = time.time()
-            if velocity is not None:
-                if len(velocity.shape) == 5:
-                    B_v, S_v, H_v, W_v, _ = velocity.shape
-                    velocity_reshaped = velocity[0].reshape(
-                        S, H * W, 3)  # [S, H*W, 3]
-                elif len(velocity.shape) == 4:
-                    B_v, S_v, HW_v, _ = velocity.shape
-                    velocity_reshaped = velocity[0]  # [S, H*W, 3]
-                else:
-                    velocity_reshaped = velocity[0].reshape(S, H * W, 3) if velocity.numel(
-                    ) >= S * H * W * 3 else torch.zeros(S, H * W, 3, device=self.device)
-
-                # 计算速度大小
-                velocity_magnitude = torch.norm(
-                    velocity_reshaped, dim=-1)  # [S, H*W]
-            else:
-                velocity_magnitude = torch.zeros(S, H * W, device=self.device)
-            stage5_times['Step 2: 处理速度信息'] = time.time() - step2_start
-
-            # Step 3: 收集动态区域掩码
-            step3_start = time.time()
-            dynamic_mask_all = torch.zeros(
-                S, H * W, dtype=torch.bool, device=self.device)
-
-            for frame_idx, result in enumerate(clustering_results):
-                if frame_idx >= S:
-                    break
-                dynamic_mask = result.get('dynamic_mask')
-                if dynamic_mask is not None and len(dynamic_mask) == H * W:
-                    dynamic_mask_all[frame_idx] = dynamic_mask
-            stage5_times['Step 3: 收集动态区域掩码'] = time.time() - step3_start
-
-            # Step 4: 计算静态区域掩码
-            step4_start = time.time()
-            velocity_threshold = 0.003  # 速度阈值
-            static_velocity_mask = velocity_magnitude <= velocity_threshold  # 低速度区域
-            static_object_mask = ~dynamic_mask_all  # 非动态物体区域
-
-            # 静态区域 = 低速度 AND 非动态物体 AND 高置信度
-            static_mask = static_velocity_mask # & static_object_mask  # [S, H*W]
-
-            # 应用confidence掩码：只有高置信度的像素才能成为静态背景
-            if 'depth_conf_mask' in preds and preds['depth_conf_mask'] is not None:
-                conf_mask = preds['depth_conf_mask']  # [B, S, H, W]
-                if len(conf_mask.shape) == 4:
-                    conf_mask = conf_mask[0]  # [S, H, W]
-                conf_mask = conf_mask.reshape(S, H*W)  # [S, H*W]
-                static_mask = static_mask & conf_mask
-                print(f"  静态背景应用confidence掩码: {conf_mask.float().mean().item():.3f} 的像素被保留")
-
-            stage5_times['Step 4: 计算静态区域掩码'] = time.time() - step4_start
-
-            # Step 5: 收集所有静态Gaussians
-            step5_start = time.time()
-            all_static_gaussians = []
-            for frame_idx in range(S):
-                frame_static_mask = static_mask[frame_idx]
-                if frame_static_mask.any():
-                    # [N_static, 14]
-                    frame_static_gaussians = gaussian_params[frame_idx][frame_static_mask]
-                    all_static_gaussians.append(frame_static_gaussians)
-
-            if not all_static_gaussians:
-                return self._create_default_static_background(H, W)
-
-            # 合并所有静态Gaussians
-            all_static_gaussians = torch.cat(
-                all_static_gaussians, dim=0)  # [Total_N, 14]
-            stage5_times['Step 5: 收集所有静态Gaussians'] = time.time() - step5_start
-
-            # Step 6: 下采样和去重处理
-            step6_start = time.time()
-            downsampled_static_gaussians = self._downsample_static_gaussians(
-                all_static_gaussians, max_points=50000000, spatial_threshold=0.001
-            )
-            stage5_times['Step 6: 下采样和去重处理'] = time.time() - step6_start
-
-            return downsampled_static_gaussians
-
-        except Exception as e:
             return self._create_default_static_background(H, W)
 
     def _create_default_static_background(self, H: int, W: int) -> torch.Tensor:
@@ -1772,79 +1616,6 @@ class OnlineDynamicProcessor:
 
         except Exception as e:
             return torch.zeros(100, 14, device=self.device)
-
-    def _downsample_static_gaussians(
-        self,
-        static_gaussians: torch.Tensor,
-        max_points: int = 2000,
-        spatial_threshold: float = 0.05
-    ) -> torch.Tensor:
-        """对静态Gaussians进行下采样和去重"""
-        try:
-            import time
-            downsample_times = {}
-            if len(static_gaussians) <= max_points:
-                return static_gaussians
-
-            # Step 6.1: 基于空间距离的去重
-            step61_start = time.time()
-            positions = static_gaussians[:, :3]  # [N, 3]
-
-            # 使用简单的网格下采样来去重
-            # 将3D空间分为网格，每个网格只保留一个代表点
-            grid_size = spatial_threshold
-
-            # 量化位置到网格
-            quantized_positions = torch.round(
-                positions / grid_size) * grid_size
-            downsample_times['Step 6.1: 位置量化'] = time.time() - step61_start
-
-            # Step 6.2: 找到唯一的网格位置
-            unique_positions, inverse_indices = torch.unique(
-                quantized_positions, dim=0, return_inverse=True
-            )
-            downsample_times['Step 6.2: 唯一网格计算'] = time.time() - step62_start
-            print(
-                f"        去重前: {len(static_gaussians)} -> 去重后: {len(unique_positions)}")
-
-            # Step 6.3: 选择代表Gaussian (向量化优化)
-            step63_start = time.time()
-            # 使用sort找到每个网格的第一个出现位置
-            sorted_indices, sort_order = torch.sort(inverse_indices)
-            # 找到相邻元素不同的位置（即每个唯一值第一次出现的位置）
-            first_occurrence_mask = torch.cat([
-                torch.tensor([True], device=self.device),
-                sorted_indices[1:] != sorted_indices[:-1]
-            ])
-            first_occurrence = sort_order[first_occurrence_mask]
-            deduped_gaussians = static_gaussians[first_occurrence]
-            downsample_times['Step 6.3: 选择代表Gaussian'] = time.time() - \
-                step63_start
-
-            # Step 6.4: 随机下采样（如果仍然太多）
-            step64_start = time.time()
-            if len(deduped_gaussians) > max_points:
-                indices = torch.randperm(len(deduped_gaussians), device=self.device)[
-                    :max_points]
-                final_gaussians = deduped_gaussians[indices]
-                print(
-                    f"        随机下采样: {len(deduped_gaussians)} -> {len(final_gaussians)}")
-            else:
-                final_gaussians = deduped_gaussians
-            downsample_times['Step 6.4: 随机下采样'] = time.time() - step64_start
-
-            # 显示下采样详细耗时 - 已移除输出
-
-            return final_gaussians
-
-        except Exception as e:
-            # 回退到简单随机采样
-            if len(static_gaussians) > max_points:
-                indices = torch.randperm(len(static_gaussians), device=self.device)[
-                    :max_points]
-                return static_gaussians[indices]
-            else:
-                return static_gaussians
 
     def get_statistics(self) -> Dict[str, Any]:
         """获取处理统计信息"""
