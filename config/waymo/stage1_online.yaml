@@ -5,8 +5,8 @@
 model: "VGGT(img_size=518, patch_size=14, embed_dim=1024)"
 # pretrained: model.pt
 # pretrained_velocity: False
-# pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow/checkpoint-epoch_7_9968.pth"
-pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/aggregator_resume_noflowgrad_nearestdynamic_resume_0point1_novoxel/checkpoint-epoch_0_19936.pth"
+pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow/checkpoint-epoch_7_9968.pth"
+# pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/aggregator_resume_noflowgrad_nearestdynamic_resume_0point1_novoxel/checkpoint-epoch_0_19936.pth"
 
 # VGGT冻结策略配置
 # 可选值: "none", "encoder", "encoder_frame", "backbone", "backbone_camera", "backbone_pts",
@@ -55,7 +55,7 @@ training_stage: 'stage1'
 # =============== 第一阶段损失权重配置 ===============
 # 权重为0则完全不计算该损失
 
-lpips_start_iter: 0                     # LPIPS loss开始计算的iteration
+lpips_start_iter: 5000                     # LPIPS loss开始计算的iteration
 
 # 1. Self Render Loss (训练gaussian head)
 self_render_weight: 0.0                    # Gaussian参数学习的主要损失 (已弃用，使用下面的分项权重)
@@ -69,9 +69,12 @@ flow_interval: 1                           # 光流计算的帧间隔
 
 # 3. GT Flow Loss (直接使用GT flowmap监督velocity head)
 # 类似depth loss，返回三个损失：conf、reg、grad
-conf_flow_loss_weight: 1.0                 # GT flowmap conf损失权重
+conf_flow_loss_weight: 0.0                 # GT flowmap conf损失权重
 grad_flow_loss_weight: 0.0                 # GT flowmap gradient损失权重
-reg_flow_loss_weight: 1.0                  # GT flowmap reg损失权重
+reg_flow_loss_weight: 0.0                  # GT flowmap reg损失权重
+
+# 3b. GT Flow Loss Ours (我们自己实现的版本)
+gt_flow_loss_ours_weight: 1.0              # 自定义GT flowmap损失权重
 
 # 4. SAM2 Velocity Consistency Loss (辅助velocity head监督)
 sam2_velocity_weight: 0.0                  # SAM2掩码一致性监督
@@ -105,7 +108,7 @@ aggregator_render_rgb_weight: 1.0           # Aggregator render RGB损失权重
 aggregator_render_depth_weight: 1.0         # Aggregator render depth损失权重
 aggregator_render_lpips_weight: 0.1         # Aggregator render LPIPS损失权重
 aggregator_voxel_size: 0                # 体素量化大小(metric尺度, 单位m)
-aggregator_dynamic_threshold: 0.0          # 动静态分离的速度阈值(metric尺度, 单位m/s)
+aggregator_dynamic_threshold: 0.1          # 动静态分离的速度阈值(metric尺度, 单位m/s)
 
 # =============== 数据集配置 ===============
 
@@ -154,7 +157,7 @@ num_imgs_vis: 4
 
 # =============== 输出配置 ===============
 save_dir: 'checkpoints/waymo_stage1_online'
-exp_name: 'aggregator_resume_noflowgrad_nearestdynamic_resume_nostatic_novoxel'
+exp_name: 'aggregator_resume_noflowgrad_nearestdynamic_resume_novoxel_thre_nodetach'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/

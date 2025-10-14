@@ -54,32 +54,32 @@ def parse_args():
     parser.add_argument(
         "--model_path",
         type=str,
-        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(true+fixmodel+lowlr!+nolpips+onlyflow+velocitylocal+fromscratch)/checkpoint-epoch_2_17880.pth",
+        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/aggregator_resume_noflowgrad_nearestdynamic_resume_0point1_novoxel/checkpoint-epoch_0_45568.pth",
         help="Path to the Stage1 model checkpoint",
     )
     parser.add_argument(
         "--stage2_model_path",
         type=str,
-        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(true+fixmodel+lowlr!+nolpips+onlyflow+velocitylocal+fromscratch)/stage2-checkpoint-final.pth",
+        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage2_online/stage2_test/stage2-checkpoint-epoch_0_8.pth",
         help="Path to the Stage2 model checkpoint",
     )
     parser.add_argument(
         "--seq_dir",
         type=str,
-        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/test/segment-11717495969710734380_2440_000_2460_000_with_camera_labels",
+        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train_with_flow/segment-15795616688853411272_1245_000_1265_000_with_camera_labels",
         # default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train",
         help="Path to the sequence directory or video file",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./stage2_inference_outputs",
+        default="./stage2_inference_outputs_test",
         help="Output directory for results",
     )
     parser.add_argument(
         "--idx",
         type=int,
-        default=0,
+        default=1400,
         help="Index of the sequence to process (for single inference)",
     )
     parser.add_argument(
@@ -91,7 +91,7 @@ def parse_args():
     parser.add_argument(
         "--num_views",
         type=int,
-        default=24,
+        default=8,
         help="Number of views for inference",
     )
 
@@ -104,25 +104,62 @@ def parse_args():
     parser.add_argument(
         "--start_idx",
         type=int,
-        default=150,
+        default=100,
         help="Starting index for batch inference",
     )
     parser.add_argument(
         "--end_idx",
         type=int,
-        default=200,
+        default=10000,
         help="Ending index for batch inference",
     )
     parser.add_argument(
         "--step",
         type=int,
-        default=5,
+        default=100,
         help="Step size for batch inference",
     )
     parser.add_argument(
         "--continue_on_error",
         action="store_true",
         help="Continue batch processing even if some indices fail",
+    )
+    parser.add_argument(
+        "--use_velocity_based_transform",
+        action="store_true",
+        help="Use velocity-based transformation instead of optical flow",
+    )
+
+    # 动态物体聚类和跟踪参数
+    parser.add_argument(
+        "--velocity_threshold",
+        type=float,
+        default=0.1,
+        help="Velocity threshold for dynamic object clustering",
+    )
+    parser.add_argument(
+        "--clustering_eps",
+        type=float,
+        default=0.02,
+        help="DBSCAN eps parameter for clustering",
+    )
+    parser.add_argument(
+        "--clustering_min_samples",
+        type=int,
+        default=10,
+        help="DBSCAN min_samples parameter for clustering",
+    )
+    parser.add_argument(
+        "--tracking_position_threshold",
+        type=float,
+        default=2.0,
+        help="Position threshold for object tracking across frames",
+    )
+    parser.add_argument(
+        "--tracking_velocity_threshold",
+        type=float,
+        default=0.2,
+        help="Velocity threshold for object tracking across frames",
     )
 
     return parser.parse_args()
@@ -152,13 +189,18 @@ def load_stage1_model(model_path, device):
     return model
 
 
-def load_stage2_components(stage2_model_path, device):
+def load_stage2_components(stage2_model_path, device, use_velocity_based_transform=False,
+                          velocity_threshold=0.1, clustering_eps=0.02, clustering_min_samples=10,
+                          tracking_position_threshold=2.0, tracking_velocity_threshold=0.2):
     """加载Stage2组件"""
     print(f"Loading Stage2 components...")
+    print(f"  Transformation method: {'Velocity-based' if use_velocity_based_transform else 'Flow-based'}")
+    print(f"  Clustering parameters: velocity_threshold={velocity_threshold}, eps={clustering_eps}, min_samples={clustering_min_samples}")
+    print(f"  Tracking parameters: position_threshold={tracking_position_threshold}, velocity_threshold={tracking_velocity_threshold}")
 
     # Stage2配置（使用稀疏卷积）
     stage2_config = {
-        'training_mode': 'gaussian_only',
+        'training_mode': 'joint',  # 改为joint以同时启用Gaussian和Pose refinement
         'input_gaussian_dim': 14,
         'output_gaussian_dim': 14,
         'gaussian_feature_dim': 128,
@@ -171,6 +213,15 @@ def load_stage2_components(stage2_model_path, device):
         'max_points_per_object': 4096,
         'rgb_loss_weight': 1.0,
         'depth_loss_weight': 0.0,
+        'dynamic_processor': {
+            'use_velocity_based_transform': use_velocity_based_transform,
+            'velocity_threshold': velocity_threshold,
+            'clustering_eps': clustering_eps,
+            'clustering_min_samples': clustering_min_samples,
+            'tracking_position_threshold': tracking_position_threshold,
+            'tracking_velocity_threshold': tracking_velocity_threshold,
+            'min_object_size': 50  # 降低最小物体尺寸阈值以检测更多动态物体
+        }
     }
 
     # 创建Stage2训练器
@@ -191,6 +242,10 @@ def load_stage2_components(stage2_model_path, device):
         print("Stage2 checkpoint loaded successfully")
     else:
         print(f"Warning: Stage2 checkpoint not found at {stage2_model_path}, using initialized model")
+
+    # IMPORTANT: 设置为评估模式
+    stage2_trainer.eval()
+    print("Stage2 model set to eval mode")
 
     # 创建Stage2渲染损失（仅用于渲染）
     render_loss_config = {
@@ -826,7 +881,10 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
                   f"Aggregation: {stage_times.get('aggregation', 0):.3f}s | "
                   f"Total: {dynamic_objects_data.get('processing_time', 0):.3f}s")
 
+        print(f"\n[Dynamic Objects Detection] Found {len(dynamic_objects_data.get('dynamic_objects', [])) if dynamic_objects_data else 0} dynamic objects")
+
         if not dynamic_objects_data or len(dynamic_objects_data['dynamic_objects']) == 0:
+            print("[WARNING] No dynamic objects detected! Initial and Refined images will be identical.")
             # 如果没有动态物体，使用静态Gaussian进行渲染
             B, S, C, H, W = vggt_batch['images'].shape
 
@@ -842,10 +900,11 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
                     None, None, None, :].repeat(1, extrinsics.shape[1], 1, 1)
             ], dim=-2)
 
-            # 使用静态Gaussian场景进行渲染
-            static_scene = stage2_trainer.stage2_model.get_refined_scene(
-                [], dynamic_objects_data.get('static_gaussians')
-            )
+            # 使用静态Gaussian场景进行渲染（没有动态物体）
+            static_scene = {
+                'static_gaussians': dynamic_objects_data.get('static_gaussians'),
+                'dynamic_objects': []
+            }
 
             with torch.no_grad():
                 rendered_images_tensor, _ = stage2_render_loss.render_refined_scene(
@@ -869,6 +928,7 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
                 'views': views
             }
         else:
+            print(f"[INFO] Processing {len(dynamic_objects_data['dynamic_objects'])} dynamic objects with Stage2 refinement")
 
             # 准备渲染参数
             B, S, C, H, W = vggt_batch['images'].shape
@@ -888,10 +948,10 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
 
             # 模式1: 不使用Stage2细化，直接使用原始动态物体数据
             start_time = time.time()
-            initial_scene = stage2_trainer.stage2_model.get_refined_scene(
-                dynamic_objects_data['dynamic_objects'],
-                dynamic_objects_data.get('static_gaussians')
-            )
+            initial_scene = {
+                'static_gaussians': dynamic_objects_data.get('static_gaussians'),
+                'dynamic_objects': dynamic_objects_data['dynamic_objects']
+            }
             with torch.no_grad():
                 initial_rendered_images, _ = stage2_render_loss.render_refined_scene(
                     refined_scene=initial_scene,
@@ -905,17 +965,105 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
 
             # 模式2: 使用Stage2细化
             start_time = time.time()
+            print(f"\n[Stage2 Refinement] Starting refinement with {len(dynamic_objects_data['dynamic_objects'])} dynamic objects")
+            print(f"[Stage2 Refinement] Stage2 model training mode: {stage2_trainer.stage2_model.training}")
+
             with torch.no_grad():
                 refinement_results = stage2_trainer.stage2_model(
                     dynamic_objects=dynamic_objects_data['dynamic_objects'],
-                    static_gaussians=dynamic_objects_data.get('static_gaussians')
+                    static_gaussians=dynamic_objects_data.get('static_gaussians'),
+                    preds=stage1_preds
                 )
             stage2_refine_time = time.time() - start_time
 
-            # 获取细化后的场景
-            refined_scene = stage2_trainer.stage2_model.get_refined_scene(
-                refinement_results, dynamic_objects_data.get('static_gaussians')
-            )
+            print(f"[Stage2 Refinement] Refinement completed in {stage2_refine_time:.3f}s")
+            if isinstance(refinement_results, dict) and 'refined_dynamic_objects' in refinement_results:
+                num_refined = len(refinement_results['refined_dynamic_objects'])
+                print(f"[Stage2 Refinement] Successfully refined {num_refined} dynamic objects")
+
+                # 比较refinement前后的Gaussian参数差异(检查第一个物体)
+                if num_refined > 0 and len(dynamic_objects_data['dynamic_objects']) > 0:
+                    refined_objects = refinement_results['refined_dynamic_objects']
+
+                    # 计算所有物体的平均参数变化
+                    total_means_diff = 0.0
+                    total_scales_diff = 0.0
+                    total_opacity_diff = 0.0
+                    compared_count = 0
+
+                    # 统计pose变换
+                    total_translation_diff = 0.0
+                    total_rotation_diff = 0.0
+                    pose_compared_count = 0
+
+                    # 调试信息
+                    num_objects_with_pose_deltas = 0
+
+                    for i, refined_obj in enumerate(refined_objects):
+                        if i < len(dynamic_objects_data['dynamic_objects']):
+                            original_obj = dynamic_objects_data['dynamic_objects'][i]
+
+                            # 获取canonical_gaussians进行比较
+                            if 'canonical_gaussians' in original_obj and 'refined_gaussians' in refined_obj:
+                                orig_gauss = original_obj['canonical_gaussians']  # [N, 14]
+                                refined_gauss = refined_obj['refined_gaussians']  # [N, 14]
+
+                                # 计算参数差异
+                                means_diff = torch.abs(orig_gauss[:, :3] - refined_gauss[:, :3]).mean()
+                                scales_diff = torch.abs(orig_gauss[:, 7:10] - refined_gauss[:, 7:10]).mean()
+                                opacity_diff = torch.abs(orig_gauss[:, 10] - refined_gauss[:, 10]).mean()
+
+                                total_means_diff += means_diff.item()
+                                total_scales_diff += scales_diff.item()
+                                total_opacity_diff += opacity_diff.item()
+                                compared_count += 1
+
+                            # 统计pose deltas
+                            if 'pose_deltas' in refined_obj:
+                                pose_deltas_list = refined_obj['pose_deltas']
+                                if pose_deltas_list and len(pose_deltas_list) > 0:
+                                    num_objects_with_pose_deltas += 1
+                                    for pose_delta in pose_deltas_list:
+                                        if pose_delta is not None and isinstance(pose_delta, torch.Tensor):
+                                            # pose_delta: [6] 或 [7] - [rotation(3 or 4), translation(3)]
+                                            if pose_delta.numel() >= 6:
+                                                translation = pose_delta[-3:]  # 最后3个是translation
+                                                rotation = pose_delta[:-3]  # 前面的是rotation
+
+                                                translation_magnitude = torch.norm(translation).item()
+                                                rotation_magnitude = torch.norm(rotation).item()
+
+                                                total_translation_diff += translation_magnitude
+                                                total_rotation_diff += rotation_magnitude
+                                                pose_compared_count += 1
+
+                    if compared_count > 0:
+                        avg_means_diff = total_means_diff / compared_count
+                        avg_scales_diff = total_scales_diff / compared_count
+                        avg_opacity_diff = total_opacity_diff / compared_count
+
+                        print(f"[Stage2 Refinement] Average Gaussian parameter changes across {compared_count} objects:")
+                        print(f"  - Means (position) diff: {avg_means_diff:.6f}")
+                        print(f"  - Scales diff: {avg_scales_diff:.6f}")
+                        print(f"  - Opacity diff: {avg_opacity_diff:.6f}")
+
+                    if pose_compared_count > 0:
+                        avg_translation_diff = total_translation_diff / pose_compared_count
+                        avg_rotation_diff = total_rotation_diff / pose_compared_count
+
+                        print(f"[Stage2 Refinement] Average pose refinement across {pose_compared_count} frames ({num_objects_with_pose_deltas} objects):")
+                        print(f"  - Translation magnitude: {avg_translation_diff:.6f}")
+                        print(f"  - Rotation magnitude: {avg_rotation_diff:.6f} rad")
+                    else:
+                        print(f"[Stage2 Refinement] No pose deltas found (objects with pose_deltas: {num_objects_with_pose_deltas})")
+            else:
+                print(f"[Stage2 Refinement] Refined {len(refinement_results)} dynamic objects")
+
+            # 直接构建渲染需要的场景格式（不使用get_refined_scene）
+            refined_scene = {
+                'static_gaussians': dynamic_objects_data.get('static_gaussians'),
+                'dynamic_objects': refinement_results['refined_dynamic_objects']
+            }
 
             start_time = time.time()
             with torch.no_grad():
@@ -1163,7 +1311,13 @@ def main():
     print("Loading models (shared for all inferences)...")
     stage1_model = load_stage1_model(args.model_path, device)
     stage2_trainer, stage2_render_loss = load_stage2_components(
-        args.stage2_model_path, device
+        args.stage2_model_path, device,
+        use_velocity_based_transform=args.use_velocity_based_transform,
+        velocity_threshold=args.velocity_threshold,
+        clustering_eps=args.clustering_eps,
+        clustering_min_samples=args.clustering_min_samples,
+        tracking_position_threshold=args.tracking_position_threshold,
+        tracking_velocity_threshold=args.tracking_velocity_threshold
     )
     print("Models loaded successfully!\n")
 

@@ -48,6 +48,7 @@ class OpticalFlowRegistration:
                  max_flow_magnitude: float = 200.0,  # 增加最大光流幅度
                  use_simple_correspondence: bool = True,
                  use_direct_correspondence: bool = True,  # 使用直接索引匹配
+                 use_velocity_based_transform: bool = False,  # 使用velocity直接计算变换
                  raft_model_path: str = None):
         """
         初始化光流配准器
@@ -60,6 +61,7 @@ class OpticalFlowRegistration:
             max_flow_magnitude: 最大光流幅度阈值
             use_simple_correspondence: 是否使用简单对应点查找方法（更快）
             use_direct_correspondence: 是否使用直接索引匹配（最快且最准确）
+            use_velocity_based_transform: 是否使用velocity直接计算变换（无需光流，最快）
             raft_model_path: RAFT模型权重文件路径（可选）
         """
         self.device = device
@@ -68,6 +70,7 @@ class OpticalFlowRegistration:
         self.max_flow_magnitude = max_flow_magnitude
         self.use_simple_correspondence = use_simple_correspondence
         self.use_direct_correspondence = use_direct_correspondence
+        self.use_velocity_based_transform = use_velocity_based_transform
 
         # 初始化光流模型
         self.flow_model = self._load_flow_model(
@@ -76,8 +79,9 @@ class OpticalFlowRegistration:
         # 存储配准结果
         self.registration_results = {}
 
+        transform_method = "Velocity-based" if use_velocity_based_transform else "Flow-based"
         print(
-            f"光流配准器初始化完成 - 模型: {flow_model_name}, 方法: Procrustes算法, 对应点查找: {'简单' if use_simple_correspondence else '复杂'}")
+            f"光流配准器初始化完成 - 模型: {flow_model_name}, 变换方法: {transform_method}, 对应点查找: {'简单' if use_simple_correspondence else '复杂'}")
 
     def _load_flow_model(self, model_name: str, raft_model_path: str = None):
         """加载光流模型"""
@@ -889,17 +893,24 @@ class OpticalFlowRegistration:
         """
         预先计算所有相邻帧之间的光流 - 使用calc_flow函数
 
+        如果使用velocity-based方法，直接返回空字典（无需计算光流）
+
         Args:
             vggt_batch: 输入数据批次
 
         Returns:
-            光流字典 {frame_pair: flow}
+            光流字典 {frame_pair: flow}，如果使用velocity-based则返回空字典
         """
+        # 如果使用velocity-based变换方法，跳过光流计算
+        if self.use_velocity_based_transform:
+            print("  使用velocity-based方法，跳过光流计算")
+            return {}
 
         B, S, C, H, W = vggt_batch["images"].shape
 
         # 使用calc_flow函数计算所有相邻帧之间的光流
         # calc_flow返回 (forward_flow, backward_flow, forward_consist_mask, backward_consist_mask, forward_in_bound_mask, backward_in_bound_mask)
+        print("  计算光流中...")
         forward_flow, backward_flow = calc_flow(
             vggt_batch["images"],
             self.flow_model,
@@ -916,6 +927,7 @@ class OpticalFlowRegistration:
             flow = forward_flow[0, frame_idx].detach(
             ).cpu().numpy().transpose(1, 2, 0)  # [H, W, 2]
             flows[(frame_idx, frame_idx + 1)] = flow
+        print(f"  光流计算完成，共 {len(flows)} 对")
         return flows
 
     def compute_chain_transformation(self,
@@ -976,24 +988,34 @@ class OpticalFlowRegistration:
                 print(f"物体 {global_id} 在帧 {frame_idx} 或 {next_frame} 中不存在")
                 return None
 
-            # 获取光流
-            if direction == 1:
-                flow_key = (frame_idx, next_frame)
-            else:
-                flow_key = (next_frame, frame_idx)
+            # 获取光流（如果使用flow-based方法）
+            flow = None
+            if not self.use_velocity_based_transform:
+                if direction == 1:
+                    flow_key = (frame_idx, next_frame)
+                else:
+                    flow_key = (next_frame, frame_idx)
 
-            if flow_key not in flows:
-                print(f"未找到帧 {frame_idx} -> {next_frame} 的光流")
-                return None
+                if flow_key not in flows:
+                    print(f"未找到帧 {frame_idx} -> {next_frame} 的光流")
+                    return None
 
-            flow = flows[flow_key]
-            if direction == -1:
-                # 反向光流
-                flow = -flow
+                flow = flows[flow_key]
+                if direction == -1:
+                    # 反向光流
+                    flow = -flow
 
             # 获取深度数据
             depth_src = preds["depth"][0, frame_idx, :, :, 0]  # [H, W]
             depth_dst = preds["depth"][0, next_frame, :, :, 0]  # [H, W]
+
+            # 获取velocity数据（如果启用velocity-based方法）
+            velocity_src = None
+            velocity_dst = None
+            if self.use_velocity_based_transform and 'velocity' in preds:
+                # velocity shape: [B, S, H, W, 3]
+                velocity_src = preds['velocity'][0, frame_idx]  # [H, W, 3]
+                velocity_dst = preds['velocity'][0, next_frame]  # [H, W, 3]
 
             # 获取对应帧的内参和外参
             intrinsic_src = intrinsic[0, frame_idx]  # [3, 3]
@@ -1005,7 +1027,9 @@ class OpticalFlowRegistration:
             step_transformation = self.compute_single_step_transformation(
                 current_result, next_result,
                 depth_src, depth_dst,
-                flow, intrinsic_src, intrinsic_dst, extrinsic_src, extrinsic_dst, global_id
+                flow, intrinsic_src, intrinsic_dst, extrinsic_src, extrinsic_dst, global_id,
+                velocity_src=velocity_src, velocity_dst=velocity_dst,
+                direction=direction
             )
 
             if step_transformation is None:
@@ -1097,29 +1121,40 @@ class OpticalFlowRegistration:
                 if global_id not in current_global_ids or global_id not in next_global_ids:
                     return None
 
-                # 获取光流
-                if direction == 1:
-                    flow_key = (frame_idx, next_frame)
-                else:
-                    flow_key = (next_frame, frame_idx)
+                # 获取光流（如果使用flow-based方法）
+                flow = None
+                if not self.use_velocity_based_transform:
+                    if direction == 1:
+                        flow_key = (frame_idx, next_frame)
+                    else:
+                        flow_key = (next_frame, frame_idx)
 
-                if flow_key not in flows:
-                    return None
+                    if flow_key not in flows:
+                        return None
 
-                flow = flows[flow_key]
-                if direction == -1:
-                    flow = -flow
+                    flow = flows[flow_key]
+                    if direction == -1:
+                        flow = -flow
 
                 # 获取深度数据
                 depth_src = preds["depth"][0, frame_idx, :, :, 0]
                 depth_dst = preds["depth"][0, next_frame, :, :, 0]
+
+                # 获取velocity数据（如果启用velocity-based方法）
+                velocity_src = None
+                velocity_dst = None
+                if self.use_velocity_based_transform and 'velocity' in preds:
+                    velocity_src = preds['velocity'][0, frame_idx]  # [H, W, 3]
+                    velocity_dst = preds['velocity'][0, next_frame]  # [H, W, 3]
 
                 # 计算单步变换
                 step_transformation = self.compute_single_step_transformation(
                     current_result, next_result, depth_src, depth_dst, flow,
                     intrinsic[0, frame_idx], intrinsic[0, next_frame],
                     extrinsic[0, frame_idx], extrinsic[0, next_frame],
-                    global_id
+                    global_id,
+                    velocity_src=velocity_src, velocity_dst=velocity_dst,
+                    direction=direction
                 )
 
                 if step_transformation is None:
@@ -1137,6 +1172,91 @@ class OpticalFlowRegistration:
 
         return cumulative_transformation
 
+    def _compute_velocity_based_transformation(self,
+                                                clustering_src: Dict,
+                                                clustering_dst: Dict,
+                                                velocity_src: torch.Tensor,
+                                                velocity_dst: Optional[torch.Tensor],
+                                                global_id: int,
+                                                H: int,
+                                                W: int,
+                                                direction: int = 1) -> Optional[np.ndarray]:
+        """
+        基于velocity直接计算变换矩阵（无需光流）
+
+        策略：
+        1. 提取源帧中属于该物体的所有点的velocity
+        2. 对这些velocity取平均，得到平均运动向量
+        3. 如果是backward (direction=-1)，对velocity取反
+        4. 构建变换矩阵：R = I（单位阵），t = 平均velocity * direction
+
+        Args:
+            clustering_src: 源帧聚类结果
+            clustering_dst: 目标帧聚类结果（暂未使用，保留用于未来扩展）
+            velocity_src: 源帧velocity场 [H, W, 3]
+            velocity_dst: 目标帧velocity场（可选，暂未使用）
+            global_id: 物体全局ID
+            H, W: 图像尺寸
+            direction: 变换方向，1表示forward，-1表示backward
+
+        Returns:
+            4x4变换矩阵或None
+        """
+        # 1. 提取属于该物体的点的索引
+        # 从clustering_src中找到global_id对应的聚类索引
+        global_ids = clustering_src.get('global_ids', [])
+        if global_id not in global_ids:
+            return None
+
+        cluster_idx = global_ids.index(global_id)
+        cluster_indices = clustering_src.get('cluster_indices', [])
+        if cluster_idx >= len(cluster_indices):
+            return None
+
+        object_indices = cluster_indices[cluster_idx]  # List of flattened indices
+        if len(object_indices) == 0:
+            return None
+
+        # 2. 将velocity从[H, W, 3]转为[H*W, 3]并提取对应点的velocity
+        if isinstance(velocity_src, torch.Tensor):
+            if len(velocity_src.shape) == 3:  # [H, W, 3]
+                velocity_flat = velocity_src.reshape(H * W, 3)
+            elif len(velocity_src.shape) == 2:  # [H*W, 3]
+                velocity_flat = velocity_src
+            else:
+                return None
+
+            # 提取对应点的velocity
+            object_velocities = velocity_flat[object_indices]  # [N, 3]
+
+            # 3. 计算平均velocity
+            mean_velocity = object_velocities.mean(dim=0)  # [3]
+
+            # 转为numpy (先detach再转换)
+            if isinstance(mean_velocity, torch.Tensor):
+                mean_velocity = mean_velocity.detach().cpu().numpy()
+        else:
+            # velocity_src已经是numpy
+            if len(velocity_src.shape) == 3:
+                velocity_flat = velocity_src.reshape(H * W, 3)
+            else:
+                velocity_flat = velocity_src
+
+            object_velocities = velocity_flat[object_indices]
+            mean_velocity = np.mean(object_velocities, axis=0)
+
+        # 4. 根据方向调整velocity
+        # direction = 1: forward (src -> dst), 使用原velocity
+        # direction = -1: backward (dst -> src), velocity取反
+        adjusted_velocity = mean_velocity * direction
+
+        # 5. 构建变换矩阵：R = I, t = adjusted_velocity
+        transformation = np.eye(4)
+        transformation[:3, :3] = np.eye(3)  # 单位旋转矩阵
+        transformation[:3, 3] = adjusted_velocity  # 平移为调整后的velocity
+
+        return transformation
+
     def compute_single_step_transformation(self,
                                            clustering_src: Dict,
                                            clustering_dst: Dict,
@@ -1147,7 +1267,10 @@ class OpticalFlowRegistration:
                                            intrinsic_dst: torch.Tensor,
                                            extrinsic_src: torch.Tensor,
                                            extrinsic_dst: torch.Tensor,
-                                           global_id: int) -> Optional[np.ndarray]:
+                                           global_id: int,
+                                           velocity_src: Optional[torch.Tensor] = None,
+                                           velocity_dst: Optional[torch.Tensor] = None,
+                                           direction: int = 1) -> Optional[np.ndarray]:
         """
         计算单步变换（相邻两帧之间）
 
@@ -1162,6 +1285,9 @@ class OpticalFlowRegistration:
             extrinsic_src: 源帧相机外参
             extrinsic_dst: 目标帧相机外参
             global_id: 物体全局ID
+            velocity_src: 源帧velocity场 [H, W, 3]（可选，用于velocity-based方法）
+            velocity_dst: 目标帧velocity场 [H, W, 3]（可选，用于velocity-based方法）
+            direction: 变换方向，1表示forward (src->dst)，-1表示backward (dst->src)
 
         Returns:
             变换矩阵或None
@@ -1171,6 +1297,14 @@ class OpticalFlowRegistration:
 
         H, W = depth_src.shape
 
+        # ========== Velocity-based方法 ==========
+        if self.use_velocity_based_transform and velocity_src is not None:
+            # 使用velocity直接计算变换（无需光流，更快更简单）
+            return self._compute_velocity_based_transformation(
+                clustering_src, clustering_dst, velocity_src, velocity_dst, global_id, H, W, direction
+            )
+
+        # ========== Flow-based方法（原方法） ==========
         # 1. 聚类数据格式化
         clustering_format_start = time.time()
         # 提取物体的2D和3D点（暂时不需要颜色信息用于变换计算）
@@ -1331,6 +1465,7 @@ class OpticalFlowRegistration:
 
             # 提取单帧的Gaussian参数，并用实际点坐标替换位置
             canonical_gaussians = None
+            frame_gaussians = {}  # 新增：每帧的原始Gaussian参数
             if preds and 'gaussian_params' in preds:
                 object_points_np = object_points.cpu().numpy() if isinstance(object_points, torch.Tensor) else object_points
                 # 创建单帧的点索引对应关系
@@ -1339,6 +1474,15 @@ class OpticalFlowRegistration:
                 canonical_gaussians = self._extract_all_frames_gaussian_params(
                     object_points_np,
                     single_frame_point_indices,
+                    preds['gaussian_params'],
+                    vggt_batch
+                )
+
+                # 提取单帧的原始Gaussian参数
+                frame_gaussians[frame_idx] = self._extract_gaussian_params_for_object(
+                    result,
+                    cluster_idx,
+                    frame_idx,
                     preds['gaussian_params'],
                     vggt_batch
                 )
@@ -1354,6 +1498,7 @@ class OpticalFlowRegistration:
                 'object_frames': [frame_idx],
                 'transformations': {},
                 'canonical_gaussians': canonical_gaussians,  # 添加Gaussian参数
+                'frame_gaussians': frame_gaussians,  # 新增：每帧的原始Gaussian参数
                 'reference_frame': frame_idx,  # 保留向后兼容
                 'num_frames': 1,
                 'num_points': len(object_points),
@@ -1501,6 +1646,7 @@ class OpticalFlowRegistration:
         # 5. 提取所有帧对应的Gaussian参数，并用实际点坐标替换位置
         gaussian_start = time.time()
         canonical_gaussians = None
+        frame_gaussians = {}  # 新增：每帧的原始Gaussian参数
         if preds and 'gaussian_params' in preds:
             canonical_gaussians = self._extract_all_frames_gaussian_params(
                 all_points,  # 聚合后的实际点坐标
@@ -1508,6 +1654,18 @@ class OpticalFlowRegistration:
                 preds['gaussian_params'],
                 vggt_batch
             )
+
+            # 提取每帧单独的Gaussian参数（不进行坐标替换）
+            for frame_idx in object_frames:
+                current_result = clustering_results[frame_idx]
+                current_cluster_idx = current_result['global_ids'].index(global_id)
+                frame_gaussians[frame_idx] = self._extract_gaussian_params_for_object(
+                    current_result,
+                    current_cluster_idx,
+                    frame_idx,
+                    preds['gaussian_params'],
+                    vggt_batch
+                )
         step_times['5. Gaussian参数提取'] = time.time() - gaussian_start
 
         step_times['总耗时'] = time.time() - method_start_time
@@ -1520,6 +1678,7 @@ class OpticalFlowRegistration:
             'point_indices': all_point_indices,  # 添加点索引对应关系
             'transformations': transformations,
             'canonical_gaussians': canonical_gaussians,  # 添加Gaussian参数
+            'frame_gaussians': frame_gaussians,  # 新增：每帧的原始Gaussian参数
             'num_frames': len(object_frames),
             'num_points': len(all_points),
             'step_times': step_times  # 添加详细时间统计

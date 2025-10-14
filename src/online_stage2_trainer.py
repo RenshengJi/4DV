@@ -13,6 +13,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from typing import Dict, List, Optional, Any, Tuple
 import numpy as np
 import time
@@ -83,6 +84,10 @@ class OnlineStage2Trainer:
         self.stage2_training_time = 0.0
         self.stage2_skip_count = 0  # 跳过的训练次数
         self.stage2_memory_usage = []  # 内存使用记录
+
+        # 网络耗时统计
+        self.gaussian_refine_times = []  # Gaussian refine网络耗时
+        self.pose_refine_times = []  # Pose refine网络耗时
         
         print(f"OnlineStage2Trainer initialized:")
         print(f"  - Start epoch: {stage2_start_epoch}")
@@ -109,10 +114,13 @@ class OnlineStage2Trainer:
             "max_points": config.get('max_points_per_object', 4096)
         }
         
+        training_mode = config.get('stage2_training_mode', config.get('training_mode', 'joint'))
+        print(f"  - Stage2 training mode: {training_mode}")
+
         model = Stage2Refiner(
             gaussian_refine_config=gaussian_refine_config,
             pose_refine_config=pose_refine_config,
-            training_mode=config.get('training_mode', 'joint')
+            training_mode=training_mode
         )
 
         model.to(self.device)
@@ -156,70 +164,134 @@ class OnlineStage2Trainer:
         iteration: int
     ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
         """
-        处理第一阶段输出，进行第二阶段训练
-        
+        处理第一阶段输出，进行第二阶段训练（支持DDP多卡训练）
+
         Args:
             preds: 第一阶段预测结果
             vggt_batch: VGGT批次数据
             auxiliary_models: 辅助模型
             epoch: 当前epoch
             iteration: 当前iteration
-            
+
         Returns:
             stage2_loss: 第二阶段损失（如果执行了训练）
             loss_dict: 详细损失字典
         """
+        # 检查是否使用分布式训练
+        is_distributed = dist.is_available() and dist.is_initialized()
+        is_main_process = not is_distributed or dist.get_rank() == 0
+
         if not self.should_run_stage2(epoch, iteration):
             self.stage2_skip_count += 1
             return None, {}
-        
+
         start_time = time.time()
-        
+
         # 记录初始GPU内存使用
         if self.memory_efficient and torch.cuda.is_available():
             initial_memory = torch.cuda.memory_allocated() / 1024**2  # MB
-        
+
+        # 初始化状态标志（用于DDP同步）
+        has_error = torch.tensor([0], dtype=torch.long, device=self.device)
+        has_objects = torch.tensor([1], dtype=torch.long, device=self.device)
+
         try:
             # 实时处理动态物体
             dynamic_objects_data = self.dynamic_processor.process_dynamic_objects(
                 preds, vggt_batch, auxiliary_models
             )
 
-            # 显示阶段时间统计
-            if dynamic_objects_data and 'stage_times' in dynamic_objects_data:
+            # 检查是否有动态物体
+            num_objects = len(dynamic_objects_data['dynamic_objects']) if dynamic_objects_data else 0
+
+            # 显示阶段时间统计（仅主进程）
+            if is_main_process and dynamic_objects_data and 'stage_times' in dynamic_objects_data:
                 stage_times = dynamic_objects_data['stage_times']
                 print(f"[Stage Times] Preprocessing: {stage_times.get('preprocessing', 0):.3f}s | "
                       f"Clustering+Background: {stage_times.get('clustering_background', 0):.3f}s | "
                       f"Tracking: {stage_times.get('tracking', 0):.3f}s | "
                       f"Aggregation: {stage_times.get('aggregation', 0):.3f}s | "
-                      f"Total: {dynamic_objects_data.get('processing_time', 0):.3f}s")
+                      f"Total: {dynamic_objects_data.get('processing_time', 0):.3f}s | "
+                      f"Objects: {num_objects}")
 
-            if not dynamic_objects_data or len(dynamic_objects_data['dynamic_objects']) == 0:
-                print(f"No dynamic objects found in iteration {iteration}")
-                # 返回零损失而不是None，这样stage2损失会显示在日志中
+            if num_objects == 0:
+                has_objects[0] = 0
+                if is_main_process:
+                    print(f"No dynamic objects found in iteration {iteration}")
+
+            # DDP同步：确保所有进程知道是否有物体
+            if is_distributed:
+                dist.all_reduce(has_objects, op=dist.ReduceOp.MIN)
+
+            # 如果所有进程都没有物体，统一返回零损失
+            if has_objects[0] == 0:
                 return torch.tensor(0.0, device=self.device, requires_grad=True), {
                     'stage2_rgb_loss': 0.0,
-                    'stage2_depth_loss': 0.0
+                    'stage2_depth_loss': 0.0,
+                    'stage2_total_loss': 0.0,
+                    'stage2_final_total_loss': 0.0
                 }
-            
-            # 执行第二阶段前向传播
-            with torch.cuda.amp.autocast(enabled=True):  # 使用混合精度
-                stage2_loss, loss_dict = self._run_stage2_forward(
-                    dynamic_objects_data, vggt_batch, preds
-                )
-            
-            # 不在这里执行反向传播，让主训练循环处理
-            # Stage2优化器将在主训练循环中调用
-            
+
+            # 执行第二阶段前向传播 (包装在内部try-catch中以捕获CUDA/渲染错误)
+            stage2_loss = None
+            loss_dict = {}
+            try:
+                with torch.cuda.amp.autocast(enabled=True):  # 使用混合精度
+                    stage2_loss, loss_dict = self._run_stage2_forward(
+                        dynamic_objects_data, vggt_batch, preds
+                    )
+            except Exception as forward_error:
+                # 捕获前向传播中的任何错误（CUDA OOM、渲染失败等）
+                if is_main_process:
+                    print(f"ERROR in _run_stage2_forward at iteration {iteration}: {forward_error}")
+                    import traceback
+                    print(f"Forward error traceback: {traceback.format_exc()}")
+
+                # 标记错误并同步到所有进程
+                has_error[0] = 1
+                if is_distributed:
+                    dist.all_reduce(has_error, op=dist.ReduceOp.MAX)
+
+                # 统一返回零损失
+                return torch.tensor(0.0, device=self.device, requires_grad=True), {
+                    'stage2_rgb_loss': 0.0,
+                    'stage2_depth_loss': 0.0,
+                    'stage2_total_loss': 0.0,
+                    'stage2_final_total_loss': 0.0
+                }
+
             # 更新统计信息
             self.stage2_iteration_count += 1
             self.last_stage2_loss = float(stage2_loss) if stage2_loss is not None else 0.0
             self.stage2_training_time += (time.time() - start_time)
-            
+
+            # 实时显示网络耗时（仅主进程）
+            if is_main_process and (len(self.gaussian_refine_times) > 0 or len(self.pose_refine_times) > 0):
+                # 计算最新的耗时
+                latest_gaussian = self.gaussian_refine_times[-1] * 1000 if self.gaussian_refine_times else 0.0
+                latest_pose = self.pose_refine_times[-1] * 1000 if self.pose_refine_times else 0.0
+                total_time = (time.time() - start_time) * 1000
+
+                # 从loss_dict获取详细时间
+                refine_time = loss_dict.get('refine_time_ms', 0.0)
+                scene_time = loss_dict.get('scene_time_ms', 0.0)
+                loss_time = loss_dict.get('loss_time_ms', 0.0)
+
+                print(f"[Network Times] Gaussian: {latest_gaussian:.2f}ms | Pose: {latest_pose:.2f}ms")
+                print(f"[Stage2 Times] Refine: {refine_time:.2f}ms | Scene: {scene_time:.2f}ms | Loss: {loss_time:.2f}ms | Total: {total_time:.2f}ms")
+
+            # 每20次有效迭代打印平均统计（仅主进程）
+            if is_main_process and self.stage2_iteration_count % 20 == 0 and len(self.gaussian_refine_times) > 0:
+                stats = self.get_statistics()
+                print(f"\n[Stage2 Avg Stats - Iter {self.stage2_iteration_count}]")
+                print(f"  Gaussian Refine Avg: {stats['gaussian_refine_avg_time_ms']:.2f}ms (count: {stats['gaussian_refine_count']})")
+                print(f"  Pose Refine Avg: {stats['pose_refine_avg_time_ms']:.2f}ms (count: {stats['pose_refine_count']})")
+                print(f"  Stage2 Total Avg: {stats['stage2_avg_training_time']*1000:.2f}ms\n")
+
             # 返回原始loss，让主循环处理backward
             return_loss = stage2_loss
             return_dict = loss_dict
-            
+
             # 内存清理
             if self.memory_efficient:
                 # 记录最终GPU内存使用
@@ -230,21 +302,36 @@ class OnlineStage2Trainer:
                     # 只保留最近100次的记录
                     if len(self.stage2_memory_usage) > 100:
                         self.stage2_memory_usage = self.stage2_memory_usage[-100:]
-                
+
                 # 清理GPU显存
                 torch.cuda.empty_cache()
                 # 清理中间变量
                 del dynamic_objects_data
                 del stage2_loss
                 del loss_dict
-            
+
             return return_loss, return_dict
-            
+
         except Exception as e:
             import traceback
-            print(f"Error in stage2 processing at epoch {epoch}, iter {iteration}: {e}")
-            print(f"Traceback: {traceback.format_exc()}")
-            return None, {}
+            if is_main_process:
+                print(f"Error in stage2 processing at epoch {epoch}, iter {iteration}: {e}")
+                print(f"Traceback: {traceback.format_exc()}")
+
+            # 标记错误
+            has_error[0] = 1
+
+            # DDP同步：确保所有进程知道有错误
+            if is_distributed:
+                dist.all_reduce(has_error, op=dist.ReduceOp.MAX)
+
+            # 所有进程统一返回零损失（带梯度）
+            return torch.tensor(0.0, device=self.device, requires_grad=True), {
+                'stage2_rgb_loss': 0.0,
+                'stage2_depth_loss': 0.0,
+                'stage2_total_loss': 0.0,
+                'stage2_final_total_loss': 0.0
+            }
     
     def _run_stage2_forward(
         self,
@@ -253,26 +340,54 @@ class OnlineStage2Trainer:
         preds: Dict[str, Any]
     ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
         """执行第二阶段前向传播"""
-        
+
         dynamic_objects = dynamic_objects_data['dynamic_objects']
         static_gaussians = dynamic_objects_data.get('static_gaussians')
-        
+
         # 第二阶段模型前向传播
-        refinement_results = self.stage2_model(
-            dynamic_objects=dynamic_objects,
-            static_gaussians=static_gaussians
-        )
-        
-        # 获取细化后的场景
-        refined_scene = self.stage2_model.get_refined_scene(
-            refinement_results, static_gaussians
-        )
-        
+        t0 = time.time()
+        try:
+            refinement_results = self.stage2_model(
+                dynamic_objects=dynamic_objects,
+                static_gaussians=static_gaussians,
+                preds=preds
+            )
+        except Exception as refine_error:
+            print(f"ERROR in stage2_model forward: {refine_error}")
+            print(f"  - num_dynamic_objects: {len(dynamic_objects)}")
+            print(f"  - static_gaussians shape: {static_gaussians.shape if static_gaussians is not None else None}")
+            raise  # Re-raise to be caught by outer try-catch
+        refine_time = time.time() - t0
+
+        # 收集网络耗时统计
+        timing_stats = refinement_results.get('timing_stats', {})
+        if timing_stats.get('num_gaussian_refines', 0) > 0:
+            avg_gaussian_time = timing_stats['gaussian_refine_time'] / timing_stats['num_gaussian_refines']
+            self.gaussian_refine_times.append(avg_gaussian_time)
+        if timing_stats.get('num_pose_refines', 0) > 0:
+            avg_pose_time = timing_stats['pose_refine_time'] / timing_stats['num_pose_refines']
+            self.pose_refine_times.append(avg_pose_time)
+
+        # 只保留最近100次的记录
+        if len(self.gaussian_refine_times) > 100:
+            self.gaussian_refine_times = self.gaussian_refine_times[-100:]
+        if len(self.pose_refine_times) > 100:
+            self.pose_refine_times = self.pose_refine_times[-100:]
+
+        # 直接构建渲染需要的场景格式
+        t1 = time.time()
+        refined_scene = {
+            'static_gaussians': static_gaussians,
+            'dynamic_objects': refinement_results['refined_dynamic_objects']
+        }
+        scene_time = time.time() - t1
+
         # 计算损失
+        t2 = time.time()
         B, S, C, H, W = vggt_batch['images'].shape
         gt_images = vggt_batch['images']
         gt_depths = vggt_batch.get('depths', torch.ones(B, S, H, W, device=self.device) * 5.0)
-        
+
         # 使用预测的相机参数而不是GT
         from vggt.utils.pose_enc import pose_encoding_to_extri_intri
         extrinsics, intrinsics = pose_encoding_to_extri_intri(
@@ -280,30 +395,48 @@ class OnlineStage2Trainer:
         )
         # 添加齐次坐标行到外参矩阵
         extrinsics = torch.cat([
-            extrinsics, 
+            extrinsics,
             torch.tensor([0, 0, 0, 1], device=extrinsics.device)[None, None, None, :].repeat(1, extrinsics.shape[1], 1, 1)
         ], dim=-2)
-        
-        
-        loss_dict = self.stage2_criterion(
-            refinement_results=refinement_results,
-            refined_scene=refined_scene,
-            gt_images=gt_images,
-            gt_depths=gt_depths,
-            intrinsics=intrinsics,
-            extrinsics=extrinsics
-        )
-        
+
+
+        # 获取sky_masks（如果有的话）
+        sky_masks = vggt_batch.get('sky_masks', None)
+
+        try:
+            loss_dict = self.stage2_criterion(
+                refinement_results=refinement_results,
+                refined_scene=refined_scene,
+                gt_images=gt_images,
+                gt_depths=gt_depths,
+                intrinsics=intrinsics,
+                extrinsics=extrinsics,
+                sky_masks=sky_masks
+            )
+        except Exception as loss_error:
+            print(f"ERROR in stage2_criterion (loss computation): {loss_error}")
+            print(f"  - gt_images shape: {gt_images.shape}")
+            print(f"  - intrinsics shape: {intrinsics.shape}")
+            print(f"  - extrinsics shape: {extrinsics.shape}")
+            raise  # Re-raise to be caught by outer try-catch
+        loss_time = time.time() - t2
+
         stage2_loss = loss_dict.get('stage2_final_total_loss')
-        
+
+        # 添加时间统计到loss_dict
+        float_loss_dict = {
+            'refine_time_ms': refine_time * 1000,
+            'scene_time_ms': scene_time * 1000,
+            'loss_time_ms': loss_time * 1000
+        }
+
         # 转换损失字典为float，并确保键名不重复添加stage2前缀
-        float_loss_dict = {}
         for k, v in loss_dict.items():
             if isinstance(v, torch.Tensor):
                 float_loss_dict[k] = float(v)
             else:
                 float_loss_dict[k] = v
-        
+
         # 内存优化：清理中间变量
         if self.memory_efficient:
             del refinement_results
@@ -312,24 +445,30 @@ class OnlineStage2Trainer:
             del gt_depths
             del intrinsics
             del loss_dict
-        
+
         return stage2_loss, float_loss_dict
     
     def get_stage2_parameters(self) -> List[torch.nn.Parameter]:
-        """获取第二阶段模型参数"""
+        """获取第二阶段模型参数（只返回requires_grad=True的参数）"""
         if not self.enable_stage2:
             return []
-        
-        return list(self.stage2_model.parameters())
+
+        # 只返回需要梯度的参数
+        params = [p for p in self.stage2_model.parameters() if p.requires_grad]
+        return params
     
     def get_statistics(self) -> Dict[str, Any]:
         """获取第二阶段训练统计信息"""
         if not self.enable_stage2:
             return {}
-        
+
         avg_training_time = self.stage2_training_time / max(self.stage2_iteration_count, 1)
         avg_memory_usage = sum(self.stage2_memory_usage) / max(len(self.stage2_memory_usage), 1)
-        
+
+        # 计算网络耗时统计
+        avg_gaussian_refine_time = sum(self.gaussian_refine_times) / max(len(self.gaussian_refine_times), 1) if self.gaussian_refine_times else 0.0
+        avg_pose_refine_time = sum(self.pose_refine_times) / max(len(self.pose_refine_times), 1) if self.pose_refine_times else 0.0
+
         return {
             'stage2_enabled': self.enable_stage2,
             'stage2_iteration_count': self.stage2_iteration_count,
@@ -339,6 +478,10 @@ class OnlineStage2Trainer:
             'stage2_avg_training_time': avg_training_time,
             'stage2_avg_memory_usage_mb': avg_memory_usage,
             'stage2_memory_efficiency_ratio': 1.0 - (self.stage2_skip_count / max(self.stage2_iteration_count + self.stage2_skip_count, 1)),
+            'gaussian_refine_avg_time_ms': avg_gaussian_refine_time * 1000,  # 转换为毫秒
+            'pose_refine_avg_time_ms': avg_pose_refine_time * 1000,  # 转换为毫秒
+            'gaussian_refine_count': len(self.gaussian_refine_times),
+            'pose_refine_count': len(self.pose_refine_times),
             'dynamic_processor_stats': self.dynamic_processor.get_statistics()
         }
     

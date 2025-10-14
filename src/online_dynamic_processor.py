@@ -13,6 +13,7 @@
 
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 import numpy as np
 import cv2
 from typing import Dict, List, Optional, Any, Tuple
@@ -26,6 +27,17 @@ from cuml.cluster import DBSCAN
 # from sklearn.cluster import DBSCAN as SklearnDBSCAN
 import cupy as cp
 from scipy.optimize import linear_sum_assignment
+
+
+def _is_main_process():
+    """检查是否为主进程（用于DDP训练）"""
+    return not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0
+
+
+def _print_main(*args, **kwargs):
+    """只在主进程打印（用于DDP训练）"""
+    if _is_main_process():
+        print(*args, **kwargs)
 
 
 
@@ -416,7 +428,7 @@ def _import_optical_flow():
 
         return optical_flow_module.OpticalFlowRegistration
     except Exception as e:
-        print(f"Failed to import optical flow: {e}")
+        _print_main(f"Failed to import optical flow: {e}")
         return None
 
 
@@ -443,6 +455,7 @@ class OnlineDynamicProcessor:
         tracking_position_threshold: float = 2.0,  # 跨帧跟踪位置阈值
         tracking_velocity_threshold: float = 0.2,  # 跨帧跟踪速度阈值
         use_optical_flow_aggregation: bool = True,
+        use_velocity_based_transform: bool = False,  # 使用velocity计算变换（无需光流）
         enable_temporal_cache: bool = True,
         cache_size: int = 16
     ):
@@ -486,7 +499,8 @@ class OnlineDynamicProcessor:
                         device=str(device),
                         min_inliers_ratio=0.1,  # 降低最小内点比例
                         ransac_threshold=5.0,   # 增加RANSAC阈值
-                        max_flow_magnitude=200.0  # 增加最大光流幅度
+                        max_flow_magnitude=200.0,  # 增加最大光流幅度
+                        use_velocity_based_transform=use_velocity_based_transform  # 使用velocity计算变换
                     )
                 except Exception as e:
                     self.optical_flow_registration = None
@@ -534,6 +548,9 @@ class OnlineDynamicProcessor:
             images = vggt_batch['images']  # [B, S, 3, H, W]
             B, S, C, H, W = images.shape
 
+            # 获取sky_masks（如果有的话）
+            sky_masks = vggt_batch.get('sky_masks', None)  # [B, S, H, W] or None
+
             # ========== Stage 1: 数据预处理 ==========
             preprocessing_start = time.time()
             preds = self._preprocess_predictions(preds, images, B, S, H, W)
@@ -544,7 +561,7 @@ class OnlineDynamicProcessor:
             # ========== Stage 2: 聚类 + 背景分离 ==========
             clustering_start = time.time()
             clustering_results = self._perform_clustering_with_existing_method(preds, vggt_batch, velocity)
-            static_gaussians = self._create_static_background_from_labels(preds, clustering_results, H, W, S)
+            static_gaussians = self._create_static_background_from_labels(preds, clustering_results, H, W, S, sky_masks)
             stage_times['clustering_background'] = time.time() - clustering_start
 
             # ========== Stage 3: 跨帧跟踪 ==========
@@ -580,7 +597,7 @@ class OnlineDynamicProcessor:
             }
 
         except Exception as e:
-            print(f"❌ 动态物体处理失败: {e}")
+            _print_main(f"❌ 动态物体处理失败: {e}")
             import traceback
             traceback.print_exc()
             return {'dynamic_objects': [], 'static_gaussians': None, 'stage_times': {}}
@@ -688,7 +705,7 @@ class OnlineDynamicProcessor:
                 )
                 return dynamic_objects
             except Exception as e:
-                print(f"  光流聚合失败，使用简单方法: {e}")
+                _print_main(f"  光流聚合失败，使用简单方法: {e}")
 
         # 回退到简单方法
         return self._create_objects_from_clustering_results(
@@ -807,6 +824,11 @@ class OnlineDynamicProcessor:
             xyz_detached = xyz.detach()
             velocity_detached = velocity_reshaped.detach()
 
+            _print_main(f"[Clustering Debug] gt_scale: {gt_scale}")
+            _print_main(f"[Clustering Debug] Velocity range before metric conversion: [{velocity_detached.min().item():.6f}, {velocity_detached.max().item():.6f}]")
+            _print_main(f"[Clustering Debug] Velocity mean magnitude: {torch.norm(velocity_detached, dim=-1).mean().item():.6f}")
+            _print_main(f"[Clustering Debug] velocity_threshold (metric): {self.velocity_threshold}")
+
             clustering_results = dynamic_object_clustering(
                 xyz_detached,  # [S, H*W, 3]
                 velocity_detached,  # [S, H*W, 3] (非metric尺度)
@@ -916,7 +938,7 @@ class OnlineDynamicProcessor:
                                 if self._validate_and_fix_transform(transform, frame_idx, global_id):
                                     frame_transforms[frame_idx] = transform
                                 else:
-                                    print(
+                                    _print_main(
                                         f"跳过对象{global_id}在帧{frame_idx}的异常变换矩阵")
                             elif frame_idx == reference_frame:
                                 # reference_frame到自己的变换是恒等变换
@@ -937,15 +959,16 @@ class OnlineDynamicProcessor:
                             'reference_frame': reference_frame,  # 正规空间位于第几帧
                             'frame_transforms': frame_transforms,  # 其他帧和正规空间帧的transform
                             'frame_existence': torch.tensor(frame_existence, dtype=torch.bool, device=self.device),
+                            'frame_gaussians': aggregated_object.get('frame_gaussians', {}),  # 新增：每帧的原始Gaussian参数
                             # 保留原始数据供调试使用
                             'aggregated_points': aggregated_object.get('aggregated_points'),
                             'aggregated_colors': aggregated_object.get('aggregated_colors'),
                             'transformations': transformations,  # 原始变换数据
                         })
                     else:
-                        print(f"物体 {global_id}: 聚合失败，aggregated_object为None")
+                        _print_main(f"物体 {global_id}: 聚合失败，aggregated_object为None")
                 except Exception as e:
-                    print(f"物体 {global_id}: 聚合过程中出现异常: {e}")
+                    _print_main(f"物体 {global_id}: 聚合过程中出现异常: {e}")
                     import traceback
                     traceback.print_exc()
 
@@ -1044,7 +1067,7 @@ class OnlineDynamicProcessor:
                             aggregated_points, global_id)
 
                     # 为Stage2Refiner创建每帧的Gaussian参数和初始变换
-                    frame_gaussians = []
+                    frame_gaussians_dict = {}  # 改为字典格式
                     initial_transforms = []
                     for i, (frame_points, frame_idx, point_indices) in enumerate(zip(object_points, object_frames, object_indices)):
                         # 尝试从VGGT提取该帧的gaussian参数
@@ -1066,7 +1089,8 @@ class OnlineDynamicProcessor:
                             frame_gaussian = self._points_to_gaussian_params_fallback(
                                 frame_points, global_id)
 
-                        frame_gaussians.append(
+                        # 使用frame_idx作为key存储到字典中
+                        frame_gaussians_dict[frame_idx] = (
                             frame_gaussian if frame_gaussian is not None else aggregated_gaussian)
                         # 创建单位变换矩阵作为初始变换
                         transform = torch.eye(4, device=self.device)
@@ -1076,7 +1100,7 @@ class OnlineDynamicProcessor:
                         'object_id': global_id,
                         'aggregated_points': aggregated_points,
                         'aggregated_gaussians': aggregated_gaussian,  # Stage2Refiner需要的字段
-                        'frame_gaussians': frame_gaussians,  # Stage2Refiner需要的字段
+                        'frame_gaussians': frame_gaussians_dict,  # Stage2Refiner需要的字段（字典格式）
                         'initial_transforms': initial_transforms,  # Stage2Refiner需要的字段
                         'reference_frame': object_frames[middle_idx],
                         'gaussian_params': aggregated_gaussian,  # 保留原字段以兼容
@@ -1427,7 +1451,7 @@ class OnlineDynamicProcessor:
 
                 color = torch.tensor([r + m, g + m, b + m], device=self.device)
                 gaussian_params[:, 6:9] = color.unsqueeze(0).repeat(N, 1)
-                print(
+                _print_main(
                     f"回退方案：为object_id={object_id}生成一致颜色 RGB=({r+m:.3f}, {g+m:.3f}, {b+m:.3f})")
             else:
                 # 默认中性颜色
@@ -1491,17 +1515,17 @@ class OnlineDynamicProcessor:
         try:
             # 检查基本形状
             if transform.shape != (4, 4):
-                print(f"⚠️  变换矩阵形状异常: {transform.shape}, 期望 (4,4)")
+                _print_main(f"⚠️  变换矩阵形状异常: {transform.shape}, 期望 (4,4)")
                 return False
 
             # 检查是否为零矩阵
             if torch.allclose(transform, torch.zeros_like(transform), atol=1e-8):
-                print(f"⚠️  对象{global_id}帧{frame_idx}: 检测到零变换矩阵！这会导致大白球问题")
+                _print_main(f"⚠️  对象{global_id}帧{frame_idx}: 检测到零变换矩阵！这会导致大白球问题")
                 return False
 
             # 检查是否有NaN或Inf
             if torch.isnan(transform).any() or torch.isinf(transform).any():
-                print(f"⚠️  对象{global_id}帧{frame_idx}: 变换矩阵包含NaN或Inf值")
+                _print_main(f"⚠️  对象{global_id}帧{frame_idx}: 变换矩阵包含NaN或Inf值")
                 return False
 
             # 检查旋转部分的行列式
@@ -1509,36 +1533,37 @@ class OnlineDynamicProcessor:
             det = torch.det(rotation_part)
 
             if det.abs() < 1e-6:
-                print(f"⚠️  对象{global_id}帧{frame_idx}: 变换矩阵奇异 (det={det:.2e})")
+                _print_main(f"⚠️  对象{global_id}帧{frame_idx}: 变换矩阵奇异 (det={det:.2e})")
                 return False
 
             # 检查是否过度缩放
             scales = torch.linalg.norm(rotation_part, dim=0)  # 各轴的缩放
             if scales.max() > 100 or scales.min() < 0.01:
-                print(
+                _print_main(
                     f"⚠️  对象{global_id}帧{frame_idx}: 异常缩放 {scales}, 可能导致渲染问题")
                 return False
 
             # 检查平移是否过大
             translation = transform[:3, 3]
             if torch.norm(translation) > 1000:
-                print(
+                _print_main(
                     f"⚠️  对象{global_id}帧{frame_idx}: 平移过大 {translation}, 可能超出相机视野")
                 # 这种情况仍然保留，但给出警告
 
             return True
 
         except Exception as e:
-            print(f"❌ 变换矩阵验证失败: {e}")
+            _print_main(f"❌ 变换矩阵验证失败: {e}")
             return False
 
     def _create_static_background_from_labels(
         self,
         preds: Dict[str, Any],
         clustering_results: List[Dict],
-        H: int, W: int, S: int
+        H: int, W: int, S: int,
+        sky_masks: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """直接使用动态聚类结果中的full_labels提取静态背景（标签为-1的gaussian）"""
+        """直接使用动态聚类结果中的full_labels提取静态背景（标签为-1的gaussian），并过滤sky区域"""
         try:
             # 获取gaussian参数
             gaussian_params = preds.get('gaussian_params')
@@ -1568,6 +1593,17 @@ class OnlineDynamicProcessor:
                 # 创建静态mask（标签为-1的点）
                 static_mask = full_labels == -1  # [H*W]
 
+                # 如果有sky_masks，过滤掉sky区域的点
+                if sky_masks is not None:
+                    # sky_masks: [B, S, H, W] -> [H*W]
+                    sky_mask_frame = sky_masks[0, s].reshape(-1)  # [H*W]
+                    # 确保sky_mask_frame是布尔类型并在正确的设备上
+                    if sky_mask_frame.dtype != torch.bool:
+                        sky_mask_frame = sky_mask_frame.bool()
+                    sky_mask_frame = sky_mask_frame.to(static_mask.device)
+                    # sky区域不应该被包含在静态背景中
+                    static_mask = static_mask & (~sky_mask_frame)  # [H*W]
+
                 # 获取当前帧的gaussian参数
                 frame_gaussians = gaussian_params[s]  # [H*W, 14]
 
@@ -1586,6 +1622,9 @@ class OnlineDynamicProcessor:
 
         except Exception as e:
             # 回退到默认方法
+            _print_main(f"⚠️  静态背景提取失败: {e}，回退到默认方法")
+            import traceback
+            traceback.print_exc()
             return self._create_default_static_background(H, W)
 
     def _create_default_static_background(self, H: int, W: int) -> torch.Tensor:

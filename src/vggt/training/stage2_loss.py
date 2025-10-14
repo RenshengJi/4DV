@@ -79,7 +79,8 @@ class Stage2RenderLoss(nn.Module):
         gt_depths: torch.Tensor,
         intrinsics: torch.Tensor,
         extrinsics: torch.Tensor,
-        frame_masks: Optional[torch.Tensor] = None
+        frame_masks: Optional[torch.Tensor] = None,
+        sky_masks: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
         计算第二阶段的渲染损失
@@ -89,8 +90,9 @@ class Stage2RenderLoss(nn.Module):
             gt_images: [B, S, 3, H, W] 真实图像
             gt_depths: [B, S, H, W] 真实深度
             intrinsics: [B, S, 3, 3] 相机内参
-            extrinsics: [B, S, 4, 4] 相机外参  
+            extrinsics: [B, S, 4, 4] 相机外参
             frame_masks: [B, S, H, W] 有效区域掩码
+            sky_masks: [B, S, H, W] 天空区域掩码
 
         Returns:
             loss_dict: 损失字典
@@ -124,6 +126,15 @@ class Stage2RenderLoss(nn.Module):
                 mask = frame_masks[0, frame_idx]  # [H, W]
             else:
                 mask = torch.ones_like(frame_gt_depth, dtype=torch.bool)
+
+            # 如果有sky_masks，从mask中排除sky区域
+            if sky_masks is not None:
+                sky_mask_frame = sky_masks[0, frame_idx]  # [H, W]
+                # 确保sky_mask_frame是布尔类型并在正确的设备上
+                if sky_mask_frame.dtype != torch.bool:
+                    sky_mask_frame = sky_mask_frame.bool()
+                sky_mask_frame = sky_mask_frame.to(mask.device)
+                mask = mask & (~sky_mask_frame)  # 排除sky区域
 
             # RGB损失
             rgb_loss = F.l1_loss(
@@ -304,6 +315,28 @@ class Stage2RenderLoss(nn.Module):
         colors = torch.cat(all_colors, dim=0)  # [N, 1, 3]
         rotations = torch.cat(all_rotations, dim=0)  # [N, 4]
         opacities = torch.cat(all_opacities, dim=0)  # [N]
+
+        # 安全性检查：检测NaN/Inf值
+        if torch.isnan(means).any() or torch.isinf(means).any():
+            print(f"WARNING: means contains NaN or Inf! Setting to zeros.")
+            means = torch.nan_to_num(means, nan=0.0, posinf=0.0, neginf=0.0)
+        if torch.isnan(scales).any() or torch.isinf(scales).any():
+            print(f"WARNING: scales contains NaN or Inf! Setting to safe values.")
+            scales = torch.nan_to_num(scales, nan=0.01, posinf=1.0, neginf=0.01)
+            scales = torch.clamp(scales, min=0.001, max=10.0)
+        if torch.isnan(colors).any() or torch.isinf(colors).any():
+            print(f"WARNING: colors contains NaN or Inf! Setting to gray.")
+            colors = torch.nan_to_num(colors, nan=0.5, posinf=1.0, neginf=0.0)
+            colors = torch.clamp(colors, min=0.0, max=1.0)
+        if torch.isnan(rotations).any() or torch.isinf(rotations).any():
+            print(f"WARNING: rotations contains NaN or Inf! Normalizing.")
+            rotations = torch.nan_to_num(rotations, nan=0.0, posinf=1.0, neginf=-1.0)
+            # Normalize quaternions
+            rotations = F.normalize(rotations, p=2, dim=-1)
+        if torch.isnan(opacities).any() or torch.isinf(opacities).any():
+            print(f"WARNING: opacities contains NaN or Inf! Setting to 0.5.")
+            opacities = torch.nan_to_num(opacities, nan=0.5, posinf=1.0, neginf=0.0)
+            opacities = torch.clamp(opacities, min=0.0, max=1.0)
 
         # 准备渲染参数
         viewmat = extrinsic.unsqueeze(0)  # [1, 4, 4]
@@ -527,7 +560,9 @@ class Stage2RenderLoss(nn.Module):
                 frame_to_canonical = frame_transforms[frame_idx]  # [4, 4] 变换矩阵
                 try:
                     # 求逆得到从canonical到frame的变换
-                    canonical_to_frame = torch.linalg.inv(frame_to_canonical)
+                    # 转换为float32以支持linalg.inv
+                    original_dtype = frame_to_canonical.dtype
+                    canonical_to_frame = torch.linalg.inv(frame_to_canonical.float()).to(original_dtype)
                     return canonical_to_frame
                 except Exception as e:
                     print(
@@ -544,8 +579,10 @@ class Stage2RenderLoss(nn.Module):
                 frame_to_canonical_delta = self._pose_delta_to_transform_matrix(
                     pose_delta)
                 try:
+                    # 转换为float32以支持linalg.inv
+                    original_dtype = frame_to_canonical_delta.dtype
                     canonical_to_frame = torch.linalg.inv(
-                        frame_to_canonical_delta)
+                        frame_to_canonical_delta.float()).to(original_dtype)
                     return canonical_to_frame
                 except Exception:
                     return None
@@ -603,9 +640,12 @@ class Stage2RenderLoss(nn.Module):
             print(f"使用单位矩阵替代异常变换")
             transform = torch.eye(4, dtype=transform.dtype,
                                   device=transform.device)
-        elif torch.det(transform[:3, :3]).abs() < 1e-8:
-            print(f"⚠️  变换矩阵奇异(det={torch.det(transform[:3, :3]):.2e})！")
-            print(f"变换矩阵:\n{transform}")
+        else:
+            # 转换为float32以支持torch.det
+            det_val = torch.det(transform[:3, :3].float()).abs()
+            if det_val < 1e-8:
+                print(f"⚠️  变换矩阵奇异(det={det_val:.2e})！")
+                print(f"变换矩阵:\n{transform}")
 
         transformed_gaussians = gaussians.clone()
 
@@ -706,7 +746,8 @@ class Stage2CompleteLoss(nn.Module):
         gt_depths: torch.Tensor,
         intrinsics: torch.Tensor,
         extrinsics: torch.Tensor,
-        frame_masks: Optional[torch.Tensor] = None
+        frame_masks: Optional[torch.Tensor] = None,
+        sky_masks: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
         计算第二阶段的完整损失
@@ -719,6 +760,7 @@ class Stage2CompleteLoss(nn.Module):
             intrinsics: 相机内参
             extrinsics: 相机外参
             frame_masks: 有效区域掩码
+            sky_masks: 天空区域掩码
 
         Returns:
             complete_loss_dict: 完整损失字典
@@ -726,7 +768,7 @@ class Stage2CompleteLoss(nn.Module):
         # 渲染损失
         render_loss_dict = self.render_loss(
             refined_scene, gt_images, gt_depths,
-            intrinsics, extrinsics, frame_masks
+            intrinsics, extrinsics, frame_masks, sky_masks
         )
 
         # 直接使用渲染损失作为完整损失

@@ -4,24 +4,23 @@
 # =============== 模型配置 ===============
 model: "VGGT(img_size=518, patch_size=14, embed_dim=1024)"
 # pretrained: model.pt  # 第二阶段需要加载第一阶段训练好的模型
-pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/aggregator_resume_noflowgrad_nearestdynamic/checkpoint-epoch_0_35805.pth"  # 或者指定第一阶段训练好的checkpoint路径
+# pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/aggregator_resume_noflowgrad_nearestdynamic/checkpoint-epoch_0_35805.pth" 
+pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/aggregator_resume_noflowgrad_nearestdynamic_resume_0point1_novoxel/checkpoint-epoch_0_45568.pth"
 
 
 # VGGT冻结策略配置
-# 可选值: "none", "encoder", "encoder_frame", "backbone", "backbone_camera", "backbone_pts",
-#        "vggt", "vggt_wo_velocity", "vggt_wo_depth", "vggt_wo_gaussian_and_velocity", "all", "old"
 # 第二阶段训练时冻结所有VGGT参数，只训练Stage2 refine模型
 # null表示不设置冻结策略（保持模型默认行为）
-vggt_freeze_strategy: null
+vggt_freeze_strategy: all
 
 
 # =============== 辅助模型配置 ===============
 auxiliary_models:
-  # # 光流模型 (用于flow_loss) - 第二阶段禁用
-  # flow: RAFT(RAFTCfg(name="kitti-M", dataset="kitti", path="Tartan-C-T-TSKH-kitti432x960-M.pth",
-  #   use_var=True, var_min=0, var_max=10, pretrain="resnet34", initial_dim=64, block_dims=[64, 128, 256],
-  #   radius=4, dim=128, num_blocks=2, iters=4, image_size=[432, 960],
-  #   offload=${offload_auxiliary}, geo_thresh=2, photo_thresh=-1))
+  # 光流模型 (用于flow_loss) - 第二阶段禁用
+  flow: RAFT(RAFTCfg(name="kitti-M", dataset="kitti", path="Tartan-C-T-TSKH-kitti432x960-M.pth",
+    use_var=True, var_min=0, var_max=10, pretrain="resnet34", initial_dim=64, block_dims=[64, 128, 256],
+    radius=4, dim=128, num_blocks=2, iters=4, image_size=[432, 960],
+    offload=${offload_auxiliary}, geo_thresh=2, photo_thresh=-1))
 
   # SAM2模型 (用于velocity consistency loss) - 第二阶段禁用
   # sam2: SAM2Base(config_file="sam2.1_hiera_t", path="sam2.1_hiera_tiny.pt",
@@ -41,7 +40,7 @@ long_context: True
 fixed_length: False
 resume: null  # 通常从第一阶段的checkpoint开始
 benchmark: False
-num_views: 32
+num_views: 8
 num_test_views: 16
 n_corres_train: 0
 n_corres_test: 0
@@ -125,16 +124,17 @@ pose_feature_dim: 128
 pose_num_conv_layers: 2
 pose_voxel_size: 0.1                      # 位姿细化体素大小（米）
 max_points_per_object: 4096
-stage2_training_mode: 'refine'             # 第二阶段专用的refine模式
+stage2_training_mode: 'joint'             # 第二阶段专用的refine模式
 
 # 第二阶段损失配置
 stage2_rgb_loss_weight: 1.0               # RGB渲染损失
-stage2_depth_loss_weight: 0.1             # 深度渲染损失
+stage2_depth_loss_weight: 1.0             # 深度渲染损失
 
 # 动态处理器配置
 min_object_size: 100                      # 最小物体尺寸（点数）
 max_objects_per_frame: 10                 # 每帧最大物体数量
 enable_optical_flow_aggregation: true     # 是否使用光流聚合
+use_velocity_based_transform: true       # 是否使用velocity直接计算变换（false=光流方法，true=velocity方法）
 
 # Stage 2: 动态物体聚类参数
 velocity_threshold: 0.1                   # 速度阈值（metric尺度，m/s）
@@ -156,7 +156,7 @@ train_dataset: Waymo_Multi(allow_repeat=${allow_repeat}, split=None,
   num_views=${num_views}, n_corres=${n_corres_train}, seq_aug_crop=True, load_sam_masks=False)
 
 test_dataset: 1000 @ Waymo_Multi(split=None,
-  ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train_with_flow",
+  ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/test_with_flow",
   img_ray_mask_p=[1.0, 0.0, 0.0], valid_camera_id_list=["1", "2", "3"],
   resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], num_views=${num_test_views}, seed=42, n_corres=${n_corres_test})
 
@@ -167,15 +167,15 @@ accum_iter: 4
 gradient_checkpointing: True
 epochs: 10                                 # 第二阶段通常需要较少epochs
 start_epoch: 0
-weight_decay: 0.01                         # 第二阶段使用较小的weight decay
-lr: 1e-4                                   # 第二阶段使用较小的学习率
+weight_decay: 0.01                         # 基础weight decay（由于VGGT冻结，实际未使用）
+lr: 1e-4                                   # 基础学习率（由于VGGT冻结，实际未使用，仅作为fallback）
 min_lr: 1e-8
 warmup_epochs: 0.1                         # 第二阶段使用较短的warmup
 amp: 1
 
-# 第二阶段专用学习率配置
-stage2_learning_rate: 5e-5                # 更小的学习率用于精细化
-stage2_weight_decay: 0.005                # 更小的权重衰减
+# 第二阶段专用学习率配置（由于vggt_freeze_strategy=all，只有stage2参数会被训练）
+stage2_learning_rate: 5e-4                # 第二阶段学习率用于refiner精细化（✓ 实际生效的学习率）
+stage2_weight_decay: 0.005                # 第二阶段权重衰减（✓ 实际生效的weight decay）
 
 # =============== 训练监控配置 ===============
 num_workers: 4
@@ -188,7 +188,7 @@ distributed: False
 dist_backend: 'nccl'
 
 eval_freq: 1
-save_freq: 0.2                             # 第二阶段更频繁保存
+save_freq: 0.01                             # 第二阶段更频繁保存
 keep_freq: 1
 print_freq: 5                              # 更频繁的打印
 print_img_freq: 50000000
@@ -196,7 +196,7 @@ num_imgs_vis: 4
 
 # =============== 输出配置 ===============
 save_dir: 'checkpoints/waymo_stage2_online'
-exp_name: 'stage2_online'
+exp_name: 'stage2_train+fixpose+detach'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/

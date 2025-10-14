@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 import time
 import logging
+from collections import defaultdict
 
 # 导入头网络
 from vggt.heads.sparse_conv_refine_head import GaussianRefineHeadSparseConv, PoseRefineHeadSparseConv
@@ -82,144 +83,141 @@ class Stage2Refiner(nn.Module):
         self,
         dynamic_objects: List[Dict],
         static_gaussians: Optional[Dict] = None,
-        frame_info: Optional[Dict] = None
+        frame_info: Optional[Dict] = None,
+        preds: Optional[Dict] = None
     ) -> Dict[str, Any]:
         """
         前向传播
-        
+
         Args:
             dynamic_objects: 动态物体列表，每个包含:
-                - 'aggregated_gaussians': [N, 14] 聚合的Gaussian参数
-                - 'frame_gaussians': List[Tensor] 每帧的原始Gaussian
-                - 'initial_transforms': List[Tensor] 初始变换矩阵
+                - 'canonical_gaussians': [N, 14] canonical Gaussian参数
+                - 'frame_transforms': Dict[int, Tensor] 每帧变换矩阵
                 - 'object_id': int 物体ID
             static_gaussians: 静态场景的Gaussian参数 (可选)
             frame_info: 帧信息，包含相机参数等
-            
+            preds: Stage1预测结果，包含'scale'等信息 (可选)
+
         Returns:
             results: 包含细化结果的字典
         """
         results = {
             'refined_dynamic_objects': [],
             'pose_refinements': {},
-            'gaussian_refinements': {}
+            'gaussian_refinements': {},
+            'timing_stats': {
+                'gaussian_refine_time': 0.0,
+                'pose_refine_time': 0.0,
+                'num_gaussian_refines': 0,
+                'num_pose_refines': 0
+            }
         }
-        
-        for obj_idx, obj_data in enumerate(dynamic_objects):
-            object_start_time = time.time()
+
+        # 从preds中获取pred_scale
+        pred_scale = preds.get('scale') if preds is not None else None
+
+        for obj_data in dynamic_objects:
             object_id = obj_data['object_id']
-            
-            # 支持两种数据格式：新格式和旧格式
-            if 'canonical_gaussians' in obj_data:
-                # 新格式：来自修正后的OnlineDynamicProcessor
-                canonical_gaussians = obj_data['canonical_gaussians']  # [N, 14]
-                frame_transforms_dict = obj_data.get('frame_transforms', {})
-                
-                # 转换frame_transforms字典为列表格式以兼容现有逻辑
-                frame_gaussians = [canonical_gaussians]  # 默认使用canonical作为唯一帧
-                initial_transforms = []
-                
-                # 从frame_transforms中提取变换矩阵
-                if frame_transforms_dict:
-                    sorted_frames = sorted(frame_transforms_dict.keys())
-                    for frame_idx in sorted_frames:
-                        initial_transforms.append(frame_transforms_dict[frame_idx])
-                        # 每帧都使用相同的canonical gaussians，实际变换在渲染时处理
-                        frame_gaussians.append(canonical_gaussians)
-                
-                # 如果没有变换信息，至少添加一个恒等变换
-                if not initial_transforms:
-                    initial_transforms = [torch.eye(4, device=canonical_gaussians.device)]
-                    
-                aggregated_gaussians = canonical_gaussians
-                
-            else:
-                # 旧格式：传统的aggregated_gaussians格式
-                aggregated_gaussians = obj_data['aggregated_gaussians']  # [N, 14]
-                frame_gaussians = obj_data.get('frame_gaussians', [aggregated_gaussians])  # List[Tensor]
-                initial_transforms = obj_data.get('initial_transforms', [torch.eye(4, device=aggregated_gaussians.device)])  # List[Tensor]
-            
+            canonical_gaussians = obj_data['canonical_gaussians']
+            frame_transforms = obj_data.get('frame_transforms', {})
+
+            # 转换为列表格式
+            initial_transforms = [frame_transforms[f] for f in sorted(frame_transforms.keys())] if frame_transforms else [torch.eye(4, device=canonical_gaussians.device)]
+
+            # 初始化结果
+            # canonical_gaussians将在refinement后被更新为refined版本
             refined_obj = {
                 'object_id': object_id,
-                'original_gaussians': aggregated_gaussians,
-                'refined_gaussians': aggregated_gaussians,  # 默认值
-                'refined_transforms': initial_transforms,   # 默认值
+                'original_canonical_gaussians': canonical_gaussians,  # 保留原始版本
+                'canonical_gaussians': canonical_gaussians,  # 将被更新为refined版本
+                'refined_gaussians': canonical_gaussians,
+                'refined_transforms': initial_transforms,
                 'gaussian_deltas': None,
                 'pose_deltas': [],
-                # 保留新格式信息以便get_refined_scene使用
-                'canonical_gaussians': aggregated_gaussians,
                 'reference_frame': obj_data.get('reference_frame', 0),
-                'frame_transforms': obj_data.get('frame_transforms', {}),
+                'original_frame_transforms': frame_transforms,  # 保留原始版本
+                'frame_transforms': frame_transforms,  # 将被更新为refined版本
                 'frame_existence': obj_data.get('frame_existence', torch.tensor([True], dtype=torch.bool))
             }
-            
-            # 1. Gaussian参数细化
+
+            # Gaussian参数细化
             if self.training_mode in ["joint", "gaussian_only"]:
-                
-                # Safety check: 防止内存爆炸 - 限制最大Gaussian数量
-                max_gaussians_stage2 = 1000000  # TODO:
-                if aggregated_gaussians.shape[0] > max_gaussians_stage2:
-                    # print(f"Warning: Object {object_id} has too many Gaussians ({aggregated_gaussians.shape[0]}), skipping Stage2 processing")
-                    # 跳过这个物体的Stage2处理
-                    refined_obj['refined_gaussians'] = aggregated_gaussians  # 保持原始参数
-                    refined_obj['gaussian_deltas'] = None
-                else:
-                    gaussian_deltas = self.gaussian_refine_head(aggregated_gaussians)
-                    refined_gaussians = self.gaussian_refine_head.apply_deltas(
-                        aggregated_gaussians, gaussian_deltas
-                    )
-                    
-                    refined_obj['refined_gaussians'] = refined_gaussians
-                    refined_obj['gaussian_deltas'] = gaussian_deltas
-                    results['gaussian_refinements'][object_id] = {
-                        'deltas': gaussian_deltas,
-                        'refined_params': refined_gaussians
-                    }
-            
-            # 2. 位姿细化
-            if self.training_mode in ["joint", "pose_only"]:
-                refined_transforms = []
-                pose_deltas = []
-                
-                # 获取细化后的Gaussian位置作为点云
-                refined_positions = refined_obj['refined_gaussians'][:, :3]  # [N, 3]
-                
-                for frame_idx, (frame_gaussian, initial_T) in enumerate(
-                    zip(frame_gaussians, initial_transforms)
-                ):
-                    # 获取当前帧的点云位置
-                    frame_positions = frame_gaussian[:, :3]  # [M, 3]
-                    
-                    # 通过初始变换将参考点云变换到当前帧
-                    ref_positions_homo = torch.cat([
-                        refined_positions,
-                        torch.ones(refined_positions.shape[0], 1, device=refined_positions.device)
-                    ], dim=-1)  # [N, 4]
-                    
-                    transformed_ref = torch.matmul(initial_T, ref_positions_homo.T).T[:, :3]  # [N, 3]
-                    
-                    # 预测位姿细化
+                start_time = time.time()
+                gaussian_deltas = self.gaussian_refine_head(canonical_gaussians, pred_scale=pred_scale)
+                refined_gaussians = self.gaussian_refine_head.apply_deltas(canonical_gaussians, gaussian_deltas)
+                gaussian_time = time.time() - start_time
+
+                refined_obj['refined_gaussians'] = refined_gaussians
+                refined_obj['canonical_gaussians'] = refined_gaussians  # 更新canonical_gaussians为refined版本
+                refined_obj['gaussian_deltas'] = gaussian_deltas
+                results['gaussian_refinements'][object_id] = {
+                    'deltas': gaussian_deltas,
+                    'refined_params': refined_gaussians
+                }
+
+                # 累计时间统计
+                results['timing_stats']['gaussian_refine_time'] += gaussian_time
+                results['timing_stats']['num_gaussian_refines'] += 1
+
+            # 位姿细化（仅对多帧物体进行）
+            if self.training_mode in ["joint", "pose_only"] and len(initial_transforms) > 1:
+                pose_start_time = time.time()
+                refined_positions = refined_obj['refined_gaussians'][:, :3].detach()  # 使用refined后的Gaussian位置,不计算梯度
+                refined_transforms = {}  # 改为字典以保持frame_idx映射
+                pose_deltas = {}  # 改为字典以保持frame_idx映射
+
+                # 获取每帧的原始Gaussian参数（字典格式：{frame_idx: gaussians}）
+                frame_gaussians = obj_data.get('frame_gaussians', {})
+
+                # 获取有序的frame_idx列表
+                sorted_frame_indices = sorted(frame_transforms.keys()) if frame_transforms else list(range(len(initial_transforms)))
+
+                for loop_idx, initial_T in enumerate(initial_transforms):
+                    # 获取实际的frame_idx
+                    actual_frame_idx = sorted_frame_indices[loop_idx] if loop_idx < len(sorted_frame_indices) else loop_idx
+
+                    # source_points: refined canonical Gaussian经过initial_T变换后的位置
+                    ones = torch.ones(refined_positions.shape[0], 1, device=refined_positions.device)
+                    source_points = (initial_T @ torch.cat([refined_positions, ones], dim=-1).T).T[:, :3]
+
+                    # target_points: 当前帧的原始Gaussian位置
+                    if actual_frame_idx in frame_gaussians:
+                        target_gaussians = frame_gaussians[actual_frame_idx]
+                        if target_gaussians is not None:
+                            target_points = target_gaussians[:, :3]  # 取前3维作为位置
+                        else:
+                            # 如果没有当前帧的Gaussian，使用source_points作为fallback
+                            target_points = source_points
+                    else:
+                        # 如果没有当前帧的Gaussian，使用source_points作为fallback
+                        target_points = source_points
+
+                    # 预测并应用位姿细化（传入pred_scale）
                     pose_delta = self.pose_refine_head(
-                        source_points=transformed_ref,
-                        target_points=frame_positions,
-                        initial_transform=initial_T
+                        source_points=source_points,
+                        target_points=target_points,
+                        pred_scale=pred_scale
                     )
-                    
-                    # 应用位姿细化
-                    refined_transform = self.pose_refine_head.apply_pose_delta(
-                        initial_T, pose_delta
-                    )
-                    
-                    refined_transforms.append(refined_transform)
-                    pose_deltas.append(pose_delta)
-                
+                    refined_transform = self.pose_refine_head.apply_pose_delta(initial_T, pose_delta)
+
+                    # 使用actual_frame_idx作为key存储
+                    refined_transforms[actual_frame_idx] = refined_transform
+                    pose_deltas[actual_frame_idx] = pose_delta
+
+                pose_time = time.time() - pose_start_time
+
                 refined_obj['refined_transforms'] = refined_transforms
+                refined_obj['frame_transforms'] = refined_transforms  # 更新frame_transforms为refined版本
                 refined_obj['pose_deltas'] = pose_deltas
                 results['pose_refinements'][object_id] = {
                     'deltas': pose_deltas,
                     'refined_transforms': refined_transforms
                 }
-            
+
+                # 累计时间统计
+                results['timing_stats']['pose_refine_time'] += pose_time
+                results['timing_stats']['num_pose_refines'] += 1
+
             results['refined_dynamic_objects'].append(refined_obj)
 
         return results
@@ -236,133 +234,171 @@ class Stage2Refiner(nn.Module):
     ) -> Dict[str, Any]:
         """
         获取完整的细化后场景表示，格式兼容Stage2Loss的期望
-        
+
+        IMPORTANT: 此方法只接受经过forward()处理的refinement_results，
+        必须包含'refined_dynamic_objects'字段，强制使用refined后的参数以确保梯度传播。
+
         Args:
-            refinement_results: forward方法的输出结果或直接的dynamic_objects列表
+            refinement_results: forward方法的输出结果（必须包含'refined_dynamic_objects'）
             static_gaussians: 静态场景Gaussian参数
-            
+
+        Returns:
+            scene: 包含完整场景的字典，格式为Stage2Loss期望的结构
+
+        Raises:
+            ValueError: 如果refinement_results格式不正确或缺少refined参数
+        """
+        # 只接受经过refinement的结果
+        if not isinstance(refinement_results, dict) or 'refined_dynamic_objects' not in refinement_results:
+            raise ValueError(
+                "get_refined_scene() requires refinement_results from forward() with 'refined_dynamic_objects'. "
+                "If you want to render unrefined scenes, use get_initial_scene() instead."
+            )
+
+        input_objects = refinement_results['refined_dynamic_objects']
+        dynamic_objects = []
+
+        for obj_data in input_objects:
+            object_id = obj_data['object_id']
+
+            # 强制使用refined参数
+            if 'refined_gaussians' not in obj_data:
+                raise ValueError(
+                    f"Object {object_id} missing 'refined_gaussians'. "
+                    "All objects must be refined before calling get_refined_scene()."
+                )
+
+            # 构建动态物体数据，强制使用refined参数
+            reference_frame = obj_data.get('reference_frame', 0)
+            if reference_frame is None:
+                reference_frame = 0
+
+            # 使用refined后的Gaussian参数（确保梯度传播）
+            canonical_gaussians = obj_data['refined_gaussians']
+
+            # 使用refined后的transforms（如果有pose refinement）
+            frame_transforms = obj_data.get('frame_transforms', {})
+            if 'refined_transforms' in obj_data and obj_data['refined_transforms']:
+                # 优先使用refined transforms（字典格式，直接使用）
+                refined_transforms = obj_data['refined_transforms']
+                if isinstance(refined_transforms, dict):
+                    # 字典格式：直接使用
+                    frame_transforms = refined_transforms
+                    print(f"[get_refined_scene] Object {object_id}: Using refined_transforms (dict), keys = {list(frame_transforms.keys())}")
+                else:
+                    # 列表格式（兼容旧代码）：需要映射到frame_idx
+                    frame_transforms = {}
+                    original_frame_transforms = obj_data.get('frame_transforms', {})
+                    sorted_frame_indices = sorted(original_frame_transforms.keys()) if original_frame_transforms else list(range(len(refined_transforms)))
+                    for loop_idx, transform in enumerate(refined_transforms):
+                        if transform is not None and loop_idx < len(sorted_frame_indices):
+                            actual_frame_idx = sorted_frame_indices[loop_idx]
+                            frame_transforms[actual_frame_idx] = transform
+                    print(f"[get_refined_scene] Object {object_id}: Using refined_transforms (list), keys = {list(frame_transforms.keys())}")
+
+            # 构建frame_existence
+            frame_existence = obj_data.get('frame_existence')
+            if frame_existence is None or len(frame_existence) <= 1:
+                if frame_transforms:
+                    max_frame = max(frame_transforms.keys()) if frame_transforms else reference_frame
+                    frame_existence = torch.tensor(
+                        [frame_idx in frame_transforms for frame_idx in range(max_frame + 1)],
+                        dtype=torch.bool
+                    )
+                else:
+                    frame_existence = torch.tensor([True], dtype=torch.bool)
+
+            dynamic_obj = {
+                'object_id': object_id,
+                'canonical_gaussians': canonical_gaussians,  # 强制使用refined参数
+                'reference_frame': reference_frame,
+                'frame_transforms': frame_transforms,  # 使用refined transforms（如果有）
+                'frame_existence': frame_existence
+            }
+
+            dynamic_objects.append(dynamic_obj)
+
+        scene = {
+            'static_gaussians': static_gaussians,
+            'dynamic_objects': dynamic_objects
+        }
+
+        return scene
+
+    def get_initial_scene(
+        self,
+        dynamic_objects: List[Dict],
+        static_gaussians: Optional[torch.Tensor] = None
+    ) -> Dict[str, Any]:
+        """
+        获取未经refinement的初始场景表示（用于对比）
+
+        此方法用于渲染未经Stage2细化的场景，不涉及梯度传播。
+
+        Args:
+            dynamic_objects: 原始动态物体列表（来自OnlineDynamicProcessor）
+            static_gaussians: 静态场景Gaussian参数
+
         Returns:
             scene: 包含完整场景的字典，格式为Stage2Loss期望的结构
         """
-        # 处理两种可能的输入格式
-        if isinstance(refinement_results, dict) and 'refined_dynamic_objects' in refinement_results:
-            # 来自Stage2Refiner.forward()的结果
-            input_objects = refinement_results['refined_dynamic_objects']
-            use_refined_params = True
-        elif isinstance(refinement_results, list):
-            # 直接传入的dynamic_objects列表（来自OnlineDynamicProcessor）
-            input_objects = refinement_results
-            use_refined_params = False
-        else:
-            # 回退处理
-            input_objects = refinement_results.get('refined_dynamic_objects', refinement_results.get('dynamic_objects', []))
-            use_refined_params = 'refined_dynamic_objects' in refinement_results
-        
-        dynamic_objects = []
-        
-        for obj_data in input_objects:
-            # 如果输入已经是Stage2Loss期望的格式，直接使用
-            if all(key in obj_data for key in ['canonical_gaussians', 'reference_frame', 'frame_transforms', 'frame_existence']):
-                # 直接复制，但如果有细化后的参数，使用细化后的
-                dynamic_obj = obj_data.copy()
-                if use_refined_params and 'refined_gaussians' in obj_data:
-                    dynamic_obj['canonical_gaussians'] = obj_data['refined_gaussians']
-                dynamic_objects.append(dynamic_obj)
-                continue
-            
-            # 需要转换格式的情况（传统的Stage2Refiner输出）
+        scene_dynamic_objects = []
+
+        for obj_data in dynamic_objects:
             object_id = obj_data['object_id']
-            
-            # 构建动态物体数据，使用Stage2Loss期望的结构
+
+            # 构建动态物体数据
             reference_frame = obj_data.get('reference_frame', 0)
             if reference_frame is None:
-                reference_frame = 0  # 默认为第0帧
-            
-            # 选择合适的gaussian参数
-            if use_refined_params and 'refined_gaussians' in obj_data:
-                canonical_gaussians = obj_data['refined_gaussians']  # 细化后的
-            else:
-                canonical_gaussians = obj_data.get('canonical_gaussians', obj_data.get('aggregated_gaussians'))
-            
-            dynamic_obj = {
-                'object_id': object_id,
-                'canonical_gaussians': canonical_gaussians,
-                'reference_frame': reference_frame,
-                'frame_transforms': obj_data.get('frame_transforms', {}),
-                'frame_existence': obj_data.get('frame_existence', torch.tensor([True], dtype=torch.bool))
-            }
-            
-            # 如果没有frame_transforms，尝试从其他字段构建
-            if not dynamic_obj['frame_transforms']:
-                # 处理refined_transforms或initial_transforms
-                transforms = obj_data.get('refined_transforms', obj_data.get('initial_transforms', []))
-                if transforms:
-                    for frame_idx, transform in enumerate(transforms):
-                        if transform is not None:
-                            dynamic_obj['frame_transforms'][frame_idx] = transform
-                
-                # 处理transformations字典格式
-                transformations_dict = obj_data.get('transformations', {})
+                reference_frame = 0
+
+            # 使用原始canonical_gaussians
+            canonical_gaussians = obj_data.get('canonical_gaussians', obj_data.get('aggregated_gaussians'))
+            if canonical_gaussians is None:
+                print(f"Warning: Object {object_id} missing canonical_gaussians, skipping")
+                continue
+
+            # 使用原始transforms
+            frame_transforms = obj_data.get('frame_transforms', {})
+            if not frame_transforms and 'transformations' in obj_data:
+                # 从transformations构建
+                transformations_dict = obj_data['transformations']
                 for frame_idx, transform_info in transformations_dict.items():
                     if isinstance(transform_info, dict) and 'transformation' in transform_info:
                         transform = transform_info['transformation']
                         if isinstance(transform, np.ndarray):
                             transform = torch.from_numpy(transform).float()
-                        dynamic_obj['frame_transforms'][frame_idx] = transform
-            
-            # 如果没有frame_existence，从frame_transforms推导
-            if dynamic_obj['frame_existence'] is None or len(dynamic_obj['frame_existence']) <= 1:
-                if dynamic_obj['frame_transforms']:
-                    max_frame = max(dynamic_obj['frame_transforms'].keys()) if dynamic_obj['frame_transforms'] else reference_frame
-                    frame_existence = []
-                    for frame_idx in range(max_frame + 1):
-                        frame_existence.append(frame_idx in dynamic_obj['frame_transforms'])
-                    dynamic_obj['frame_existence'] = torch.tensor(frame_existence, dtype=torch.bool)
-            
-            dynamic_objects.append(dynamic_obj)
-        
+                        frame_transforms[frame_idx] = transform
+
+            # 构建frame_existence
+            frame_existence = obj_data.get('frame_existence')
+            if frame_existence is None or len(frame_existence) <= 1:
+                if frame_transforms:
+                    max_frame = max(frame_transforms.keys()) if frame_transforms else reference_frame
+                    frame_existence = torch.tensor(
+                        [frame_idx in frame_transforms for frame_idx in range(max_frame + 1)],
+                        dtype=torch.bool
+                    )
+                else:
+                    frame_existence = torch.tensor([True], dtype=torch.bool)
+
+            dynamic_obj = {
+                'object_id': object_id,
+                'canonical_gaussians': canonical_gaussians,
+                'reference_frame': reference_frame,
+                'frame_transforms': frame_transforms,
+                'frame_existence': frame_existence
+            }
+
+            scene_dynamic_objects.append(dynamic_obj)
+
         scene = {
             'static_gaussians': static_gaussians,
-            'dynamic_objects': dynamic_objects  # 使用Stage2Loss期望的字段名
+            'dynamic_objects': scene_dynamic_objects
         }
-        
+
         return scene
     
-    def compute_consistency_loss(self, refinement_results: Dict) -> torch.Tensor:
-        """
-        计算几何一致性损失
-        
-        Args:
-            refinement_results: forward方法的输出结果
-            
-        Returns:
-            consistency_loss: 一致性损失
-        """
-        total_loss = 0.0
-        num_objects = len(refinement_results['refined_dynamic_objects'])
-        
-        for obj_data in refinement_results['refined_dynamic_objects']:
-            gaussian_deltas = obj_data['gaussian_deltas']
-            pose_deltas = obj_data['pose_deltas']
-            
-            if gaussian_deltas is not None:
-                # Gaussian变化量的正则化
-                gaussian_reg_loss = torch.mean(torch.abs(gaussian_deltas))
-                total_loss += 0.1 * gaussian_reg_loss
-            
-            if pose_deltas:
-                # 位姿变化量的正则化
-                pose_deltas_tensor = torch.stack(pose_deltas)  # [num_frames, 6]
-                pose_reg_loss = torch.mean(torch.abs(pose_deltas_tensor))
-                total_loss += 0.1 * pose_reg_loss
-                
-                # 位姿变化的时间平滑性
-                if len(pose_deltas) > 1:
-                    pose_diff = pose_deltas_tensor[1:] - pose_deltas_tensor[:-1]
-                    temporal_smoothness_loss = torch.mean(torch.abs(pose_diff))
-                    total_loss += 0.05 * temporal_smoothness_loss
-        
-        return total_loss / max(num_objects, 1)
     
     def gradient_checkpointing_enable(self, enable: bool = True):
         """启用或禁用梯度检查点（稀疏卷积版本不支持）"""

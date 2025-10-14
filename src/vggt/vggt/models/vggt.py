@@ -67,9 +67,6 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         self.velocity_head = DPTGSHead(dim_in=2 * embed_dim, output_dim=4, activation="linear", conf_activation="expp1")
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size)
 
-        # nn.init.zeros_(self.velocity_head.scratch.output_conv2[-1].weight)
-        # nn.init.zeros_(self.velocity_head.scratch.output_conv2[-1].bias)
-
         # Sky token support - now managed at VGGT level
         self.use_sky_token = use_sky_token
         if self.use_sky_token:
@@ -101,18 +98,20 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
     def set_freeze(self, freeze):
         to_be_frozen = {
             "none": [],
-            "stage2": [
+            "all": [
                 self.aggregator,
                 self.camera_head,
                 self.point_head,
                 self.depth_head,
-                # self.gaussian_head,
+                self.gaussian_head,
                 self.velocity_head,
-                self.scale_head,
+                self.scale_head if self.use_scale_token else None,
+                self.scale_token if self.use_scale_token else None,
+                self.sky_token if self.use_sky_token else None,
+                self.sky_head if self.use_sky_token else None,
+                self.track_head if hasattr(self, "track_head") else None,
             ],
         }
-        if hasattr(self, "track_head"):
-            to_be_frozen["vggt"].append(self.track_head)
         freeze_all_params(to_be_frozen[freeze])
 
     def gradient_checkpointing_enable(self, enable=True):

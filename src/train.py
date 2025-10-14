@@ -26,7 +26,7 @@ import sys
 # 添加vggt路径
 sys.path.append(os.path.join(os.path.dirname(__file__), 'vggt'))
 from vggt.vggt.models.vggt import VGGT
-from vggt.training.loss import camera_loss, depth_loss, point_loss, cross_render_and_loss, flow_loss, gt_flow_loss, self_render_and_loss, velocity_loss, sky_opacity_loss, sky_color_loss, vggt_distillation_loss, scale_loss, aggregator_render_loss
+from vggt.training.loss import camera_loss, depth_loss, point_loss, cross_render_and_loss, flow_loss, gt_flow_loss, gt_flow_loss_ours, self_render_and_loss, velocity_loss, sky_opacity_loss, sky_color_loss, vggt_distillation_loss, scale_loss, aggregator_render_loss
 from vggt.utils.auxiliary import RAFTCfg, calc_flow
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri, extri_intri_to_pose_encoding
 
@@ -141,7 +141,7 @@ def train(args):
         gradient_accumulation_steps=args.accum_iter,
         mixed_precision="bf16",
         kwargs_handlers=[
-            DistributedDataParallelKwargs(find_unused_parameters=True),
+            # DistributedDataParallelKwargs(find_unused_parameters=True),
             InitProcessGroupKwargs(timeout=timedelta(seconds=6000)),
         ],
     )
@@ -177,10 +177,12 @@ def train(args):
             'clustering_min_samples': getattr(args, 'clustering_min_samples', 10),
             'tracking_position_threshold': getattr(args, 'tracking_position_threshold', 2.0),
             'tracking_velocity_threshold': getattr(args, 'tracking_velocity_threshold', 0.2),
-            'use_optical_flow_aggregation': getattr(args, 'enable_optical_flow_aggregation', True)
+            'use_optical_flow_aggregation': getattr(args, 'enable_optical_flow_aggregation', True),
+            'use_velocity_based_transform': getattr(args, 'use_velocity_based_transform', False)
         }
     }
     
+    # Stage2 trainer必须在所有进程中初始化（DDP要求所有进程有相同的模型参数）
     online_stage2_trainer = OnlineStage2Trainer(
         stage2_config=stage2_config,
         device=device,
@@ -188,7 +190,7 @@ def train(args):
         stage2_start_epoch=getattr(args, 'stage2_start_epoch', 5),
         stage2_frequency=getattr(args, 'stage2_frequency', 10),
         memory_efficient=getattr(args, 'stage2_memory_efficient', True)
-    ) if accelerator.is_main_process else None
+    )
 
     printer.info("output_dir: " + args.output_dir)
     if args.output_dir:
@@ -437,7 +439,7 @@ def train(args):
 
     # # following timm: set wd as 0 for bias and norm layers
     param_groups = misc.get_parameter_groups(model, args.weight_decay)
-    
+
     # 添加第二阶段参数到优化器
     if online_stage2_trainer is not None and online_stage2_trainer.enable_stage2:
         stage2_params = online_stage2_trainer.get_stage2_parameters()
@@ -452,10 +454,28 @@ def train(args):
                     'weight_decay': getattr(args, 'stage2_weight_decay', args.weight_decay * 0.5),
                     'name': 'stage2_params'
                 }]
-                
+
                 param_groups.extend(stage2_param_groups)
-                print(f"Added {len(stage2_params)} Stage2 parameters to optimizer with lr={stage2_lr}")
-    
+                printer.info(f"Added {len(stage2_params)} Stage2 parameters to optimizer with lr={stage2_lr}")
+
+    # 如果主模型参数组为空（例如全部冻结），但有stage2参数，仍可创建优化器
+    if not param_groups:
+        raise ValueError(
+            "No trainable parameters found! "
+            "Please check:\n"
+            "1. vggt_freeze_strategy is not freezing all parameters without stage2\n"
+            "2. Stage2 model is properly initialized with trainable parameters\n"
+            f"Stage1 trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad)}\n"
+            f"Stage2 enabled: {online_stage2_trainer is not None and online_stage2_trainer.enable_stage2}"
+        )
+
+    printer.info(f"Total parameter groups for optimizer: {len(param_groups)}")
+    for i, group in enumerate(param_groups):
+        group_name = group.get('name', f'group_{i}')
+        num_params = len(group['params'])
+        group_lr = group.get('lr', args.lr)
+        printer.info(f"  Group {i} ({group_name}): {num_params} parameters, lr={group_lr}")
+
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
     loss_scaler = NativeScaler(accelerator=accelerator)
     
@@ -576,6 +596,7 @@ def train(args):
                     'conf_flow_loss_weight': getattr(args, 'conf_flow_loss_weight', 1.0),  # GT flowmap conf损失
                     'grad_flow_loss_weight': getattr(args, 'grad_flow_loss_weight', 1.0),  # GT flowmap grad损失
                     'reg_flow_loss_weight': getattr(args, 'reg_flow_loss_weight', 1.0),   # GT flowmap reg损失
+                    'gt_flow_loss_ours_weight': getattr(args, 'gt_flow_loss_ours_weight', 0.0),  # GT flowmap ours损失
                     'sam2_velocity_weight': getattr(args, 'sam2_velocity_weight', 1.0),
                     'sky_opacity_weight': getattr(args, 'sky_opacity_weight', 1.0),
                     'sky_color_weight': getattr(args, 'sky_color_weight', 1.0),
@@ -726,6 +747,28 @@ def train(args):
                         loss_dict.update(gt_flow_loss_dict)
                     except Exception as e:
                         print(f"Error in GT flow loss computation: {e}")
+                        import traceback
+                        traceback.print_exc()
+
+                # 3b. GT Flow Loss Ours (我们自己实现的版本)
+                if loss_weights['gt_flow_loss_ours_weight'] > 0 and \
+                   preds.get("velocity") is not None and \
+                   vggt_batch.get("flowmap") is not None:
+                    try:
+                        gt_flow_loss_ours_dict = gt_flow_loss_ours(
+                            preds["velocity"],
+                            vggt_batch
+                        )
+
+                        gt_flow_ours = gt_flow_loss_ours_dict.get("gt_flow_loss", 0.0)
+                        loss += loss_weights['gt_flow_loss_ours_weight'] * gt_flow_ours
+
+                        loss_dict.update({
+                            'gt_flow_loss_ours': gt_flow_ours,
+                            'gt_flow_ours_num_valid': gt_flow_loss_ours_dict.get('gt_flow_num_valid', 0)
+                        })
+                    except Exception as e:
+                        print(f"Error in GT flow loss ours computation: {e}")
                         import traceback
                         traceback.print_exc()
 
@@ -890,7 +933,7 @@ def train(args):
                         aggregator_loss_dict = aggregator_render_loss(
                             gaussian_params=preds["gaussian_params"],
                             depth=preds["depth"],
-                            velocity=preds["velocity"],
+                            velocity=preds["velocity"],  # velocity不参与梯度计算
                             sky_masks=sky_masks,
                             gt_extrinsic=vggt_batch["extrinsics"],
                             gt_intrinsic=vggt_batch["intrinsics"],
@@ -947,38 +990,34 @@ def train(args):
                 if (online_stage2_trainer is not None and
                     getattr(args, 'enable_stage2', False) and
                     epoch >= getattr(args, 'stage2_start_epoch', 10)):
-                    try:
-                        stage2_loss, stage2_loss_dict = online_stage2_trainer.process_stage1_outputs(
-                            preds=preds,
-                            vggt_batch=vggt_batch,
-                            auxiliary_models=auxiliary_models,
-                            epoch=epoch,
-                            iteration=data_iter_step
-                        )
+                    # Stage2处理（已内置DDP同步，不会导致卡住）
+                    stage2_loss, stage2_loss_dict = online_stage2_trainer.process_stage1_outputs(
+                        preds=preds,
+                        vggt_batch=vggt_batch,
+                        auxiliary_models=auxiliary_models,
+                        epoch=epoch,
+                        iteration=data_iter_step
+                    )
 
-                        if stage2_loss is not None:
-                            # 第二阶段只包含渲染损失，权重配置
-                            stage2_weight = getattr(args, 'stage2_loss_weight', 0.1)
+                    if stage2_loss is not None:
+                        # 第二阶段只包含渲染损失，权重配置
+                        stage2_weight = getattr(args, 'stage2_loss_weight', 0.1)
 
-                            # 注意：第二阶段的损失不加入第一阶段的总损失中
-                            # 因为第二阶段有独立的参数和优化器
+                        # 注意：第二阶段的损失不加入第一阶段的总损失中
+                        # 因为第二阶段有独立的参数和优化器
 
-                            # 记录第二阶段损失用于监控（所有stage2损失键名已经带有stage2_前缀）
-                            stage2_loss_dict_for_log = {k: v for k, v in stage2_loss_dict.items() if k.startswith('stage2_')}
+                        # 记录第二阶段损失用于监控（所有stage2损失键名已经带有stage2_前缀）
+                        stage2_loss_dict_for_log = {k: v for k, v in stage2_loss_dict.items() if k.startswith('stage2_')}
 
-                            # 记录到metric_logger和tensorboard
-                            metric_logger.update(**stage2_loss_dict_for_log)
+                        # 记录到metric_logger和tensorboard
+                        metric_logger.update(**stage2_loss_dict_for_log)
 
-                            if log_writer is not None:
-                                step = epoch * len(data_loader_train) + data_iter_step
-                                log_writer.add_scalar("stage2_total_loss", float(stage2_loss), step)
-                                for name, val in stage2_loss_dict_for_log.items():
-                                    if isinstance(val, torch.Tensor) and val.ndim == 0:
-                                        log_writer.add_scalar("train_" + name, val, step)
-
-
-                    except Exception as e:
-                        printer.warning(f"Stage2 training failed at epoch {epoch}, iter {data_iter_step}: {e}")
+                        if log_writer is not None and accelerator.is_main_process:
+                            step = epoch * len(data_loader_train) + data_iter_step
+                            log_writer.add_scalar("stage2_total_loss", float(stage2_loss), step)
+                            for name, val in stage2_loss_dict_for_log.items():
+                                if isinstance(val, torch.Tensor) and val.ndim == 0:
+                                    log_writer.add_scalar("train_" + name, val, step)
 
                 # =============== 梯度更新逻辑 ===============
                 loss_value = float(loss)
@@ -1871,7 +1910,7 @@ def run(cfg: OmegaConf):
     if cfg.get("debug", False):
         cfg.num_workers = 0
         import debugpy
-        debugpy.listen(5691)
+        debugpy.listen(5695)
         print("Waiting for debugger to attach...")
         debugpy.wait_for_client()
     logdir = pathlib.Path(cfg.logdir)
