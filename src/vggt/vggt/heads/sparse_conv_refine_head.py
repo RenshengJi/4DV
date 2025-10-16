@@ -8,8 +8,107 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, List
+import math
 import spconv.pytorch as spconv
 from spconv.pytorch import SparseConvTensor
+
+
+class CrossAttentionFusion(nn.Module):
+    """
+    Source和Target点云特征的交叉注意力融合模块
+
+    核心思想：
+    - 让source的每个点"attend to" target的所有点
+    - 学习哪些target点与当前source点最相关
+    - 使用多头注意力捕获多种对应模式
+
+    相比简单的max pooling + 相加：
+    - ✅ 显式建模source-target对应关系
+    - ✅ 可学习的注意力权重，自动关注重要区域
+    - ✅ 保留空间细节信息
+    - ✅ 多头机制捕获多种对应模式
+
+    参考：PREDATOR, Spatial Deformable Transformer等最新方法
+    """
+
+    def __init__(self, feature_dim: int, num_heads: int = 4, dropout: float = 0.0):
+        """
+        Args:
+            feature_dim: 特征维度，必须能被num_heads整除
+            num_heads: 多头注意力的头数
+            dropout: Dropout概率
+        """
+        super().__init__()
+
+        assert feature_dim % num_heads == 0, \
+            f"feature_dim ({feature_dim}) must be divisible by num_heads ({num_heads})"
+
+        self.feature_dim = feature_dim
+        self.num_heads = num_heads
+        self.head_dim = feature_dim // num_heads
+        self.scale = math.sqrt(self.head_dim)  # 缩放因子
+
+        # Query/Key/Value线性投影
+        self.q_proj = nn.Linear(feature_dim, feature_dim)
+        self.k_proj = nn.Linear(feature_dim, feature_dim)
+        self.v_proj = nn.Linear(feature_dim, feature_dim)
+
+        # 输出投影
+        self.out_proj = nn.Linear(feature_dim, feature_dim)
+
+        # Dropout
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+        # Layer normalization for better training stability
+        self.norm = nn.LayerNorm(feature_dim)
+
+    def forward(self, source_feats: torch.Tensor, target_feats: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            source_feats: [N, C] source点特征
+            target_feats: [M, C] target点特征
+
+        Returns:
+            fused_feats: [2*C] 融合后的全局特征
+                - 前C维: source-to-target attended features
+                - 后C维: 全局统计特征 (mean)
+        """
+        N, C = source_feats.shape
+        M = target_feats.shape[0]
+        H = self.num_heads
+        D = self.head_dim
+
+        # 1. 线性投影并重塑为多头形式
+        # Q: source查询target  K, V: target被查询
+        Q = self.q_proj(source_feats).view(N, H, D)  # [N, H, D]
+        K = self.k_proj(target_feats).view(M, H, D)  # [M, H, D]
+        V = self.v_proj(target_feats).view(M, H, D)  # [M, H, D]
+
+        # 2. 计算注意力分数: Q @ K^T / sqrt(d_k)
+        # einsum: 'nhd,mhd->nmh' 表示对每个head，计算N×M的相似度矩阵
+        attn_scores = torch.einsum('nhd,mhd->nmh', Q, K) / self.scale  # [N, M, H]
+
+        # 3. Softmax归一化（对target维度）
+        attn_weights = F.softmax(attn_scores, dim=1)  # [N, M, H]
+        attn_weights = self.dropout(attn_weights)
+
+        # 4. 加权聚合: attention_weights @ V
+        # einsum: 'nmh,mhd->nhd' 表示用注意力权重加权聚合target的值
+        attended = torch.einsum('nmh,mhd->nhd', attn_weights, V)  # [N, H, D]
+        attended = attended.reshape(N, C)  # [N, C]
+
+        # 5. 输出投影 + 残差连接
+        source_attended = self.out_proj(attended)
+        source_attended = self.dropout(source_attended)
+        source_attended = self.norm(source_attended + source_feats)  # Residual connection
+
+        # 6. 全局特征聚合：同时使用max和mean pooling
+        # Max: 捕获最强响应  Mean: 捕获整体分布
+        global_max = source_attended.max(dim=0)[0]  # [C]
+        global_mean = source_attended.mean(dim=0)   # [C]
+
+        # 返回拼接的全局特征
+        return torch.cat([global_max, global_mean], dim=0)  # [2*C]
 
 
 class SparseConvBlock(spconv.SparseModule):
@@ -304,14 +403,14 @@ class GaussianRefineHeadSparseConv(nn.Module):
             print(f"[WARNING] GaussianRefineHead: spatial_shape {spatial_shape_list} exceeds max {MAX_SPATIAL_DIM}, returning zero delta")
             # 使用模型参数创建零tensor，确保有grad_fn
             dummy_param = next(self.parameters())
-            return (dummy_param * 0.0).expand_as(gaussian_params)
+            return torch.zeros_like(gaussian_params) + dummy_param.sum() * 0.0
 
         # 【关键修复】检查spatial_shape是否为有效的正整数
         if any(dim <= 0 for dim in spatial_shape_list):
             print(f"[WARNING] GaussianRefineHead: invalid spatial_shape {spatial_shape_list}, returning zero delta")
             # 使用模型参数创建零tensor，确保有grad_fn
             dummy_param = next(self.parameters())
-            return (dummy_param * 0.0).expand_as(gaussian_params)
+            return torch.zeros_like(gaussian_params) + dummy_param.sum() * 0.0
 
         # 【关键修复】验证voxel_coords是否在有效范围内
         voxel_coords_max = voxel_coords[:, 1:].max(dim=0)[0]
@@ -320,14 +419,14 @@ class GaussianRefineHeadSparseConv(nn.Module):
             print(f"[WARNING] GaussianRefineHead: negative voxel coords detected (min={voxel_coords_min.tolist()}), returning zero delta")
             # 使用模型参数创建零tensor，确保有grad_fn
             dummy_param = next(self.parameters())
-            return (dummy_param * 0.0).expand_as(gaussian_params)
+            return torch.zeros_like(gaussian_params) + dummy_param.sum() * 0.0
 
         # 【关键修复】验证voxel_features是否有效
         if torch.isnan(voxel_features).any() or torch.isinf(voxel_features).any():
             print(f"[WARNING] GaussianRefineHead: NaN/Inf in voxel_features, returning zero delta")
             # 使用模型参数创建零tensor，确保有grad_fn
             dummy_param = next(self.parameters())
-            return (dummy_param * 0.0).expand_as(gaussian_params)
+            return torch.zeros_like(gaussian_params) + dummy_param.sum() * 0.0
 
         # 4. 创建SparseConvTensor（添加try-catch保护）
         try:
@@ -345,7 +444,7 @@ class GaussianRefineHeadSparseConv(nn.Module):
             print(f"  - voxel_coords range: min={voxel_coords_min.tolist()}, max={voxel_coords_max.tolist()}")
             # 使用模型参数创建零tensor，确保有grad_fn
             dummy_param = next(self.parameters())
-            return (dummy_param * 0.0).expand_as(gaussian_params)
+            return torch.zeros_like(gaussian_params) + dummy_param.sum() * 0.0
 
         # 5. 稀疏卷积处理（添加try-catch保护）
         try:
@@ -356,7 +455,7 @@ class GaussianRefineHeadSparseConv(nn.Module):
             print(f"  - num_voxels: {voxel_features.shape[0]}")
             # 使用模型参数创建零tensor，确保有grad_fn
             dummy_param = next(self.parameters())
-            return (dummy_param * 0.0).expand_as(gaussian_params)
+            return torch.zeros_like(gaussian_params) + dummy_param.sum() * 0.0
 
         # 6. 从体素特征还原到点特征
         voxel_features_out = sparse_output.features  # [M, feature_dim]
@@ -454,11 +553,23 @@ class PoseRefineHeadSparseConv(nn.Module):
             self.receptive_field_voxels = receptive_field
             self.receptive_field_meters = receptive_field * voxel_size
 
+        # 交叉注意力融合模块（替换简单的max pooling + 相加）
+        # 显式建模source-target对应关系，学习哪些点对匹配
+        self.cross_attention = CrossAttentionFusion(
+            feature_dim=feature_dim,
+            num_heads=4,  # 4个注意力头
+            dropout=0.1   # 轻微dropout防止过拟合
+        )
+
         # 位姿预测头 (输出9维: 6D旋转 + 3平移)
+        # 输入：4*feature_dim (source_to_target [2C] + target_to_source [2C])
         # 使用6D旋转表示以避免轴-角表示的数值不稳定性和不连续性
         # 参考: Zhou et al. "On the Continuity of Rotation Representations in Neural Networks" CVPR 2019
         self.pose_head = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim),
+            nn.Linear(feature_dim * 4, feature_dim * 2),  # 降维
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
+            nn.Linear(feature_dim * 2, feature_dim),
             nn.ReLU(inplace=True),
             nn.Linear(feature_dim, 9)  # 6D rotation + 3D translation
         )
@@ -577,7 +688,7 @@ class PoseRefineHeadSparseConv(nn.Module):
             print(f"[WARNING] PoseRefineHead: Failed to create sparse tensors, returning zero pose_delta")
             # 使用模型参数创建零tensor，确保有grad_fn
             dummy_param = next(self.parameters())
-            return (dummy_param * 0.0).sum() + torch.zeros(6, device=device, requires_grad=True)
+            return (dummy_param * 0.0).sum() + torch.zeros(9, device=device, requires_grad=True)
 
         # 3. 稀疏卷积特征提取（添加try-catch保护）
         try:
@@ -587,16 +698,29 @@ class PoseRefineHeadSparseConv(nn.Module):
             print(f"[ERROR] PoseRefineHead: Failed in conv_layers: {e}")
             # 使用模型参数创建零tensor，确保有grad_fn
             dummy_param = next(self.parameters())
-            return (dummy_param * 0.0).sum() + torch.zeros(6, device=device, requires_grad=True)
+            return (dummy_param * 0.0).sum() + torch.zeros(9, device=device, requires_grad=True)
 
-        # 4. 全局特征聚合
-        source_global = source_sparse.features.max(dim=0)[0]  # [feature_dim]
-        target_global = target_sparse.features.max(dim=0)[0]  # [feature_dim]
+        # 4. 交叉注意力特征融合（替换简单的max pooling + 相加）
+        # 双向注意力：source看target，target看source
+        # 这样可以捕获双向的几何对应关系
 
-        # 5. 特征融合
-        combined_feature = source_global + target_global  # [feature_dim]
+        source_feats = source_sparse.features  # [N, feature_dim]
+        target_feats = target_sparse.features  # [M, feature_dim]
+
+        # Source-to-Target: source点云查询target点云
+        # 学习：对于每个source点，target中哪些点与它对应
+        source_to_target = self.cross_attention(source_feats, target_feats)  # [2*feature_dim]
+
+        # Target-to-Source: target点云查询source点云（对称性）
+        # 学习：对于每个target点，source中哪些点与它对应
+        target_to_source = self.cross_attention(target_feats, source_feats)  # [2*feature_dim]
+
+        # 5. 双向特征拼接
+        # 将双向的注意力特征拼接，提供更丰富的对应关系信息
+        combined_feature = torch.cat([source_to_target, target_to_source], dim=0)  # [4*feature_dim]
 
         # 6. 位姿预测
+        # 基于双向对应关系，预测pose delta
         pose_delta = self.pose_head(combined_feature)  # [9]: 6D rotation + 3D translation
 
         return pose_delta
