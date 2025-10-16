@@ -454,11 +454,13 @@ class PoseRefineHeadSparseConv(nn.Module):
             self.receptive_field_voxels = receptive_field
             self.receptive_field_meters = receptive_field * voxel_size
 
-        # 位姿预测头 (输出6维: 3旋转 + 3平移)
+        # 位姿预测头 (输出9维: 6D旋转 + 3平移)
+        # 使用6D旋转表示以避免轴-角表示的数值不稳定性和不连续性
+        # 参考: Zhou et al. "On the Continuity of Rotation Representations in Neural Networks" CVPR 2019
         self.pose_head = nn.Sequential(
             nn.Linear(feature_dim, feature_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(feature_dim, 6)
+            nn.Linear(feature_dim, 9)  # 6D rotation + 3D translation
         )
 
         # 接近零初始化 - 位姿预测头的最后一层
@@ -545,7 +547,7 @@ class PoseRefineHeadSparseConv(nn.Module):
             pred_scale: [] 或 [1] Stage1预测的scene scale（可选）
 
         Returns:
-            pose_delta: [6] 位姿增量 (rotation_vector[3], translation[3])
+            pose_delta: [9] 位姿增量 (6D rotation[6], translation[3])
         """
         device = source_points.device
 
@@ -595,7 +597,7 @@ class PoseRefineHeadSparseConv(nn.Module):
         combined_feature = source_global + target_global  # [feature_dim]
 
         # 6. 位姿预测
-        pose_delta = self.pose_head(combined_feature)  # [6]
+        pose_delta = self.pose_head(combined_feature)  # [9]: 6D rotation + 3D translation
 
         return pose_delta
 
@@ -605,47 +607,54 @@ class PoseRefineHeadSparseConv(nn.Module):
         pose_delta: torch.Tensor
     ) -> torch.Tensor:
         """
-        应用位姿增量到初始变换
+        应用位姿增量到初始变换（使用6D旋转表示）
+
+        6D旋转表示优势：
+        - 连续、可微、无奇异点
+        - 梯度稳定，适合深度学习训练
+        - 避免轴-角表示的除零和不连续性问题
 
         Args:
             initial_transform: [4, 4] 初始变换矩阵
-            pose_delta: [6] 位姿增量 (rotation_vector[3], translation[3])
+            pose_delta: [9] 位姿增量 (6D rotation + 3D translation)
+                - rotation_6d: [6] 两个3D向量 (a1, a2)
+                - translation: [3] 平移向量
 
         Returns:
             refined_transform: [4, 4] 细化后的变换矩阵
         """
         device = initial_transform.device
 
-        # 提取旋转和平移
-        rotation_vec = pose_delta[:3]  # [3]
-        translation = pose_delta[3:]  # [3]
+        # 提取6D旋转和平移
+        rotation_6d = pose_delta[:6]  # [6]
+        translation = pose_delta[6:]  # [3]
 
-        # 旋转向量转旋转矩阵 (Rodrigues公式)
-        angle = torch.norm(rotation_vec)
-        # if angle < 1e-6:
-        #     rotation_matrix = torch.eye(3, device=device)
-        # else:
-        axis = rotation_vec / angle
-        K = torch.zeros((3, 3), device=device)
-        K[0, 1] = -axis[2]
-        K[0, 2] = axis[1]
-        K[1, 0] = axis[2]
-        K[1, 2] = -axis[0]
-        K[2, 0] = -axis[1]
-        K[2, 1] = axis[0]
+        # 6D旋转 → 旋转矩阵 (Gram-Schmidt正交化)
+        # 将6D向量重塑为2个3D向量
+        a1 = rotation_6d[:3]  # [3]
+        a2 = rotation_6d[3:6]  # [3]
 
-        rotation_matrix = (
-            torch.eye(3, device=device) +
-            torch.sin(angle) * K +
-            (1 - torch.cos(angle)) * torch.matmul(K, K)
-        )
+        # Gram-Schmidt正交化
+        # b1 = normalize(a1)
+        b1 = F.normalize(a1, dim=0, eps=1e-8)
+
+        # b2 = normalize(a2 - (a2·b1)b1)
+        dot_product = (b1 * a2).sum()
+        b2 = a2 - dot_product * b1
+        b2 = F.normalize(b2, dim=0, eps=1e-8)
+
+        # b3 = b1 × b2 (叉积得到第三个正交向量)
+        b3 = torch.cross(b1, b2, dim=0)
+
+        # 构建旋转矩阵 [b1, b2, b3] 作为列向量
+        rotation_matrix = torch.stack([b1, b2, b3], dim=1)  # [3, 3]
 
         # 构建增量变换矩阵
         delta_transform = torch.eye(4, device=device)
         delta_transform[:3, :3] = rotation_matrix
         delta_transform[:3, 3] = translation
 
-        # 应用增量
+        # 应用增量: T_refined = T_delta @ T_initial
         refined_transform = torch.matmul(delta_transform, initial_transform)
 
         return refined_transform

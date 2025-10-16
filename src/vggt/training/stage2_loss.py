@@ -591,30 +591,37 @@ class Stage2RenderLoss(nn.Module):
         return None
 
     def _pose_delta_to_transform_matrix(self, pose_delta: torch.Tensor) -> torch.Tensor:
-        """将pose delta转换为4x4变换矩阵"""
-        # pose_delta: [6] - [rx, ry, rz, tx, ty, tz]
+        """
+        将pose delta转换为4x4变换矩阵（使用6D旋转表示）
+
+        Args:
+            pose_delta: [9] - [6D rotation(6), translation(3)]
+
+        Returns:
+            transform: [4, 4] 变换矩阵
+        """
         device = pose_delta.device
 
-        # 旋转部分 (轴角表示)
-        rotation_vec = pose_delta[:3]  # [3]
-        translation = pose_delta[3:6]  # [3]
+        # 提取6D旋转和平移
+        rotation_6d = pose_delta[:6]  # [6]
+        translation = pose_delta[6:9]  # [3]
 
-        # 轴角转旋转矩阵
-        angle = torch.norm(rotation_vec)
-        if angle < 1e-8:
-            # 接近零旋转
-            R = torch.eye(3, device=device)
-        else:
-            axis = rotation_vec / angle
-            # Rodrigues公式
-            K = torch.tensor([
-                [0, -axis[2], axis[1]],
-                [axis[2], 0, -axis[0]],
-                [-axis[1], axis[0], 0]
-            ], device=device)
+        # 6D旋转 → 旋转矩阵 (Gram-Schmidt正交化)
+        a1 = rotation_6d[:3]  # [3]
+        a2 = rotation_6d[3:6]  # [3]
 
-            R = torch.eye(3, device=device) + torch.sin(angle) * \
-                K + (1 - torch.cos(angle)) * torch.mm(K, K)
+        # Gram-Schmidt正交化
+        import torch.nn.functional as F
+        b1 = F.normalize(a1, dim=0, eps=1e-8)
+
+        dot_product = (b1 * a2).sum()
+        b2 = a2 - dot_product * b1
+        b2 = F.normalize(b2, dim=0, eps=1e-8)
+
+        b3 = torch.cross(b1, b2, dim=0)
+
+        # 构建旋转矩阵
+        R = torch.stack([b1, b2, b3], dim=1)  # [3, 3]
 
         # 构建4x4变换矩阵
         transform = torch.eye(4, device=device)
