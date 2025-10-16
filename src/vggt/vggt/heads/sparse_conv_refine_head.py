@@ -56,17 +56,22 @@ class SparseConvBlock(spconv.SparseModule):
 
 
 class ResidualSparseConvBlock(spconv.SparseModule):
-    """带残差连接的稀疏卷积块"""
+    """带残差连接的稀疏卷积块，支持dilated convolution"""
 
-    def __init__(self, channels: int, kernel_size: int = 3):
+    def __init__(self, channels: int, kernel_size: int = 3, dilation: int = 1):
         super().__init__()
+
+        # 计算正确的padding以保持空间尺寸
+        # padding = dilation * (kernel_size - 1) // 2
+        padding = dilation * (kernel_size // 2)
 
         self.conv1 = spconv.SubMConv3d(
             channels, channels,
             kernel_size=kernel_size,
-            padding=kernel_size // 2,
+            padding=padding,
+            dilation=dilation,
             bias=False,
-            indice_key='subm'
+            indice_key=f'subm_d{dilation}'  # 不同dilation使用不同的indice_key
         )
         self.bn1 = nn.BatchNorm1d(channels)
         self.relu = nn.ReLU(inplace=True)
@@ -74,9 +79,10 @@ class ResidualSparseConvBlock(spconv.SparseModule):
         self.conv2 = spconv.SubMConv3d(
             channels, channels,
             kernel_size=kernel_size,
-            padding=kernel_size // 2,
+            padding=padding,
+            dilation=dilation,
             bias=False,
-            indice_key='subm'
+            indice_key=f'subm_d{dilation}'
         )
         self.bn2 = nn.BatchNorm1d(channels)
 
@@ -173,6 +179,7 @@ class GaussianRefineHeadSparseConv(nn.Module):
     """
     使用spconv的Gaussian细化网络
     比Transformer快得多，内存占用小
+    支持dilated convolution以扩大感受野
     """
 
     def __init__(
@@ -182,7 +189,9 @@ class GaussianRefineHeadSparseConv(nn.Module):
         feature_dim: int = 128,
         num_conv_layers: int = 2,
         voxel_size: float = 0.05,  # 体素大小，单位米
-        max_num_points_per_voxel: int = 5
+        max_num_points_per_voxel: int = 5,
+        use_dilated_conv: bool = False,  # 是否使用dilated convolution
+        dilation_rates: Optional[List[int]] = None  # 每层的膨胀率
     ):
         super().__init__()
         self.input_dim = input_gaussian_dim
@@ -190,6 +199,7 @@ class GaussianRefineHeadSparseConv(nn.Module):
         self.feature_dim = feature_dim
         self.voxel_size = voxel_size
         self.max_num_points_per_voxel = max_num_points_per_voxel
+        self.use_dilated_conv = use_dilated_conv
 
         # 输入编码
         self.input_encoder = nn.Sequential(
@@ -199,9 +209,30 @@ class GaussianRefineHeadSparseConv(nn.Module):
         )
 
         # 稀疏卷积层
-        self.conv_layers = spconv.SparseSequential(
-            *[ResidualSparseConvBlock(feature_dim) for _ in range(num_conv_layers)]
-        )
+        if use_dilated_conv and dilation_rates is not None:
+            # 使用指定的dilation rates
+            assert len(dilation_rates) == num_conv_layers, \
+                f"dilation_rates length ({len(dilation_rates)}) must match num_conv_layers ({num_conv_layers})"
+            self.conv_layers = spconv.SparseSequential(
+                *[ResidualSparseConvBlock(feature_dim, dilation=dilation_rates[i])
+                  for i in range(num_conv_layers)]
+            )
+            # 计算理论感受野（用于debug）
+            receptive_field = 1
+            for dilation in dilation_rates:
+                receptive_field += 2 * 2 * dilation  # 每个ResidualBlock有2个3x3卷积
+            self.receptive_field_voxels = receptive_field
+            self.receptive_field_meters = receptive_field * voxel_size
+            print(f"[GaussianRefineHead] Using dilated convolution with rates: {dilation_rates}")
+            print(f"[GaussianRefineHead] Theoretical receptive field: {receptive_field} voxels = {self.receptive_field_meters:.2f}m")
+        else:
+            # 默认：不使用dilation（向后兼容）
+            self.conv_layers = spconv.SparseSequential(
+                *[ResidualSparseConvBlock(feature_dim) for _ in range(num_conv_layers)]
+            )
+            receptive_field = 1 + num_conv_layers * 2 * 2  # 每个ResidualBlock有2个3x3卷积
+            self.receptive_field_voxels = receptive_field
+            self.receptive_field_meters = receptive_field * voxel_size
 
         # 输出头
         self.output_head = nn.Sequential(
@@ -218,7 +249,7 @@ class GaussianRefineHeadSparseConv(nn.Module):
         # 获取输出头的最后一层
         final_layer = self.output_head[-1]
         # 权重初始化为很小的值
-        nn.init.normal_(final_layer.weight, mean=0.0, std=0.0001)
+        nn.init.normal_(final_layer.weight, mean=0.0, std=0.00001)
         # bias初始化为零
         if final_layer.bias is not None:
             nn.init.zeros_(final_layer.bias)
@@ -263,20 +294,69 @@ class GaussianRefineHeadSparseConv(nn.Module):
             positions_centered, point_features
         )
 
-        # 3. 计算空间范围
+        # 3. 计算空间范围并进行安全性检查
         spatial_shape = voxel_coords[:, 1:].max(dim=0)[0] + 1
-        spatial_shape = spatial_shape.cpu().numpy().tolist()
+        spatial_shape_list = spatial_shape.cpu().numpy().tolist()
 
-        # 4. 创建SparseConvTensor
-        sparse_input = SparseConvTensor(
-            features=voxel_features,
-            indices=voxel_coords,
-            spatial_shape=spatial_shape,
-            batch_size=1
-        )
+        # 【关键修复】验证spatial_shape是否在合理范围内
+        MAX_SPATIAL_DIM = 1024  # spconv的安全上限
+        if any(dim > MAX_SPATIAL_DIM for dim in spatial_shape_list):
+            print(f"[WARNING] GaussianRefineHead: spatial_shape {spatial_shape_list} exceeds max {MAX_SPATIAL_DIM}, returning zero delta")
+            # 使用模型参数创建零tensor，确保有grad_fn
+            dummy_param = next(self.parameters())
+            return (dummy_param * 0.0).expand_as(gaussian_params)
 
-        # 5. 稀疏卷积处理
-        sparse_output = self.conv_layers(sparse_input)
+        # 【关键修复】检查spatial_shape是否为有效的正整数
+        if any(dim <= 0 for dim in spatial_shape_list):
+            print(f"[WARNING] GaussianRefineHead: invalid spatial_shape {spatial_shape_list}, returning zero delta")
+            # 使用模型参数创建零tensor，确保有grad_fn
+            dummy_param = next(self.parameters())
+            return (dummy_param * 0.0).expand_as(gaussian_params)
+
+        # 【关键修复】验证voxel_coords是否在有效范围内
+        voxel_coords_max = voxel_coords[:, 1:].max(dim=0)[0]
+        voxel_coords_min = voxel_coords[:, 1:].min(dim=0)[0]
+        if (voxel_coords_min < 0).any():
+            print(f"[WARNING] GaussianRefineHead: negative voxel coords detected (min={voxel_coords_min.tolist()}), returning zero delta")
+            # 使用模型参数创建零tensor，确保有grad_fn
+            dummy_param = next(self.parameters())
+            return (dummy_param * 0.0).expand_as(gaussian_params)
+
+        # 【关键修复】验证voxel_features是否有效
+        if torch.isnan(voxel_features).any() or torch.isinf(voxel_features).any():
+            print(f"[WARNING] GaussianRefineHead: NaN/Inf in voxel_features, returning zero delta")
+            # 使用模型参数创建零tensor，确保有grad_fn
+            dummy_param = next(self.parameters())
+            return (dummy_param * 0.0).expand_as(gaussian_params)
+
+        # 4. 创建SparseConvTensor（添加try-catch保护）
+        try:
+            sparse_input = SparseConvTensor(
+                features=voxel_features,
+                indices=voxel_coords,
+                spatial_shape=spatial_shape_list,
+                batch_size=1
+            )
+        except Exception as e:
+            print(f"[ERROR] GaussianRefineHead: Failed to create SparseConvTensor: {e}")
+            print(f"  - voxel_features shape: {voxel_features.shape}")
+            print(f"  - voxel_coords shape: {voxel_coords.shape}")
+            print(f"  - spatial_shape: {spatial_shape_list}")
+            print(f"  - voxel_coords range: min={voxel_coords_min.tolist()}, max={voxel_coords_max.tolist()}")
+            # 使用模型参数创建零tensor，确保有grad_fn
+            dummy_param = next(self.parameters())
+            return (dummy_param * 0.0).expand_as(gaussian_params)
+
+        # 5. 稀疏卷积处理（添加try-catch保护）
+        try:
+            sparse_output = self.conv_layers(sparse_input)
+        except Exception as e:
+            print(f"[ERROR] GaussianRefineHead: Failed in conv_layers: {e}")
+            print(f"  - spatial_shape: {spatial_shape_list}")
+            print(f"  - num_voxels: {voxel_features.shape[0]}")
+            # 使用模型参数创建零tensor，确保有grad_fn
+            dummy_param = next(self.parameters())
+            return (dummy_param * 0.0).expand_as(gaussian_params)
 
         # 6. 从体素特征还原到点特征
         voxel_features_out = sparse_output.features  # [M, feature_dim]
@@ -315,13 +395,14 @@ class GaussianRefineHeadSparseConv(nn.Module):
         # deltas_activated[..., 13:14] = deltas[..., 13:14].sigmoid()
 
         # 应用激活后的deltas
-        return gaussian_params  + deltas_activated
+        return gaussian_params + deltas_activated
 
 
 class PoseRefineHeadSparseConv(nn.Module):
     """
     使用spconv的位姿细化网络
     基于点云几何特征预测帧间变换
+    支持dilated convolution以扩大感受野
     """
 
     def __init__(
@@ -330,12 +411,15 @@ class PoseRefineHeadSparseConv(nn.Module):
         feature_dim: int = 128,
         num_conv_layers: int = 2,
         voxel_size: float = 0.1,
-        max_points: int = 4096
+        max_points: int = 4096,
+        use_dilated_conv: bool = False,  # 是否使用dilated convolution
+        dilation_rates: Optional[List[int]] = None  # 每层的膨胀率
     ):
         super().__init__()
         self.max_points = max_points
         self.voxel_size = voxel_size
         self.feature_dim = feature_dim
+        self.use_dilated_conv = use_dilated_conv
 
         # 点云编码
         self.point_encoder = nn.Sequential(
@@ -345,9 +429,30 @@ class PoseRefineHeadSparseConv(nn.Module):
         )
 
         # 稀疏卷积特征提取
-        self.conv_layers = spconv.SparseSequential(
-            *[ResidualSparseConvBlock(feature_dim) for _ in range(num_conv_layers)]
-        )
+        if use_dilated_conv and dilation_rates is not None:
+            # 使用指定的dilation rates
+            assert len(dilation_rates) == num_conv_layers, \
+                f"dilation_rates length ({len(dilation_rates)}) must match num_conv_layers ({num_conv_layers})"
+            self.conv_layers = spconv.SparseSequential(
+                *[ResidualSparseConvBlock(feature_dim, dilation=dilation_rates[i])
+                  for i in range(num_conv_layers)]
+            )
+            # 计算理论感受野（用于debug）
+            receptive_field = 1
+            for dilation in dilation_rates:
+                receptive_field += 2 * 2 * dilation  # 每个ResidualBlock有2个3x3卷积
+            self.receptive_field_voxels = receptive_field
+            self.receptive_field_meters = receptive_field * voxel_size
+            print(f"[PoseRefineHead] Using dilated convolution with rates: {dilation_rates}")
+            print(f"[PoseRefineHead] Theoretical receptive field: {receptive_field} voxels = {self.receptive_field_meters:.2f}m")
+        else:
+            # 默认：不使用dilation（向后兼容）
+            self.conv_layers = spconv.SparseSequential(
+                *[ResidualSparseConvBlock(feature_dim) for _ in range(num_conv_layers)]
+            )
+            receptive_field = 1 + num_conv_layers * 2 * 2  # 每个ResidualBlock有2个3x3卷积
+            self.receptive_field_voxels = receptive_field
+            self.receptive_field_meters = receptive_field * voxel_size
 
         # 位姿预测头 (输出6维: 3旋转 + 3平移)
         self.pose_head = nn.Sequential(
@@ -364,12 +469,12 @@ class PoseRefineHeadSparseConv(nn.Module):
         # 获取位姿预测头的最后一层
         final_layer = self.pose_head[-1]
         # 权重初始化为很小的值
-        nn.init.normal_(final_layer.weight, mean=0.0, std=0.0001)
+        nn.init.normal_(final_layer.weight, mean=0.0, std=0.00001)
         # bias初始化为零
         if final_layer.bias is not None:
             nn.init.zeros_(final_layer.bias)
 
-    def _points_to_sparse_tensor(self, points: torch.Tensor, features: torch.Tensor) -> SparseConvTensor:
+    def _points_to_sparse_tensor(self, points: torch.Tensor, features: torch.Tensor) -> Optional[SparseConvTensor]:
         """
         将点云转换为稀疏张量
 
@@ -378,24 +483,52 @@ class PoseRefineHeadSparseConv(nn.Module):
             features: [N, C] 点特征
 
         Returns:
-            sparse_tensor: SparseConvTensor
+            sparse_tensor: SparseConvTensor or None if failed
         """
         # 使用全局points_to_voxels函数
         voxel_features, voxel_coords_unique, _ = points_to_voxels(points, features, self.voxel_size)
 
-        # 计算空间范围
+        # 计算空间范围并进行安全性检查
         spatial_shape = voxel_coords_unique[:, 1:].max(dim=0)[0] + 1
-        spatial_shape = spatial_shape.cpu().numpy().tolist()
+        spatial_shape_list = spatial_shape.cpu().numpy().tolist()
 
-        # 创建SparseConvTensor
-        sparse_tensor = SparseConvTensor(
-            features=voxel_features,
-            indices=voxel_coords_unique,
-            spatial_shape=spatial_shape,
-            batch_size=1
-        )
+        # 【关键修复】验证spatial_shape是否在合理范围内
+        MAX_SPATIAL_DIM = 1024  # spconv的安全上限
+        if any(dim > MAX_SPATIAL_DIM for dim in spatial_shape_list):
+            print(f"[WARNING] PoseRefineHead: spatial_shape {spatial_shape_list} exceeds max {MAX_SPATIAL_DIM}")
+            return None
 
-        return sparse_tensor
+        # 【关键修复】检查spatial_shape是否为有效的正整数
+        if any(dim <= 0 for dim in spatial_shape_list):
+            print(f"[WARNING] PoseRefineHead: invalid spatial_shape {spatial_shape_list}")
+            return None
+
+        # 【关键修复】验证voxel_coords是否在有效范围内
+        voxel_coords_min = voxel_coords_unique[:, 1:].min(dim=0)[0]
+        if (voxel_coords_min < 0).any():
+            print(f"[WARNING] PoseRefineHead: negative voxel coords detected (min={voxel_coords_min.tolist()})")
+            return None
+
+        # 【关键修复】验证voxel_features是否有效
+        if torch.isnan(voxel_features).any() or torch.isinf(voxel_features).any():
+            print(f"[WARNING] PoseRefineHead: NaN/Inf in voxel_features")
+            return None
+
+        # 创建SparseConvTensor（添加try-catch保护）
+        try:
+            sparse_tensor = SparseConvTensor(
+                features=voxel_features,
+                indices=voxel_coords_unique,
+                spatial_shape=spatial_shape_list,
+                batch_size=1
+            )
+            return sparse_tensor
+        except Exception as e:
+            print(f"[ERROR] PoseRefineHead: Failed to create SparseConvTensor: {e}")
+            print(f"  - voxel_features shape: {voxel_features.shape}")
+            print(f"  - voxel_coords shape: {voxel_coords_unique.shape}")
+            print(f"  - spatial_shape: {spatial_shape_list}")
+            return None
 
     def forward(
         self,
@@ -426,19 +559,33 @@ class PoseRefineHeadSparseConv(nn.Module):
         source_points_metric = source_points / pred_scale  # [N, 3]
         target_points_metric = target_points / pred_scale  # [M, 3]
 
-        # 中心化点云（移动坐标系到各自中心）- 用于体素化
-        source_center = source_points_metric.mean(dim=0, keepdim=True)  # [1, 3]
-        target_center = target_points_metric.mean(dim=0, keepdim=True)  # [1, 3]
-        source_centered = source_points_metric - source_center  # [N, 3]
-        target_centered = target_points_metric - target_center  # [M, 3]
+        # 中心化点云（使用共同中心）- 用于体素化
+        # 使用source和target的共同中心，确保预测的变换一致性
+        all_points = torch.cat([source_points_metric, target_points_metric], dim=0)  # [N+M, 3]
+        shared_center = all_points.mean(dim=0, keepdim=True)  # [1, 3]
+        source_centered = source_points_metric - shared_center  # [N, 3]
+        target_centered = target_points_metric - shared_center  # [M, 3]
 
         # 2. 转换为稀疏张量（使用metric空间的中心化坐标）
         source_sparse = self._points_to_sparse_tensor(source_centered, source_features)
         target_sparse = self._points_to_sparse_tensor(target_centered, target_features)
 
-        # 3. 稀疏卷积特征提取
-        source_sparse = self.conv_layers(source_sparse)
-        target_sparse = self.conv_layers(target_sparse)
+        # 【关键修复】检查稀疏张量创建是否成功
+        if source_sparse is None or target_sparse is None:
+            print(f"[WARNING] PoseRefineHead: Failed to create sparse tensors, returning zero pose_delta")
+            # 使用模型参数创建零tensor，确保有grad_fn
+            dummy_param = next(self.parameters())
+            return (dummy_param * 0.0).sum() + torch.zeros(6, device=device, requires_grad=True)
+
+        # 3. 稀疏卷积特征提取（添加try-catch保护）
+        try:
+            source_sparse = self.conv_layers(source_sparse)
+            target_sparse = self.conv_layers(target_sparse)
+        except Exception as e:
+            print(f"[ERROR] PoseRefineHead: Failed in conv_layers: {e}")
+            # 使用模型参数创建零tensor，确保有grad_fn
+            dummy_param = next(self.parameters())
+            return (dummy_param * 0.0).sum() + torch.zeros(6, device=device, requires_grad=True)
 
         # 4. 全局特征聚合
         source_global = source_sparse.features.max(dim=0)[0]  # [feature_dim]

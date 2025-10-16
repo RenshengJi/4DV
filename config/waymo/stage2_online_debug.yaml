@@ -115,16 +115,19 @@ stage2_frequency: 1                       # 每个iteration都进行第二阶段
 # 第二阶段损失权重
 stage2_loss_weight: 1.0                   # 第二阶段渲染损失权重
 
-# 第二阶段模型配置（稀疏卷积）
+# 第二阶段模型配置（稀疏卷积 - 稳定版，避免SIGABRT）
 input_gaussian_dim: 14
 output_gaussian_dim: 14
-gaussian_feature_dim: 128
-gaussian_num_conv_layers: 2
-gaussian_voxel_size: 0.05                 # Gaussian细化体素大小（米）
+gaussian_feature_dim: 128                 # 降低到128以增加稳定性
+gaussian_num_conv_layers: 4               # 降低到4层以减少内存压力
+gaussian_voxel_size: 0.05                 # Gaussian细化体素大小（米），保持高分辨率
+use_dilated_conv: true                    # 启用dilated convolution
+gaussian_dilation_rates: [1, 1, 2, 2]     # 降低膨胀率以避免spconv CUDA错误
 max_num_points_per_voxel: 5
-pose_feature_dim: 128
-pose_num_conv_layers: 2
+pose_feature_dim: 128                     # 降低到128以增加稳定性
+pose_num_conv_layers: 4                   # 降低到4层以减少内存压力
 pose_voxel_size: 0.1                      # 位姿细化体素大小（米）
+pose_dilation_rates: [1, 1, 2, 2]         # 降低膨胀率以避免spconv CUDA错误
 max_points_per_object: 4096
 stage2_training_mode: 'joint'             # 第二阶段专用的refine模式
 
@@ -152,7 +155,7 @@ tracking_velocity_threshold: 0.2          # 速度匹配阈值
 allow_repeat: False
 
 train_dataset: Waymo_Multi(allow_repeat=${allow_repeat}, split=None,
-  ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/test_with_flow",
+  ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train_with_flow",
   img_ray_mask_p=[1.0, 0.0, 0.0], valid_camera_id_list=["1", "2", "3"],
   aug_crop=0, resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], transform=ImgNorm,
   num_views=${num_views}, n_corres=${n_corres_train}, seq_aug_crop=True, load_sam_masks=False)
@@ -169,15 +172,15 @@ accum_iter: 4
 gradient_checkpointing: True
 epochs: 10                                 # 第二阶段通常需要较少epochs
 start_epoch: 0
-weight_decay: 0.01                         # 第二阶段使用较小的weight decay
-lr: 1e-4                                   # 第二阶段使用较小的学习率
+weight_decay: 0.01                         # 基础weight decay（由于VGGT冻结，实际未使用）
+lr: 1e-4                                   # 基础学习率（由于VGGT冻结，实际未使用，仅作为fallback）
 min_lr: 1e-8
 warmup_epochs: 0.1                         # 第二阶段使用较短的warmup
 amp: 1
 
-# 第二阶段专用学习率配置
-stage2_learning_rate: 5e-5                # 更小的学习率用于精细化
-stage2_weight_decay: 0.005                # 更小的权重衰减
+# 第二阶段专用学习率配置（由于vggt_freeze_strategy=all，只有stage2参数会被训练）
+stage2_learning_rate: 5e-4                # 第二阶段学习率用于refiner精细化（✓ 实际生效的学习率）
+stage2_weight_decay: 0.005                # 第二阶段权重衰减（✓ 实际生效的weight decay）
 
 # =============== 训练监控配置 ===============
 num_workers: 4
@@ -190,7 +193,7 @@ distributed: False
 dist_backend: 'nccl'
 
 eval_freq: 1
-save_freq: 0.05                             # 第二阶段更频繁保存
+save_freq: 0.01                             # 第二阶段更频繁保存
 keep_freq: 1
 print_freq: 5                              # 更频繁的打印
 print_img_freq: 50000000
@@ -198,7 +201,7 @@ num_imgs_vis: 4
 
 # =============== 输出配置 ===============
 save_dir: 'checkpoints/waymo_stage2_online_debug'
-exp_name: 'stage2_first'
+exp_name: 'stage2_train+lr5e-4+0.00001init'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/

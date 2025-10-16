@@ -103,7 +103,9 @@ class OnlineStage2Trainer:
             "feature_dim": config.get('gaussian_feature_dim', 128),
             "num_conv_layers": config.get('gaussian_num_conv_layers', 2),
             "voxel_size": config.get('gaussian_voxel_size', 0.05),
-            "max_num_points_per_voxel": config.get('max_num_points_per_voxel', 5)
+            "max_num_points_per_voxel": config.get('max_num_points_per_voxel', 5),
+            "use_dilated_conv": config.get('use_dilated_conv', False),
+            "dilation_rates": config.get('gaussian_dilation_rates', None)
         }
 
         pose_refine_config = {
@@ -111,11 +113,19 @@ class OnlineStage2Trainer:
             "feature_dim": config.get('pose_feature_dim', 128),
             "num_conv_layers": config.get('pose_num_conv_layers', 2),
             "voxel_size": config.get('pose_voxel_size', 0.1),
-            "max_points": config.get('max_points_per_object', 4096)
+            "max_points": config.get('max_points_per_object', 4096),
+            "use_dilated_conv": config.get('use_dilated_conv', False),
+            "dilation_rates": config.get('pose_dilation_rates', None)
         }
-        
+
         training_mode = config.get('stage2_training_mode', config.get('training_mode', 'joint'))
         print(f"  - Stage2 training mode: {training_mode}")
+
+        # 打印dilated conv配置
+        if config.get('use_dilated_conv', False):
+            print(f"  - Using dilated convolution:")
+            print(f"    Gaussian dilation rates: {config.get('gaussian_dilation_rates', None)}")
+            print(f"    Pose dilation rates: {config.get('pose_dilation_rates', None)}")
 
         model = Stage2Refiner(
             gaussian_refine_config=gaussian_refine_config,
@@ -130,8 +140,8 @@ class OnlineStage2Trainer:
     def _create_stage2_criterion(self, config: Dict[str, Any]) -> Stage2CompleteLoss:
         """创建第二阶段损失函数"""
         render_loss_config = {
-            'rgb_weight': config.get('rgb_loss_weight', 0.5),  # 降低权重避免过拟合
-            'depth_weight': config.get('depth_loss_weight', 0.0),  # 使用配置中的实际值
+            'rgb_weight': config.get('stage2_rgb_loss_weight', 0.5),  # 修正：使用stage2_前缀的键名
+            'depth_weight': config.get('stage2_depth_loss_weight', 0.0),  # 修正：使用stage2_前缀的键名
         }
 
         criterion = Stage2CompleteLoss(
@@ -225,11 +235,34 @@ class OnlineStage2Trainer:
 
             # 如果所有进程都没有物体，统一返回零损失
             if has_objects[0] == 0:
-                return torch.tensor(0.0, device=self.device, requires_grad=True), {
+                # 【关键修复】创建一个带梯度的零损失（连接到计算图）
+                # 使用stage2模型的某个参数创建一个零损失，确保有grad_fn
+                dummy_param = next(self.stage2_model.parameters())
+                zero_loss = (dummy_param * 0.0).sum()  # 这个tensor有grad_fn，可以backward
+                return zero_loss, {
                     'stage2_rgb_loss': 0.0,
                     'stage2_depth_loss': 0.0,
                     'stage2_total_loss': 0.0,
-                    'stage2_final_total_loss': 0.0
+                    'stage2_final_total_loss': 0.0,
+                    'stage2_skipped': True  # 标记为跳过，用于过滤tensorboard日志
+                }
+
+            # 【关键修复】预先验证动态物体数据的合法性（避免spconv SIGABRT）
+            if not self._validate_dynamic_objects(dynamic_objects_data):
+                if is_main_process:
+                    print(f"[WARNING] Stage2 validation failed at iteration {iteration}, skipping")
+                has_error[0] = 1
+                if is_distributed:
+                    dist.all_reduce(has_error, op=dist.ReduceOp.MAX)
+                # 创建带梯度的零损失
+                dummy_param = next(self.stage2_model.parameters())
+                zero_loss = (dummy_param * 0.0).sum()
+                return zero_loss, {
+                    'stage2_rgb_loss': 0.0,
+                    'stage2_depth_loss': 0.0,
+                    'stage2_total_loss': 0.0,
+                    'stage2_final_total_loss': 0.0,
+                    'stage2_skipped': True  # 标记为跳过
                 }
 
             # 执行第二阶段前向传播 (包装在内部try-catch中以捕获CUDA/渲染错误)
@@ -252,13 +285,21 @@ class OnlineStage2Trainer:
                 if is_distributed:
                     dist.all_reduce(has_error, op=dist.ReduceOp.MAX)
 
-                # 统一返回零损失
-                return torch.tensor(0.0, device=self.device, requires_grad=True), {
+                # 统一返回零损失（带梯度）
+                dummy_param = next(self.stage2_model.parameters())
+                zero_loss = (dummy_param * 0.0).sum()
+                return zero_loss, {
                     'stage2_rgb_loss': 0.0,
                     'stage2_depth_loss': 0.0,
                     'stage2_total_loss': 0.0,
-                    'stage2_final_total_loss': 0.0
+                    'stage2_final_total_loss': 0.0,
+                    'stage2_skipped': True  # 标记为跳过
                 }
+
+            # 【关键修复】DDP同步：确保所有进程都完成forward后再返回
+            # 这防止快的进程继续到backward而慢的进程还在forward，导致死锁
+            if is_distributed:
+                dist.barrier()
 
             # 更新统计信息
             self.stage2_iteration_count += 1
@@ -326,13 +367,59 @@ class OnlineStage2Trainer:
                 dist.all_reduce(has_error, op=dist.ReduceOp.MAX)
 
             # 所有进程统一返回零损失（带梯度）
-            return torch.tensor(0.0, device=self.device, requires_grad=True), {
+            dummy_param = next(self.stage2_model.parameters())
+            zero_loss = (dummy_param * 0.0).sum()
+            return zero_loss, {
                 'stage2_rgb_loss': 0.0,
                 'stage2_depth_loss': 0.0,
                 'stage2_total_loss': 0.0,
-                'stage2_final_total_loss': 0.0
+                'stage2_final_total_loss': 0.0,
+                'stage2_skipped': True  # 标记为跳过
             }
     
+    def _validate_dynamic_objects(self, dynamic_objects_data: Dict[str, Any]) -> bool:
+        """
+        验证动态物体数据的合法性，避免spconv SIGABRT
+
+        Args:
+            dynamic_objects_data: 动态物体处理结果
+
+        Returns:
+            bool: True if valid, False otherwise
+        """
+        if not dynamic_objects_data:
+            return False
+
+        dynamic_objects = dynamic_objects_data.get('dynamic_objects', [])
+        if not dynamic_objects:
+            return False
+
+        # 验证每个物体的canonical_gaussians
+        for obj in dynamic_objects:
+            canonical_gaussians = obj.get('canonical_gaussians')
+            if canonical_gaussians is None:
+                print(f"[WARNING] Object {obj.get('object_id', 'unknown')} has None canonical_gaussians")
+                return False
+
+            # 检查形状
+            if canonical_gaussians.shape[0] == 0:
+                print(f"[WARNING] Object {obj.get('object_id', 'unknown')} has empty canonical_gaussians")
+                return False
+
+            # 检查NaN/Inf
+            if torch.isnan(canonical_gaussians).any() or torch.isinf(canonical_gaussians).any():
+                print(f"[WARNING] Object {obj.get('object_id', 'unknown')} has NaN/Inf in canonical_gaussians")
+                return False
+
+            # 检查坐标范围（避免超大坐标导致spconv溢出）
+            positions = canonical_gaussians[:, :3]
+            pos_range = positions.max() - positions.min()
+            if pos_range > 1000.0:  # 超过1000米认为异常
+                print(f"[WARNING] Object {obj.get('object_id', 'unknown')} has excessive position range: {pos_range.item():.2f}m")
+                return False
+
+        return True
+
     def _run_stage2_forward(
         self,
         dynamic_objects_data: Dict[str, Any],

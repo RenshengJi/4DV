@@ -163,10 +163,10 @@ def train(args):
         'pose_num_layers': getattr(args, 'pose_num_layers', 2),
         'max_points_per_object': getattr(args, 'max_points_per_object', 2048),
         'training_mode': getattr(args, 'stage2_training_mode', 'joint'),
-        
-        # 损失配置
-        'rgb_loss_weight': getattr(args, 'stage2_rgb_loss_weight', 0.5),
-        'depth_loss_weight': getattr(args, 'stage2_depth_loss_weight', 0.05),
+
+        # 损失配置 - 使用stage2_前缀的键名以匹配online_stage2_trainer.py
+        'stage2_rgb_loss_weight': getattr(args, 'stage2_rgb_loss_weight', 0.5),
+        'stage2_depth_loss_weight': getattr(args, 'stage2_depth_loss_weight', 0.05),
         
         # 动态处理器配置
         'dynamic_processor': {
@@ -1006,18 +1006,29 @@ def train(args):
                         # 注意：第二阶段的损失不加入第一阶段的总损失中
                         # 因为第二阶段有独立的参数和优化器
 
-                        # 记录第二阶段损失用于监控（所有stage2损失键名已经带有stage2_前缀）
-                        stage2_loss_dict_for_log = {k: v for k, v in stage2_loss_dict.items() if k.startswith('stage2_')}
+                        # 【关键修复】过滤掉skipped的stage2损失，避免零损失影响tensorboard曲线
+                        stage2_skipped = stage2_loss_dict.get('stage2_skipped', False)
 
-                        # 记录到metric_logger和tensorboard
-                        metric_logger.update(**stage2_loss_dict_for_log)
+                        if not stage2_skipped:
+                            # 只记录有效的（非跳过的）stage2损失
+                            stage2_loss_dict_for_log = {k: v for k, v in stage2_loss_dict.items()
+                                                        if k.startswith('stage2_') and k != 'stage2_skipped'}
 
-                        if log_writer is not None and accelerator.is_main_process:
-                            step = epoch * len(data_loader_train) + data_iter_step
-                            log_writer.add_scalar("stage2_total_loss", float(stage2_loss), step)
-                            for name, val in stage2_loss_dict_for_log.items():
-                                if isinstance(val, torch.Tensor) and val.ndim == 0:
-                                    log_writer.add_scalar("train_" + name, val, step)
+                            # 记录到metric_logger和tensorboard
+                            metric_logger.update(**stage2_loss_dict_for_log)
+
+                            if log_writer is not None and accelerator.is_main_process:
+                                step = epoch * len(data_loader_train) + data_iter_step
+                                log_writer.add_scalar("stage2_total_loss", float(stage2_loss), step)
+                                for name, val in stage2_loss_dict_for_log.items():
+                                    if isinstance(val, torch.Tensor) and val.ndim == 0:
+                                        log_writer.add_scalar("train_" + name, val, step)
+                                    elif isinstance(val, (int, float)):
+                                        log_writer.add_scalar("train_" + name, val, step)
+                        else:
+                            # 跳过的stage2损失不记录到tensorboard
+                            if accelerator.is_main_process and data_iter_step % 100 == 0:
+                                printer.info(f"[Iter {data_iter_step}] Stage2 skipped (no dynamic objects or validation failed)")
 
                 # =============== 梯度更新逻辑 ===============
                 loss_value = float(loss)
@@ -1040,12 +1051,14 @@ def train(args):
                 elif training_stage == 'stage2':
                     # ============ 第二阶段训练 ============
                     # 只更新第二阶段的参数（refine模型），不更新第一阶段参数
+                    # 【关键修复】DDP同步问题：所有进程都必须调用backward，即使loss为0
                     if (stage2_loss is not None and
                         online_stage2_trainer is not None and
                         online_stage2_trainer.enable_stage2):
                         stage2_params = online_stage2_trainer.get_stage2_parameters()
                         if stage2_params:
                             # 第二阶段使用独立的损失和参数
+                            # 即使stage2_skipped=True（零损失），也必须调用backward保持DDP同步
                             loss_scaler(
                                 stage2_loss,
                                 optimizer,
@@ -1910,7 +1923,7 @@ def run(cfg: OmegaConf):
     if cfg.get("debug", False):
         cfg.num_workers = 0
         import debugpy
-        debugpy.listen(5695)
+        debugpy.listen(5696)
         print("Waiting for debugger to attach...")
         debugpy.wait_for_client()
     logdir = pathlib.Path(cfg.logdir)

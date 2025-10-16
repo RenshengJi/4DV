@@ -41,7 +41,9 @@ class Stage2Refiner(nn.Module):
                 "feature_dim": 128,
                 "num_conv_layers": 2,
                 "voxel_size": 0.05,
-                "max_num_points_per_voxel": 5
+                "max_num_points_per_voxel": 5,
+                "use_dilated_conv": False,  # 默认不使用dilated conv（向后兼容）
+                "dilation_rates": None
             }
 
         if pose_refine_config is None:
@@ -50,7 +52,9 @@ class Stage2Refiner(nn.Module):
                 "feature_dim": 128,
                 "num_conv_layers": 2,
                 "voxel_size": 0.1,
-                "max_points": 4096
+                "max_points": 4096,
+                "use_dilated_conv": False,  # 默认不使用dilated conv（向后兼容）
+                "dilation_rates": None
             }
 
         # 初始化网络组件 - 使用稀疏卷积版本
@@ -188,9 +192,11 @@ class Stage2Refiner(nn.Module):
                         else:
                             # 如果没有当前帧的Gaussian，使用source_points作为fallback
                             target_points = source_points
+                            print(f"Warning: Object {object_id} frame {actual_frame_idx} has None gaussians, using source_points as fallback")
                     else:
                         # 如果没有当前帧的Gaussian，使用source_points作为fallback
                         target_points = source_points
+                        print(f"Warning: Object {object_id} frame {actual_frame_idx} missing in frame_gaussians, using source_points as fallback")
 
                     # 预测并应用位姿细化（传入pred_scale）
                     pose_delta = self.pose_refine_head(

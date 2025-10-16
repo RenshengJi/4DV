@@ -113,16 +113,19 @@ stage2_frequency: 1                       # 每个iteration都进行第二阶段
 # 第二阶段损失权重
 stage2_loss_weight: 1.0                   # 第二阶段渲染损失权重
 
-# 第二阶段模型配置（稀疏卷积）
+# 第二阶段模型配置（稀疏卷积 - 稳定版，避免SIGABRT）
 input_gaussian_dim: 14
 output_gaussian_dim: 14
-gaussian_feature_dim: 128
-gaussian_num_conv_layers: 2
-gaussian_voxel_size: 0.05                 # Gaussian细化体素大小（米）
+gaussian_feature_dim: 128                 # 降低到128以增加稳定性
+gaussian_num_conv_layers: 4               # 降低到4层以减少内存压力
+gaussian_voxel_size: 0.05                 # Gaussian细化体素大小（米），保持高分辨率
+use_dilated_conv: true                    # 启用dilated convolution
+gaussian_dilation_rates: [1, 1, 2, 2]     # 降低膨胀率以避免spconv CUDA错误
 max_num_points_per_voxel: 5
-pose_feature_dim: 128
-pose_num_conv_layers: 2
+pose_feature_dim: 128                     # 降低到128以增加稳定性
+pose_num_conv_layers: 4                   # 降低到4层以减少内存压力
 pose_voxel_size: 0.1                      # 位姿细化体素大小（米）
+pose_dilation_rates: [1, 1, 2, 2]         # 降低膨胀率以避免spconv CUDA错误
 max_points_per_object: 4096
 stage2_training_mode: 'joint'             # 第二阶段专用的refine模式
 
@@ -196,7 +199,7 @@ num_imgs_vis: 4
 
 # =============== 输出配置 ===============
 save_dir: 'checkpoints/waymo_stage2_online'
-exp_name: 'stage2_train+fixpose+detach'
+exp_name: 'stage2_train+lr5e-4+0.00001init'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/

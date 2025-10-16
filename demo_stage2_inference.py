@@ -189,6 +189,59 @@ def load_stage1_model(model_path, device):
     return model
 
 
+def detect_checkpoint_config(stage2_model_path):
+    """自动检测checkpoint的网络配置"""
+    if not os.path.exists(stage2_model_path):
+        return None
+
+    print(f"Auto-detecting checkpoint architecture from {stage2_model_path}...")
+    checkpoint = torch.load(stage2_model_path, map_location="cpu")
+
+    if 'stage2_model' not in checkpoint:
+        print("  Warning: Checkpoint format not recognized, using default config")
+        return None
+
+    ckpt_keys = checkpoint['stage2_model'].keys()
+
+    # 检测层数
+    max_layer_idx = -1
+    for key in ckpt_keys:
+        if 'conv_layers.' in key:
+            # 提取层索引，例如 "gaussian_refine_head.conv_layers.2.conv1.weight"
+            parts = key.split('.')
+            for i, part in enumerate(parts):
+                if part == 'conv_layers' and i + 1 < len(parts):
+                    try:
+                        layer_idx = int(parts[i + 1])
+                        max_layer_idx = max(max_layer_idx, layer_idx)
+                    except ValueError:
+                        pass
+
+    num_layers = max_layer_idx + 1 if max_layer_idx >= 0 else 2
+
+    # 检测特征维度
+    feature_dim = 128
+    for key in ckpt_keys:
+        if 'input_encoder.0.weight' in key:
+            # shape: [feature_dim, input_dim]
+            weight = checkpoint['stage2_model'][key]
+            feature_dim = weight.shape[0]
+            break
+
+    # 检测是否使用dilated conv（通过检查indice_key）
+    use_dilated_conv = any('subm_d' in key for key in ckpt_keys)
+
+    detected_config = {
+        'num_layers': num_layers,
+        'feature_dim': feature_dim,
+        'use_dilated_conv': use_dilated_conv
+    }
+
+    print(f"  Detected: num_layers={num_layers}, feature_dim={feature_dim}, use_dilated_conv={use_dilated_conv}")
+
+    return detected_config
+
+
 def load_stage2_components(stage2_model_path, device, use_velocity_based_transform=False,
                           velocity_threshold=0.1, clustering_eps=0.02, clustering_min_samples=10,
                           tracking_position_threshold=2.0, tracking_velocity_threshold=0.2):
@@ -198,18 +251,39 @@ def load_stage2_components(stage2_model_path, device, use_velocity_based_transfo
     print(f"  Clustering parameters: velocity_threshold={velocity_threshold}, eps={clustering_eps}, min_samples={clustering_min_samples}")
     print(f"  Tracking parameters: position_threshold={tracking_position_threshold}, velocity_threshold={tracking_velocity_threshold}")
 
+    # 【智能配置】自动检测checkpoint的网络架构
+    detected_config = detect_checkpoint_config(stage2_model_path)
+
+    if detected_config:
+        # 使用检测到的配置
+        num_layers = detected_config['num_layers']
+        feature_dim = detected_config['feature_dim']
+        use_dilated = detected_config['use_dilated_conv']
+        dilation_rates = [1, 1, 2, 2][:num_layers] if use_dilated else None
+        print(f"Using detected checkpoint config: {num_layers} layers, {feature_dim} dim, dilated={use_dilated}")
+    else:
+        # 使用最新训练配置作为默认值
+        num_layers = 4
+        feature_dim = 128
+        use_dilated = True
+        dilation_rates = [1, 1, 2, 2]
+        print(f"Using default config: {num_layers} layers, {feature_dim} dim, dilated={use_dilated}")
+
     # Stage2配置（使用稀疏卷积）
     stage2_config = {
-        'training_mode': 'joint',  # 改为joint以同时启用Gaussian和Pose refinement
+        'training_mode': 'joint',  # 同时启用Gaussian和Pose refinement
         'input_gaussian_dim': 14,
         'output_gaussian_dim': 14,
-        'gaussian_feature_dim': 128,
-        'gaussian_num_conv_layers': 2,
+        'gaussian_feature_dim': feature_dim,
+        'gaussian_num_conv_layers': num_layers,
         'gaussian_voxel_size': 0.05,
+        'use_dilated_conv': use_dilated,
+        'gaussian_dilation_rates': dilation_rates,
         'max_num_points_per_voxel': 5,
-        'pose_feature_dim': 128,
-        'pose_num_conv_layers': 2,
+        'pose_feature_dim': feature_dim,
+        'pose_num_conv_layers': num_layers,
         'pose_voxel_size': 0.1,
+        'pose_dilation_rates': dilation_rates,
         'max_points_per_object': 4096,
         'rgb_loss_weight': 1.0,
         'depth_loss_weight': 0.0,
@@ -238,8 +312,15 @@ def load_stage2_components(stage2_model_path, device, use_velocity_based_transfo
     if os.path.exists(stage2_model_path):
         print(f"Loading Stage2 checkpoint from {stage2_model_path}...")
         stage2_checkpoint = torch.load(stage2_model_path, map_location="cpu")
-        stage2_trainer.load_state_dict(stage2_checkpoint)
-        print("Stage2 checkpoint loaded successfully")
+
+        if 'stage2_model' in stage2_checkpoint:
+            # 由于我们已经自动检测了配置，现在应该可以完美匹配
+            stage2_trainer.stage2_model.load_state_dict(stage2_checkpoint['stage2_model'], strict=True)
+            print("✓ Stage2 model checkpoint loaded successfully (architecture matched)")
+        else:
+            # 旧格式的checkpoint
+            stage2_trainer.load_state_dict(stage2_checkpoint)
+            print("✓ Stage2 checkpoint loaded successfully")
     else:
         print(f"Warning: Stage2 checkpoint not found at {stage2_model_path}, using initialized model")
 
@@ -1018,12 +1099,13 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
                                 total_opacity_diff += opacity_diff.item()
                                 compared_count += 1
 
-                            # 统计pose deltas
+                            # 统计pose deltas（pose_deltas现在是字典 {frame_idx: pose_delta}）
                             if 'pose_deltas' in refined_obj:
-                                pose_deltas_list = refined_obj['pose_deltas']
-                                if pose_deltas_list and len(pose_deltas_list) > 0:
+                                pose_deltas_dict = refined_obj['pose_deltas']
+                                if pose_deltas_dict and len(pose_deltas_dict) > 0:
                                     num_objects_with_pose_deltas += 1
-                                    for pose_delta in pose_deltas_list:
+                                    # 遍历字典中的所有pose_delta
+                                    for frame_idx, pose_delta in pose_deltas_dict.items():
                                         if pose_delta is not None and isinstance(pose_delta, torch.Tensor):
                                             # pose_delta: [6] 或 [7] - [rotation(3 or 4), translation(3)]
                                             if pose_delta.numel() >= 6:
