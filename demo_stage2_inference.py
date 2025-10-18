@@ -709,151 +709,6 @@ def create_clustering_visualization_from_matched_results(matched_clustering_resu
         return vggt_batch["images"][0]  # [S, 3, H, W]
 
 
-def extract_and_cluster_dynamic_objects(preds, vggt_batch, conf, interval, velocity_threshold=0.01, eps=0.1, min_samples=10, position_threshold=1.0, velocity_threshold_match=0.5, fusion_alpha=0.7, area_threshold=100):
-    """
-    提取点云和速度数据，并进行动态物体聚类
-
-    Args:
-        preds: 模型预测结果
-        vggt_batch: VGGT批次数据
-        conf: 置信度掩码
-        interval: 帧间隔
-        其他参数: 聚类和匹配参数
-
-    Returns:
-        dict: 包含动态聚类可视化的字典
-    """
-    try:
-        B, S, C, image_height, image_width = vggt_batch["images"].shape
-        print(f"Processing batch: B={B}, S={S}, H={image_height}, W={image_width}")
-
-        # 提取点云和速度数据
-        xyz = preds["pts3d"]  # [B, S, H, W, 3]
-        print(f"Point cloud shape: {xyz.shape}")
-
-        # 获取位姿编码用于速度变换
-        extrinsic, intrinsic = pose_encoding_to_extri_intri(preds["pose_enc"], vggt_batch["images"].shape[-2:])
-        extrinsic = torch.cat([extrinsic, torch.tensor([0, 0, 0, 1], device=extrinsic.device)[None,None,None,:].repeat(1,extrinsic.shape[1],1,1)], dim=-2)
-        extrinsic_inv = torch.linalg.inv(extrinsic)
-
-        # 检查是否有速度数据
-        if "velocity" in preds:
-            velocity = preds["velocity"]
-            print(f"Velocity found in preds, shape: {velocity.shape}")
-
-            # 应用与demo_video.py相同的速度变换
-            velocity = torch.sign(velocity) * (torch.exp(torch.abs(velocity)) - 1)
-        else:
-            print("No velocity in preds, generating synthetic velocity from consecutive frames")
-            # 从连续帧中计算类似速度的信息
-            if S > 1:
-                # 使用相邻帧之间的位置差异作为"速度"
-                velocity = torch.zeros_like(xyz)
-                for s in range(S-1):
-                    velocity[0, s] = xyz[0, s+1] - xyz[0, s]
-                # 最后一帧使用第二到最后一帧的差异
-                if S > 1:
-                    velocity[0, -1] = velocity[0, -2]
-            else:
-                velocity = torch.zeros_like(xyz)
-
-        if B > 0 and S > 0:
-            # 重塑为聚类所需的格式
-            xyz = xyz[0].view(S, -1, 3)  # [S, H*W, 3]
-            velocity = velocity[0].view(S, -1, 3)  # [S, H*W, 3]
-
-            # 将速度从局部坐标系转换到全局坐标系（与demo_video.py一致）
-            if "velocity" in preds:
-                velocity = velocity_local_to_global(velocity.reshape(-1, 3), extrinsic_inv).reshape(S, image_height * image_width, 3)
-            print(f"Reshaped - xyz: {xyz.shape}, velocity: {velocity.shape}")
-
-            # 检查数据的有效性
-            valid_xyz = torch.isfinite(xyz).all(dim=-1)  # [S, H*W]
-            valid_velocity = torch.isfinite(velocity).all(dim=-1)  # [S, H*W]
-            valid_points_per_frame = valid_xyz.sum(dim=-1)  # [S]
-            print(f"Valid points per frame: {valid_points_per_frame.tolist()}")
-
-            velocity_magnitudes = torch.norm(velocity, dim=-1)  # [S, H*W]
-            non_zero_velocity_per_frame = (velocity_magnitudes > 1e-6).sum(dim=-1)  # [S]
-            print(f"Non-zero velocity points per frame: {non_zero_velocity_per_frame.tolist()}")
-
-            # 对每一帧进行动态物体聚类
-            print(f"开始动态物体聚类... (velocity_threshold={velocity_threshold}, eps={eps}, min_samples={min_samples}, area_threshold={area_threshold})")
-            clustering_results = dynamic_object_clustering(xyz, velocity, velocity_threshold=velocity_threshold, eps=eps, min_samples=min_samples, area_threshold=area_threshold)
-
-
-            # 跨帧匹配动态物体
-            print(f"开始跨帧物体匹配... (position_threshold={position_threshold}, velocity_threshold_match={velocity_threshold_match})")
-            clustering_results = match_objects_across_frames(clustering_results, position_threshold=position_threshold, velocity_threshold=velocity_threshold_match)
-
-            # 统计跟踪结果
-            total_objects = 0
-            for frame_idx, result in enumerate(clustering_results):
-                global_ids = result.get('global_ids', [])
-                # 过滤掉-1值，只统计有效的全局ID
-                valid_global_ids = [gid for gid in global_ids if gid != -1]
-                total_objects = max(total_objects, len(valid_global_ids))
-                print(f"帧 {frame_idx}: 检测到 {result['num_clusters']} 个动态物体，全局ID: {valid_global_ids}")
-
-            print(f"总共跟踪到 {total_objects} 个不同的动态物体")
-
-            # 生成可视化颜色
-            colored_results = visualize_clustering_results(clustering_results, num_colors=20)
-
-            # 调试信息：检查聚类结果
-    
-            # 将聚类结果与源RGB图像融合
-            clustering_images = []
-            for frame_idx, colored_result in enumerate(colored_results):
-                # 获取源RGB图像
-                source_rgb = vggt_batch["images"][0, frame_idx].permute(1, 2, 0)  # [H, W, 3]
-                source_rgb = (source_rgb * 255).cpu().numpy().astype(np.uint8)  # 转换为0-255范围
-
-                # 检查是否有动态物体
-                if colored_result['num_clusters'] > 0:
-                    # 将点云颜色重塑为图像格式
-                    point_colors = colored_result['colors']  # [H*W, 3]
-                    clustering_image = point_colors.reshape(image_height, image_width, 3)  # [H, W, 3]
-
-                    # 融合：将动态聚类结果叠加到源RGB图像上
-                    # 只有非黑色（非静态）的点才覆盖源图像
-                    mask = np.any(clustering_image > 0, axis=2)  # [H, W] 布尔掩码，True表示动态点
-                    mask = mask[:, :, np.newaxis]  # [H, W, 1] 扩展维度
-
-                    # 透明度混合：动态点使用聚类颜色与源RGB混合，静态点使用源RGB
-                    fused_image = np.where(mask,
-                                         (fusion_alpha * clustering_image + (1 - fusion_alpha) * source_rgb).astype(np.uint8),
-                                         source_rgb)
-                else:
-                    # 没有动态物体时，显示源RGB图像并添加文本提示
-                    fused_image = source_rgb.copy()
-                    # 在图像上添加文本提示
-                    cv2.putText(fused_image, "No Dynamic Objects", (10, 30),
-                               cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
-
-                clustering_images.append(fused_image)
-
-    
-            # 转换为tensor格式
-            clustering_tensor = torch.stack([torch.from_numpy(img) for img in clustering_images], dim=0)  # [S, H, W, 3]
-            clustering_tensor = clustering_tensor.permute(0, 3, 1, 2)  # [S, 3, H, W]
-
-            return {
-                "dynamic_clustering": clustering_tensor,
-                "clustering_info": [{"num_clusters": result['num_clusters']} for result in colored_results]
-            }
-    except Exception as e:
-        print(f"动态聚类处理出错: {e}")
-        # 返回空的聚类结果
-        S = vggt_batch["images"].shape[1]
-        H, W = vggt_batch["images"].shape[-2:]
-        empty_tensor = torch.zeros(S, 3, H, W)
-        return {
-            "dynamic_clustering": empty_tensor,
-            "clustering_info": [{"num_clusters": 0} for _ in range(S)]
-        }
-
-
 def parse_seq_path(p):
     """解析序列路径（复用demo_video.py的逻辑）"""
     if os.path.isdir(p):
@@ -911,6 +766,14 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
             vggt_batch["images"]
         )
     stage1_pred_time = time.time() - start_time
+
+    # Stage1的VGGT输出的velocity前三行容易出现异常，直接置零
+    if 'velocity' in stage1_preds and stage1_preds['velocity'] is not None:
+        velocity = stage1_preds['velocity']  # [B, S, H, W, 3]
+        if velocity.dim() == 5 and velocity.shape[2] >= 3:
+            print(f"Applying velocity patch: zeroing top 3 rows (shape: {velocity.shape})")
+            velocity[:, :, :5, :, :] = 0.0
+            stage1_preds['velocity'] = velocity
 
     # 生成动态聚类可视化
     start_time = time.time()

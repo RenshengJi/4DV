@@ -201,10 +201,6 @@ class OnlineStage2Trainer:
         if self.memory_efficient and torch.cuda.is_available():
             initial_memory = torch.cuda.memory_allocated() / 1024**2  # MB
 
-        # 初始化状态标志（用于DDP同步）
-        has_error = torch.tensor([0], dtype=torch.long, device=self.device)
-        has_objects = torch.tensor([1], dtype=torch.long, device=self.device)
-
         try:
             # 实时处理动态物体
             dynamic_objects_data = self.dynamic_processor.process_dynamic_objects(
@@ -224,19 +220,10 @@ class OnlineStage2Trainer:
                       f"Total: {dynamic_objects_data.get('processing_time', 0):.3f}s | "
                       f"Objects: {num_objects}")
 
+            # 【修改】每个进程独立判断，不再强制同步
+            # 如果当前进程没有物体，直接返回零损失（不影响其他进程）
             if num_objects == 0:
-                has_objects[0] = 0
-                if is_main_process:
-                    print(f"No dynamic objects found in iteration {iteration}")
-
-            # DDP同步：确保所有进程知道是否有物体
-            if is_distributed:
-                dist.all_reduce(has_objects, op=dist.ReduceOp.MIN)
-
-            # 如果所有进程都没有物体，统一返回零损失
-            if has_objects[0] == 0:
-                # 【关键修复】创建一个带梯度的零损失（连接到计算图）
-                # 使用stage2模型的某个参数创建一个零损失，确保有grad_fn
+                # 创建一个带梯度的零损失（连接到计算图）
                 dummy_param = next(self.stage2_model.parameters())
                 zero_loss = (dummy_param * 0.0).sum()  # 这个tensor有grad_fn，可以backward
                 return zero_loss, {
@@ -247,13 +234,11 @@ class OnlineStage2Trainer:
                     'stage2_skipped': True  # 标记为跳过，用于过滤tensorboard日志
                 }
 
-            # 【关键修复】预先验证动态物体数据的合法性（避免spconv SIGABRT）
+            # 【修改】预先验证动态物体数据的合法性（避免spconv SIGABRT）
+            # 每个进程独立判断，验证失败时只跳过当前进程
             if not self._validate_dynamic_objects(dynamic_objects_data):
                 if is_main_process:
-                    print(f"[WARNING] Stage2 validation failed at iteration {iteration}, skipping")
-                has_error[0] = 1
-                if is_distributed:
-                    dist.all_reduce(has_error, op=dist.ReduceOp.MAX)
+                    print(f"[WARNING] Stage2 validation failed at iteration {iteration}, skipping this GPU")
                 # 创建带梯度的零损失
                 dummy_param = next(self.stage2_model.parameters())
                 zero_loss = (dummy_param * 0.0).sum()
@@ -274,18 +259,14 @@ class OnlineStage2Trainer:
                         dynamic_objects_data, vggt_batch, preds
                     )
             except Exception as forward_error:
-                # 捕获前向传播中的任何错误（CUDA OOM、渲染失败等）
+                # 【修改】捕获前向传播中的任何错误（CUDA OOM、渲染失败等）
+                # 每个进程独立处理错误，不强制同步
                 if is_main_process:
                     print(f"ERROR in _run_stage2_forward at iteration {iteration}: {forward_error}")
                     import traceback
                     print(f"Forward error traceback: {traceback.format_exc()}")
 
-                # 标记错误并同步到所有进程
-                has_error[0] = 1
-                if is_distributed:
-                    dist.all_reduce(has_error, op=dist.ReduceOp.MAX)
-
-                # 统一返回零损失（带梯度）
+                # 返回零损失（带梯度），只影响当前GPU
                 dummy_param = next(self.stage2_model.parameters())
                 zero_loss = (dummy_param * 0.0).sum()
                 return zero_loss, {
@@ -296,10 +277,8 @@ class OnlineStage2Trainer:
                     'stage2_skipped': True  # 标记为跳过
                 }
 
-            # 【关键修复】DDP同步：确保所有进程都完成forward后再返回
-            # 这防止快的进程继续到backward而慢的进程还在forward，导致死锁
-            if is_distributed:
-                dist.barrier()
+            # 【修改】移除barrier，允许不同GPU独立推进
+            # DDP的梯度同步会在backward时自动处理，不需要显式barrier
 
             # 更新统计信息
             self.stage2_iteration_count += 1
@@ -354,19 +333,13 @@ class OnlineStage2Trainer:
             return return_loss, return_dict
 
         except Exception as e:
+            # 【修改】外层异常捕获，每个进程独立处理，不强制同步
             import traceback
             if is_main_process:
                 print(f"Error in stage2 processing at epoch {epoch}, iter {iteration}: {e}")
                 print(f"Traceback: {traceback.format_exc()}")
 
-            # 标记错误
-            has_error[0] = 1
-
-            # DDP同步：确保所有进程知道有错误
-            if is_distributed:
-                dist.all_reduce(has_error, op=dist.ReduceOp.MAX)
-
-            # 所有进程统一返回零损失（带梯度）
+            # 返回零损失（带梯度），只影响当前GPU
             dummy_param = next(self.stage2_model.parameters())
             zero_loss = (dummy_param * 0.0).sum()
             return zero_loss, {

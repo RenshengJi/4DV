@@ -903,7 +903,6 @@ class OpticalFlowRegistration:
         """
         # 如果使用velocity-based变换方法，跳过光流计算
         if self.use_velocity_based_transform:
-            print("  使用velocity-based方法，跳过光流计算")
             return {}
 
         B, S, C, H, W = vggt_batch["images"].shape

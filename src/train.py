@@ -444,19 +444,14 @@ def train(args):
     if online_stage2_trainer is not None and online_stage2_trainer.enable_stage2:
         stage2_params = online_stage2_trainer.get_stage2_parameters()
         if stage2_params:
-            # 为第二阶段参数创建单独的参数组（使用较小的学习率）
-            stage2_lr = getattr(args, 'stage2_learning_rate', args.lr * 0.1)  # 第二阶段使用更小的学习率
-            # 直接创建参数组，stage2_params是参数列表
-            if stage2_params:  # 确保参数列表不为空
-                stage2_param_groups = [{
-                    'params': stage2_params,
-                    'lr': stage2_lr,
-                    'weight_decay': getattr(args, 'stage2_weight_decay', args.weight_decay * 0.5),
-                    'name': 'stage2_params'
-                }]
+            # 为第二阶段参数创建参数组（使用全局学习率和权重衰减）
+            stage2_param_groups = [{
+                'params': stage2_params,
+                'name': 'stage2_params'
+            }]
 
-                param_groups.extend(stage2_param_groups)
-                printer.info(f"Added {len(stage2_params)} Stage2 parameters to optimizer with lr={stage2_lr}")
+            param_groups.extend(stage2_param_groups)
+            printer.info(f"Added {len(stage2_params)} Stage2 parameters to optimizer")
 
     # 如果主模型参数组为空（例如全部冻结），但有stage2参数，仍可创建优化器
     if not param_groups:
@@ -990,6 +985,16 @@ def train(args):
                 if (online_stage2_trainer is not None and
                     getattr(args, 'enable_stage2', False) and
                     epoch >= getattr(args, 'stage2_start_epoch', 10)):
+                    # 【打补丁】修复velocity map前三行的异常高速度问题
+                    # Stage1的VGGT输出的velocity前三行容易出现异常，直接置零
+                    if 'velocity' in preds and preds['velocity'] is not None:
+                        velocity = preds['velocity']  # [B, S, H, W, 3]
+                        if velocity.dim() == 5 and velocity.shape[2] >= 3:
+                            # 将前三行的速度向量置为0 (所有3个分量: vx, vy, vz)
+                            velocity[:, :, :5, :, :] = 0.0  # TODO: 解决丑陋的补丁
+                            # 更新preds（如果velocity不是inplace修改）
+                            preds['velocity'] = velocity
+
                     # Stage2处理（已内置DDP同步，不会导致卡住）
                     stage2_loss, stage2_loss_dict = online_stage2_trainer.process_stage1_outputs(
                         preds=preds,

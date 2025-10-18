@@ -179,7 +179,7 @@ warmup_epochs: 0.1                         # 第二阶段使用较短的warmup
 amp: 1
 
 # 第二阶段专用学习率配置（由于vggt_freeze_strategy=all，只有stage2参数会被训练）
-stage2_learning_rate: 5e-4                # 第二阶段学习率用于refiner精细化（✓ 实际生效的学习率）
+stage2_learning_rate: 5e-2                # 第二阶段学习率用于refiner精细化（✓ 实际生效的学习率）
 stage2_weight_decay: 0.005                # 第二阶段权重衰减（✓ 实际生效的weight decay）
 
 # =============== 训练监控配置 ===============

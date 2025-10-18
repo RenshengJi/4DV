@@ -116,7 +116,7 @@ def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, 
                 dynamic_points_cp = cp.asarray(dynamic_points.detach().cpu().numpy())
 
             # 执行cuML DBSCAN聚类（GPU加速）
-            dbscan = DBSCAN(eps=eps, min_samples=min_samples)
+            dbscan = DBSCAN(eps=eps, min_samples=min_samples, max_mbytes_per_batch=128)
             cluster_labels_cp = dbscan.fit_predict(dynamic_points_cp)
 
             # 转换回NumPy数组
@@ -823,11 +823,6 @@ class OnlineDynamicProcessor:
             # 分离张量梯度以便在聚类中使用numpy
             xyz_detached = xyz.detach()
             velocity_detached = velocity_reshaped.detach()
-
-            _print_main(f"[Clustering Debug] gt_scale: {gt_scale}")
-            _print_main(f"[Clustering Debug] Velocity range before metric conversion: [{velocity_detached.min().item():.6f}, {velocity_detached.max().item():.6f}]")
-            _print_main(f"[Clustering Debug] Velocity mean magnitude: {torch.norm(velocity_detached, dim=-1).mean().item():.6f}")
-            _print_main(f"[Clustering Debug] velocity_threshold (metric): {self.velocity_threshold}")
 
             clustering_results = dynamic_object_clustering(
                 xyz_detached,  # [S, H*W, 3]

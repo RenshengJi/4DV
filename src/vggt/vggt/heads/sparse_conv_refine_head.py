@@ -261,9 +261,8 @@ def points_to_voxels(points: torch.Tensor, features: torch.Tensor, voxel_size: f
     num_points_per_voxel = torch.zeros(num_voxels, device=device, dtype=torch.long)
     num_points_per_voxel.scatter_add_(0, inverse_indices, torch.ones(N, device=device, dtype=torch.long))
 
-    # 获取唯一体素坐标 - 使用scatter，确保int32类型
+    # 获取唯一体素坐标 - 使用int32类型（spconv要求）
     voxel_coords_unique = torch.zeros((num_voxels, 4), device=device, dtype=torch.int32)
-    # 为每个唯一体素找到第一个对应的点
     sorted_indices, sort_order = inverse_indices.sort()
     unique_positions = torch.cat([torch.tensor([0], device=device), (sorted_indices[1:] != sorted_indices[:-1]).nonzero(as_tuple=True)[0] + 1])
     voxel_coords_unique = voxel_coords_with_batch[sort_order[unique_positions]].to(torch.int32)
@@ -333,10 +332,16 @@ class GaussianRefineHeadSparseConv(nn.Module):
             self.receptive_field_voxels = receptive_field
             self.receptive_field_meters = receptive_field * voxel_size
 
-        # 输出头
+        # 输出头 - 增强版（Plan C）
         self.output_head = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim // 2),
+            nn.Linear(feature_dim, feature_dim),
+            nn.LayerNorm(feature_dim),
             nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
+            nn.Linear(feature_dim, feature_dim // 2),
+            nn.LayerNorm(feature_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
             nn.Linear(feature_dim // 2, output_gaussian_dim)
         )
 
@@ -348,7 +353,7 @@ class GaussianRefineHeadSparseConv(nn.Module):
         # 获取输出头的最后一层
         final_layer = self.output_head[-1]
         # 权重初始化为很小的值
-        nn.init.normal_(final_layer.weight, mean=0.0, std=0.00001)
+        nn.init.normal_(final_layer.weight, mean=0.0, std=0.0001)
         # bias初始化为零
         if final_layer.bias is not None:
             nn.init.zeros_(final_layer.bias)
@@ -457,9 +462,13 @@ class GaussianRefineHeadSparseConv(nn.Module):
             dummy_param = next(self.parameters())
             return torch.zeros_like(gaussian_params) + dummy_param.sum() * 0.0
 
-        # 6. 从体素特征还原到点特征
+        # 6. 从体素特征还原到点特征（使用残差连接保留原始点特征）
         voxel_features_out = sparse_output.features  # [M, feature_dim]
-        point_features_out = voxel_features_out[inverse_indices]  # [N, feature_dim]
+        point_features_voxel = voxel_features_out[inverse_indices]  # [N, feature_dim]
+
+        # 【关键改进】残差连接：加回原始点特征，保留voxel内的点级差异
+        # 这样同一voxel内的点不会得到完全相同的delta
+        point_features_out = point_features_voxel + point_features  # [N, feature_dim]
 
         # 7. 输出头 - 直接返回delta
         delta = self.output_head(point_features_out)  # [N, output_dim]
@@ -557,7 +566,7 @@ class PoseRefineHeadSparseConv(nn.Module):
         # 显式建模source-target对应关系，学习哪些点对匹配
         self.cross_attention = CrossAttentionFusion(
             feature_dim=feature_dim,
-            num_heads=4,  # 4个注意力头
+            num_heads=12,  # 增加到12个注意力头（Plan C）
             dropout=0.1   # 轻微dropout防止过拟合
         )
 
@@ -578,12 +587,12 @@ class PoseRefineHeadSparseConv(nn.Module):
         self._init_output_weights()
 
     def _init_output_weights(self):
-        """初始化输出层权重为接近零的值，使得初始时网络输出的delta很小"""
+        """初始化输出层权重为接近零的值，使得初始时网络输出的增量很小"""
         # 获取位姿预测头的最后一层
         final_layer = self.pose_head[-1]
         # 权重初始化为很小的值
-        nn.init.normal_(final_layer.weight, mean=0.0, std=0.00001)
-        # bias初始化为零
+        nn.init.normal_(final_layer.weight, mean=0.0, std=0.0001)
+        # bias初始化为零（因为我们在forward中使用残差形式，这里不需要特殊初始化）
         if final_layer.bias is not None:
             nn.init.zeros_(final_layer.bias)
 
@@ -719,9 +728,19 @@ class PoseRefineHeadSparseConv(nn.Module):
         # 将双向的注意力特征拼接，提供更丰富的对应关系信息
         combined_feature = torch.cat([source_to_target, target_to_source], dim=0)  # [4*feature_dim]
 
-        # 6. 位姿预测
-        # 基于双向对应关系，预测pose delta
-        pose_delta = self.pose_head(combined_feature)  # [9]: 6D rotation + 3D translation
+        # 6. 位姿预测（残差形式）
+        # 基于双向对应关系，预测pose delta的增量
+        pose_delta_increment = self.pose_head(combined_feature)  # [9]: 6D rotation + 3D translation
+
+        # 残差连接：基准（单位旋转+零平移）+ 网络预测的增量
+        # 这样即使网络输出接近零，最终的pose_delta也能对应单位旋转
+        # 提高训练初期的稳定性
+        base_pose = torch.tensor(
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],  # 单位6D旋转 + 零平移
+            device=combined_feature.device,
+            dtype=combined_feature.dtype
+        )
+        pose_delta = base_pose + pose_delta_increment
 
         return pose_delta
 
@@ -753,10 +772,22 @@ class PoseRefineHeadSparseConv(nn.Module):
         rotation_6d = pose_delta[:6]  # [6]
         translation = pose_delta[6:]  # [3]
 
+        # 【安全性检查】如果pose_delta接近零（训练初期常见），直接返回initial_transform
+        if torch.abs(rotation_6d).max() < 1e-6 and torch.abs(translation).max() < 1e-6:
+            return initial_transform.clone()
+
         # 6D旋转 → 旋转矩阵 (Gram-Schmidt正交化)
         # 将6D向量重塑为2个3D向量
         a1 = rotation_6d[:3]  # [3]
         a2 = rotation_6d[3:6]  # [3]
+
+        # 【安全性检查】检查a1是否为零向量
+        a1_norm = torch.norm(a1)
+        if a1_norm < 1e-8:
+            # 如果旋转接近零，只应用平移
+            delta_transform = torch.eye(4, device=device, dtype=pose_delta.dtype)
+            delta_transform[:3, 3] = translation
+            return torch.matmul(delta_transform, initial_transform)
 
         # Gram-Schmidt正交化
         # b1 = normalize(a1)
@@ -765,6 +796,15 @@ class PoseRefineHeadSparseConv(nn.Module):
         # b2 = normalize(a2 - (a2·b1)b1)
         dot_product = (b1 * a2).sum()
         b2 = a2 - dot_product * b1
+
+        # 【安全性检查】检查b2是否为零向量（a1和a2共线）
+        b2_norm = torch.norm(b2)
+        if b2_norm < 1e-8:
+            # 如果a1和a2共线，只应用平移
+            delta_transform = torch.eye(4, device=device, dtype=pose_delta.dtype)
+            delta_transform[:3, 3] = translation
+            return torch.matmul(delta_transform, initial_transform)
+
         b2 = F.normalize(b2, dim=0, eps=1e-8)
 
         # b3 = b1 × b2 (叉积得到第三个正交向量)
@@ -774,7 +814,7 @@ class PoseRefineHeadSparseConv(nn.Module):
         rotation_matrix = torch.stack([b1, b2, b3], dim=1)  # [3, 3]
 
         # 构建增量变换矩阵
-        delta_transform = torch.eye(4, device=device)
+        delta_transform = torch.eye(4, device=device, dtype=pose_delta.dtype)
         delta_transform[:3, :3] = rotation_matrix
         delta_transform[:3, 3] = translation
 

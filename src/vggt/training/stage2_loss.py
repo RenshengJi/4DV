@@ -100,8 +100,10 @@ class Stage2RenderLoss(nn.Module):
         B, S, C, H, W = gt_images.shape
         device = gt_images.device
 
-        total_rgb_loss = torch.tensor(0.0, device=device)
-        total_depth_loss = torch.tensor(0.0, device=device)
+        # 初始化loss为None，后续累加
+        total_rgb_loss = None
+        total_depth_loss = None
+        num_valid_frames = 0
 
         rendered_images = []
         rendered_depths = []
@@ -137,11 +139,17 @@ class Stage2RenderLoss(nn.Module):
                 mask = mask & (~sky_mask_frame)  # 排除sky区域
 
             # RGB损失
-            rgb_loss = F.l1_loss(
-                rendered_rgb[mask.unsqueeze(0).repeat(3, 1, 1)],
-                frame_gt_image[mask.unsqueeze(0).repeat(3, 1, 1)]
-            )
-            total_rgb_loss += rgb_loss
+            if mask.sum() > 0:  # 确保有有效像素
+                rgb_loss = F.l1_loss(
+                    rendered_rgb[mask.unsqueeze(0).repeat(3, 1, 1)],
+                    frame_gt_image[mask.unsqueeze(0).repeat(3, 1, 1)]
+                )
+                # 累加loss
+                if total_rgb_loss is None:
+                    total_rgb_loss = rgb_loss
+                else:
+                    total_rgb_loss = total_rgb_loss + rgb_loss
+                num_valid_frames += 1
 
             # 深度损失 - 仅在权重大于0时计算
             if self.depth_weight > 0:
@@ -157,15 +165,48 @@ class Stage2RenderLoss(nn.Module):
                         rendered_depth[depth_mask],
                         frame_gt_depth[depth_mask]
                     )
-                    total_depth_loss += depth_loss
+                    # 累加loss
+                    if total_depth_loss is None:
+                        total_depth_loss = depth_loss
+                    else:
+                        total_depth_loss = total_depth_loss + depth_loss
 
-        # 平均损失
-        num_frames = max(S, 1)
+        # 平均损失并确保有grad_fn
+        # 如果没有有效的dynamic区域，需要创建一个dummy loss以保持梯度流
+        if total_rgb_loss is None:
+            # 没有任何dynamic像素，创建一个与模型参数连接的零loss
+            # 这样backward不会报错，但梯度为零
+            # 从refined_scene中获取一个参数作为anchor
+            dummy_param = None
+            if 'dynamic_objects' in refined_scene and len(refined_scene['dynamic_objects']) > 0:
+                for obj_data in refined_scene['dynamic_objects']:
+                    if 'canonical_gaussians' in obj_data and obj_data['canonical_gaussians'] is not None:
+                        dummy_param = obj_data['canonical_gaussians']
+                        break
+
+            if dummy_param is not None and dummy_param.requires_grad:
+                # 创建一个连接到模型参数的零loss
+                total_rgb_loss = (dummy_param.sum() * 0.0)
+            else:
+                # 如果找不到参数，使用requires_grad的tensor
+                total_rgb_loss = torch.zeros(1, device=device, requires_grad=True).sum()
+
+            num_valid_frames = max(S, 1)
+
+        # 构建loss字典
+        avg_rgb_loss = total_rgb_loss / num_valid_frames if num_valid_frames > 0 else total_rgb_loss
 
         loss_dict = {
-            'stage2_rgb_loss': self.rgb_weight * (total_rgb_loss / num_frames),
-            'stage2_depth_loss': torch.tensor(0.0, device=device) if self.depth_weight == 0 else self.depth_weight * (total_depth_loss / num_frames),
+            'stage2_rgb_loss': self.rgb_weight * avg_rgb_loss,
         }
+
+        # Depth loss
+        if self.depth_weight > 0 and total_depth_loss is not None:
+            avg_depth_loss = total_depth_loss / num_valid_frames if num_valid_frames > 0 else total_depth_loss
+            loss_dict['stage2_depth_loss'] = self.depth_weight * avg_depth_loss
+        else:
+            # 使用rgb_loss作为anchor创建零depth loss
+            loss_dict['stage2_depth_loss'] = avg_rgb_loss * 0.0
 
         # 总损失
         total_loss = sum(loss_dict.values())
@@ -259,7 +300,7 @@ class Stage2RenderLoss(nn.Module):
         all_opacities = []
         all_colors = []
 
-        # # 静态Gaussian：所有帧都使用完整的静态背景
+        # 静态Gaussian：所有帧都使用完整的静态背景
         if refined_scene.get('static_gaussians') is not None:
             static_gaussians = refined_scene['static_gaussians']
             if static_gaussians.shape[0] > 0:
@@ -606,9 +647,23 @@ class Stage2RenderLoss(nn.Module):
         rotation_6d = pose_delta[:6]  # [6]
         translation = pose_delta[6:9]  # [3]
 
+        # 【安全性检查】如果pose_delta接近零（训练初期常见），返回单位矩阵
+        if torch.abs(rotation_6d).max() < 1e-6:
+            transform = torch.eye(4, device=device, dtype=pose_delta.dtype)
+            transform[:3, 3] = translation  # 仍然应用平移
+            return transform
+
         # 6D旋转 → 旋转矩阵 (Gram-Schmidt正交化)
         a1 = rotation_6d[:3]  # [3]
         a2 = rotation_6d[3:6]  # [3]
+
+        # 【安全性检查】检查a1是否为零向量
+        a1_norm = torch.norm(a1)
+        if a1_norm < 1e-8:
+            # 如果a1接近零，使用单位矩阵
+            transform = torch.eye(4, device=device, dtype=pose_delta.dtype)
+            transform[:3, 3] = translation
+            return transform
 
         # Gram-Schmidt正交化
         import torch.nn.functional as F
@@ -616,6 +671,15 @@ class Stage2RenderLoss(nn.Module):
 
         dot_product = (b1 * a2).sum()
         b2 = a2 - dot_product * b1
+
+        # 【安全性检查】检查b2是否为零向量（a1和a2共线）
+        b2_norm = torch.norm(b2)
+        if b2_norm < 1e-8:
+            # 如果a1和a2共线，使用单位矩阵
+            transform = torch.eye(4, device=device, dtype=pose_delta.dtype)
+            transform[:3, 3] = translation
+            return transform
+
         b2 = F.normalize(b2, dim=0, eps=1e-8)
 
         b3 = torch.cross(b1, b2, dim=0)
@@ -624,7 +688,7 @@ class Stage2RenderLoss(nn.Module):
         R = torch.stack([b1, b2, b3], dim=1)  # [3, 3]
 
         # 构建4x4变换矩阵
-        transform = torch.eye(4, device=device)
+        transform = torch.eye(4, device=device, dtype=pose_delta.dtype)
         transform[:3, :3] = R
         transform[:3, 3] = translation
 
