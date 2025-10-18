@@ -116,7 +116,7 @@ def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, 
                 dynamic_points_cp = cp.asarray(dynamic_points.detach().cpu().numpy())
 
             # 执行cuML DBSCAN聚类（GPU加速）
-            dbscan = DBSCAN(eps=eps, min_samples=min_samples, max_mbytes_per_batch=128)
+            dbscan = DBSCAN(eps=eps, min_samples=min_samples)
             cluster_labels_cp = dbscan.fit_predict(dynamic_points_cp)
 
             # 转换回NumPy数组
@@ -947,6 +947,14 @@ class OnlineDynamicProcessor:
                         for frame_idx in range(max_frame + 1):
                             frame_existence.append(frame_idx in object_frames)
 
+                        # 提取每帧的pixel indices用于创建dynamic mask
+                        point_indices = aggregated_object.get('point_indices', [])
+                        frame_pixel_indices = {}  # {frame_idx: [pixel_idx1, pixel_idx2, ...]}
+                        for frame_idx, pixel_idx in point_indices:
+                            if frame_idx not in frame_pixel_indices:
+                                frame_pixel_indices[frame_idx] = []
+                            frame_pixel_indices[frame_idx].append(pixel_idx)
+
                         # 转换为我们需要的格式 - 直接构建Stage2Loss期望的结构
                         dynamic_objects.append({
                             'object_id': global_id,
@@ -955,6 +963,7 @@ class OnlineDynamicProcessor:
                             'frame_transforms': frame_transforms,  # 其他帧和正规空间帧的transform
                             'frame_existence': torch.tensor(frame_existence, dtype=torch.bool, device=self.device),
                             'frame_gaussians': aggregated_object.get('frame_gaussians', {}),  # 新增：每帧的原始Gaussian参数
+                            'frame_pixel_indices': frame_pixel_indices,  # 新增：每帧的2D pixel索引用于创建mask
                             # 保留原始数据供调试使用
                             'aggregated_points': aggregated_object.get('aggregated_points'),
                             'aggregated_colors': aggregated_object.get('aggregated_colors'),

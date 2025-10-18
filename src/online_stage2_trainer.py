@@ -142,13 +142,15 @@ class OnlineStage2Trainer:
         render_loss_config = {
             'rgb_weight': config.get('stage2_rgb_loss_weight', 0.5),  # 修正：使用stage2_前缀的键名
             'depth_weight': config.get('stage2_depth_loss_weight', 0.0),  # 修正：使用stage2_前缀的键名
+            'render_only_dynamic': config.get('stage2_render_only_dynamic', False),  # 是否只渲染动态物体
+            'supervise_only_dynamic': config.get('stage2_supervise_only_dynamic', False),  # 是否只监督动态区域
         }
 
         criterion = Stage2CompleteLoss(
             render_loss_config=render_loss_config
         )
         criterion.to(self.device)
-        
+
         return criterion
     
     def set_optimizer(self, optimizer: torch.optim.Optimizer):

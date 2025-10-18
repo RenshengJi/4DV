@@ -26,6 +26,61 @@ def check_and_fix_inf_nan(tensor: torch.Tensor, name: str = "tensor") -> torch.T
     return tensor
 
 
+def create_dynamic_mask_from_pixel_indices(
+    dynamic_objects: list,
+    frame_idx: int,
+    height: int,
+    width: int
+) -> torch.Tensor:
+    """
+    从动态物体的2D pixel indices创建dynamic mask
+
+    Args:
+        dynamic_objects: 动态物体列表，每个包含frame_pixel_indices
+        frame_idx: 当前帧索引
+        height, width: 图像尺寸
+
+    Returns:
+        mask: [H, W] 布尔mask，True表示动态区域
+    """
+    # 使用第一个物体的device（假设所有物体在同一device上）
+    device = None
+    for obj_data in dynamic_objects:
+        if 'canonical_gaussians' in obj_data and obj_data['canonical_gaussians'] is not None:
+            device = obj_data['canonical_gaussians'].device
+            break
+
+    if device is None:
+        device = torch.device('cpu')
+
+    mask = torch.zeros(height, width, device=device, dtype=torch.bool)
+
+    for obj_data in dynamic_objects:
+        # 获取该物体在当前帧的pixel indices
+        frame_pixel_indices = obj_data.get('frame_pixel_indices', {})
+        if frame_idx not in frame_pixel_indices:
+            continue
+
+        pixel_indices = frame_pixel_indices[frame_idx]
+        if not pixel_indices:
+            continue
+
+        # 将1D pixel indices (0 to H*W-1) 转换为2D坐标 (v, u)
+        pixel_indices_tensor = torch.tensor(pixel_indices, dtype=torch.long, device=device)
+        v_coords = pixel_indices_tensor // width  # 行坐标
+        u_coords = pixel_indices_tensor % width   # 列坐标
+
+        # 过滤在图像范围内的坐标
+        valid = (v_coords >= 0) & (v_coords < height) & (u_coords >= 0) & (u_coords < width)
+        v_valid = v_coords[valid]
+        u_valid = u_coords[valid]
+
+        # 在mask上标记这些像素
+        mask[v_valid, u_valid] = True
+
+    return mask
+
+
 def depth_to_world_points(depth, intrinsic):
     """
     将深度图转换为世界坐标系下的3D点
@@ -66,11 +121,15 @@ class Stage2RenderLoss(nn.Module):
     def __init__(
         self,
         rgb_weight: float = 1.0,
-        depth_weight: float = 0.0  # 禁用depth loss
+        depth_weight: float = 0.0,  # 禁用depth loss
+        render_only_dynamic: bool = False,  # 是否只渲染动态物体
+        supervise_only_dynamic: bool = False  # 是否只监督动态区域
     ):
         super().__init__()
         self.rgb_weight = rgb_weight
         self.depth_weight = depth_weight
+        self.render_only_dynamic = render_only_dynamic
+        self.supervise_only_dynamic = supervise_only_dynamic
 
     def forward(
         self,
@@ -118,16 +177,31 @@ class Stage2RenderLoss(nn.Module):
 
             # 渲染当前帧
             rendered_rgb, rendered_depth = self._render_frame(
-                refined_scene, frame_intrinsic, frame_extrinsic, H, W, frame_idx
+                refined_scene, frame_intrinsic, frame_extrinsic, H, W, frame_idx,
+                render_only_dynamic=self.render_only_dynamic  # 使用配置参数
             )
             rendered_images.append(rendered_rgb)
             rendered_depths.append(rendered_depth)
 
-            # 计算frame mask
-            if frame_masks is not None:
-                mask = frame_masks[0, frame_idx]  # [H, W]
+            # 计算监督区域的mask
+            if self.supervise_only_dynamic:
+                # 创建dynamic mask：只监督动态物体区域
+                dynamic_objects = refined_scene.get('dynamic_objects', [])
+                dynamic_mask = create_dynamic_mask_from_pixel_indices(
+                    dynamic_objects, frame_idx, H, W
+                )
+                mask = dynamic_mask
+
+                # 如果有额外的frame_masks，与dynamic_mask取交集
+                if frame_masks is not None:
+                    frame_mask = frame_masks[0, frame_idx]  # [H, W]
+                    mask = mask & frame_mask
             else:
-                mask = torch.ones_like(frame_gt_depth, dtype=torch.bool)
+                # 使用原始的frame_masks
+                if frame_masks is not None:
+                    mask = frame_masks[0, frame_idx]  # [H, W]
+                else:
+                    mask = torch.ones_like(frame_gt_depth, dtype=torch.bool)
 
             # 如果有sky_masks，从mask中排除sky区域
             if sky_masks is not None:
@@ -274,7 +348,8 @@ class Stage2RenderLoss(nn.Module):
         height: int,
         width: int,
         frame_idx: int = 0,
-        sky_colors: Optional[torch.Tensor] = None
+        sky_colors: Optional[torch.Tensor] = None,
+        render_only_dynamic: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         渲染单帧图像
@@ -286,6 +361,7 @@ class Stage2RenderLoss(nn.Module):
             height, width: 图像尺寸
             frame_idx: 当前帧索引
             sky_colors: [H, W, 3] 天空颜色 (可选)
+            render_only_dynamic: 是否只渲染动态物体 (默认False)
 
         Returns:
             rendered_rgb: [3, H, W] 渲染的RGB图像
@@ -300,8 +376,8 @@ class Stage2RenderLoss(nn.Module):
         all_opacities = []
         all_colors = []
 
-        # 静态Gaussian：所有帧都使用完整的静态背景
-        if refined_scene.get('static_gaussians') is not None:
+        # 静态Gaussian：只有在不是"仅渲染动态物体"模式时才渲染
+        if not render_only_dynamic and refined_scene.get('static_gaussians') is not None:
             static_gaussians = refined_scene['static_gaussians']
             if static_gaussians.shape[0] > 0:
                 all_means.append(static_gaussians[:, :3])
