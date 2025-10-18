@@ -167,7 +167,9 @@ def train(args):
         # 损失配置 - 使用stage2_前缀的键名以匹配online_stage2_trainer.py
         'stage2_rgb_loss_weight': getattr(args, 'stage2_rgb_loss_weight', 0.5),
         'stage2_depth_loss_weight': getattr(args, 'stage2_depth_loss_weight', 0.05),
-        
+        'stage2_render_only_dynamic': getattr(args, 'stage2_render_only_dynamic', False),
+        'stage2_supervise_only_dynamic': getattr(args, 'stage2_supervise_only_dynamic', False),
+
         # 动态处理器配置
         'dynamic_processor': {
             'min_object_size': getattr(args, 'min_object_size', 100),
