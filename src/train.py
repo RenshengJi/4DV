@@ -169,6 +169,7 @@ def train(args):
         'stage2_depth_loss_weight': getattr(args, 'stage2_depth_loss_weight', 0.05),
         'stage2_render_only_dynamic': getattr(args, 'stage2_render_only_dynamic', False),
         'stage2_supervise_only_dynamic': getattr(args, 'stage2_supervise_only_dynamic', False),
+        'stage2_static_black_weight': getattr(args, 'stage2_static_black_weight', 0.1),
 
         # 动态处理器配置
         'dynamic_processor': {

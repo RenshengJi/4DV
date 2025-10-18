@@ -144,6 +144,7 @@ class OnlineStage2Trainer:
             'depth_weight': config.get('stage2_depth_loss_weight', 0.0),  # 修正：使用stage2_前缀的键名
             'render_only_dynamic': config.get('stage2_render_only_dynamic', False),  # 是否只渲染动态物体
             'supervise_only_dynamic': config.get('stage2_supervise_only_dynamic', False),  # 是否只监督动态区域
+            'static_black_weight': config.get('stage2_static_black_weight', 0.1),  # 非动态区域渲染为黑色的loss权重
         }
 
         criterion = Stage2CompleteLoss(

@@ -123,13 +123,15 @@ class Stage2RenderLoss(nn.Module):
         rgb_weight: float = 1.0,
         depth_weight: float = 0.0,  # 禁用depth loss
         render_only_dynamic: bool = False,  # 是否只渲染动态物体
-        supervise_only_dynamic: bool = False  # 是否只监督动态区域
+        supervise_only_dynamic: bool = False,  # 是否只监督动态区域
+        static_black_weight: float = 0.1  # 非动态区域渲染为黑色的loss权重
     ):
         super().__init__()
         self.rgb_weight = rgb_weight
         self.depth_weight = depth_weight
         self.render_only_dynamic = render_only_dynamic
         self.supervise_only_dynamic = supervise_only_dynamic
+        self.static_black_weight = static_black_weight
 
     def forward(
         self,
@@ -163,7 +165,9 @@ class Stage2RenderLoss(nn.Module):
         # 初始化loss为None，后续累加
         total_rgb_loss = None
         total_depth_loss = None
+        total_static_black_loss = None
         num_valid_frames = 0
+        num_static_frames = 0
 
         rendered_images = []
         rendered_depths = []
@@ -214,7 +218,7 @@ class Stage2RenderLoss(nn.Module):
                 sky_mask_frame = sky_mask_frame.to(mask.device)
                 mask = mask & (~sky_mask_frame)  # 排除sky区域
 
-            # RGB损失
+            # RGB损失 - 动态区域应该匹配GT
             if mask.sum() > 0:  # 确保有有效像素
                 rgb_loss = F.l1_loss(
                     rendered_rgb[mask.unsqueeze(0).repeat(3, 1, 1)],
@@ -226,6 +230,33 @@ class Stage2RenderLoss(nn.Module):
                 else:
                     total_rgb_loss = total_rgb_loss + rgb_loss
                 num_valid_frames += 1
+
+            # Static区域黑色惩罚 - 只在supervise_only_dynamic且render_only_dynamic时启用
+            if self.supervise_only_dynamic and self.render_only_dynamic and self.static_black_weight > 0:
+                # 创建static mask（非dynamic区域）
+                static_mask = ~mask  # 取反得到static区域
+
+                # 排除sky区域（sky区域不需要惩罚）
+                if sky_masks is not None:
+                    sky_mask_frame = sky_masks[0, frame_idx]
+                    if sky_mask_frame.dtype != torch.bool:
+                        sky_mask_frame = sky_mask_frame.bool()
+                    sky_mask_frame = sky_mask_frame.to(static_mask.device)
+                    static_mask = static_mask & (~sky_mask_frame)
+
+                if static_mask.sum() > 0:
+                    # 计算static区域的渲染结果应该接近黑色（全零）
+                    target_black = torch.zeros_like(rendered_rgb)
+                    static_black_loss = F.l1_loss(
+                        rendered_rgb[:, static_mask],
+                        target_black[:, static_mask]
+                    )
+                    # 累加loss
+                    if total_static_black_loss is None:
+                        total_static_black_loss = static_black_loss
+                    else:
+                        total_static_black_loss = total_static_black_loss + static_black_loss
+                    num_static_frames += 1
 
             # 深度损失 - 仅在权重大于0时计算
             if self.depth_weight > 0:
@@ -283,6 +314,14 @@ class Stage2RenderLoss(nn.Module):
         else:
             # 使用rgb_loss作为anchor创建零depth loss
             loss_dict['stage2_depth_loss'] = avg_rgb_loss * 0.0
+
+        # Static black loss - 非动态区域渲染为黑色
+        if self.static_black_weight > 0 and total_static_black_loss is not None:
+            avg_static_black_loss = total_static_black_loss / num_static_frames if num_static_frames > 0 else total_static_black_loss
+            loss_dict['stage2_static_black_loss'] = self.static_black_weight * avg_static_black_loss
+        else:
+            # 使用rgb_loss作为anchor创建零static_black loss
+            loss_dict['stage2_static_black_loss'] = avg_rgb_loss * 0.0
 
         # 总损失
         total_loss = sum(loss_dict.values())

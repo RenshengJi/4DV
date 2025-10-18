@@ -134,6 +134,7 @@ stage2_rgb_loss_weight: 1.0               # RGB渲染损失
 stage2_depth_loss_weight: 1.0             # 深度渲染损失
 stage2_render_only_dynamic: true          # 是否只渲染动态物体（不渲染静态背景）
 stage2_supervise_only_dynamic: true       # 是否只监督动态区域（使用2D pixel mask）
+stage2_static_black_weight: 0.1           # 非动态区域渲染为黑色的loss权重
 
 # 动态处理器配置
 min_object_size: 100                      # 最小物体尺寸（点数）
