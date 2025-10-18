@@ -473,7 +473,8 @@ class OnlineStage2Trainer:
                 gt_depths=gt_depths,
                 intrinsics=intrinsics,
                 extrinsics=extrinsics,
-                sky_masks=sky_masks
+                sky_masks=sky_masks,
+                original_dynamic_objects=dynamic_objects  # 传递原始的dynamic_objects（包含frame_pixel_indices）
             )
         except Exception as loss_error:
             print(f"ERROR in stage2_criterion (loss computation): {loss_error}")

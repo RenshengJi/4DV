@@ -139,7 +139,8 @@ class Stage2RenderLoss(nn.Module):
         intrinsics: torch.Tensor,
         extrinsics: torch.Tensor,
         frame_masks: Optional[torch.Tensor] = None,
-        sky_masks: Optional[torch.Tensor] = None
+        sky_masks: Optional[torch.Tensor] = None,
+        original_dynamic_objects: Optional[list] = None
     ) -> Dict[str, torch.Tensor]:
         """
         计算第二阶段的渲染损失
@@ -186,9 +187,10 @@ class Stage2RenderLoss(nn.Module):
             # 计算监督区域的mask
             if self.supervise_only_dynamic:
                 # 创建dynamic mask：只监督动态物体区域
-                dynamic_objects = refined_scene.get('dynamic_objects', [])
+                # 使用原始的dynamic_objects（包含frame_pixel_indices），而不是refined_scene中的
+                objects_for_mask = original_dynamic_objects if original_dynamic_objects is not None else refined_scene.get('dynamic_objects', [])
                 dynamic_mask = create_dynamic_mask_from_pixel_indices(
-                    dynamic_objects, frame_idx, H, W
+                    objects_for_mask, frame_idx, H, W
                 )
                 mask = dynamic_mask
 
@@ -894,7 +896,8 @@ class Stage2CompleteLoss(nn.Module):
         intrinsics: torch.Tensor,
         extrinsics: torch.Tensor,
         frame_masks: Optional[torch.Tensor] = None,
-        sky_masks: Optional[torch.Tensor] = None
+        sky_masks: Optional[torch.Tensor] = None,
+        original_dynamic_objects: Optional[list] = None
     ) -> Dict[str, torch.Tensor]:
         """
         计算第二阶段的完整损失
@@ -908,6 +911,7 @@ class Stage2CompleteLoss(nn.Module):
             extrinsics: 相机外参
             frame_masks: 有效区域掩码
             sky_masks: 天空区域掩码
+            original_dynamic_objects: 原始的dynamic_objects（包含frame_pixel_indices）
 
         Returns:
             complete_loss_dict: 完整损失字典
@@ -915,7 +919,8 @@ class Stage2CompleteLoss(nn.Module):
         # 渲染损失
         render_loss_dict = self.render_loss(
             refined_scene, gt_images, gt_depths,
-            intrinsics, extrinsics, frame_masks, sky_masks
+            intrinsics, extrinsics, frame_masks, sky_masks,
+            original_dynamic_objects
         )
 
         # 直接使用渲染损失作为完整损失
