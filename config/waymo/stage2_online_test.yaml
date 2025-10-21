@@ -156,7 +156,7 @@ tracking_velocity_threshold: 0.2          # 速度匹配阈值
 allow_repeat: False
 
 train_dataset: Waymo_Multi(allow_repeat=${allow_repeat}, split=None,
-  ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train_with_flow",
+  ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/test_with_flow",
   img_ray_mask_p=[1.0, 0.0, 0.0], valid_camera_id_list=["1", "2", "3"],
   aug_crop=0, resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], transform=ImgNorm,
   num_views=${num_views}, n_corres=${n_corres_train}, seq_aug_crop=True, load_sam_masks=False)
@@ -190,7 +190,7 @@ distributed: False
 dist_backend: 'nccl'
 
 eval_freq: 1
-save_freq: 0.01                             # 第二阶段更频繁保存
+save_freq: 1                             # 第二阶段更频繁保存
 keep_freq: 1
 print_freq: 5                              # 更频繁的打印
 print_img_freq: 50000000
@@ -198,7 +198,7 @@ num_imgs_vis: 4
 
 # =============== 输出配置 ===============
 save_dir: 'checkpoints/waymo_stage2_online'
-exp_name: 'stage2_train+5e-4+biggermodel+onlydynamic+onlymeans'
+exp_name: 'stage2_train+5e-4+biggermodel+onlydynamic+onlymeans+only1'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/

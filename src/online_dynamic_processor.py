@@ -854,21 +854,6 @@ class OnlineDynamicProcessor:
         detailed_times = {}
 
         try:
-            if self.optical_flow_registration is None:
-                # 获取图像尺寸
-                H, W = 64, 64  # 默认值，实际应该从clustering结果或其他地方获取
-                if clustering_results and len(clustering_results) > 0:
-                    points = clustering_results[0].get('points')
-                    if points is not None and len(points.shape) >= 2:
-                        # 假设points是[H*W, 3]格式，我们可能需要从别处获取H, W
-                        # 这里使用默认值，实际情况可能需要调整
-                        pass
-                fallback_start = time.time()
-                result = self._create_objects_from_clustering_results(
-                    clustering_results, None, H, W
-                )
-                detailed_times['回退到简单聚合'] = time.time() - fallback_start
-                return result, detailed_times
 
             # 1. 预计算所有帧之间的光流
             flow_start = time.time()

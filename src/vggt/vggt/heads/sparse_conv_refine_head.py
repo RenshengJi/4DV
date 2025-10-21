@@ -481,6 +481,8 @@ class GaussianRefineHeadSparseConv(nn.Module):
 
         对deltas应用激活函数后再加到原始参数上，与vggt.py中的forward保持一致
 
+        注意：当前只调整前3个参数（means/positions），其他参数不变
+
         Args:
             gaussian_params: [N, 14] 原始Gaussian参数
             deltas: [N, 14] 细化增量（raw）
@@ -491,18 +493,9 @@ class GaussianRefineHeadSparseConv(nn.Module):
         # 对deltas应用激活函数（与vggt.py中的forward一致）
         deltas_activated = deltas.clone()
 
-        # # Scale activation: 0.05 * exp(scale), clamped to max 0.3
-        # deltas_activated[..., 3:6] = (0.05 * torch.exp(deltas[..., 3:6])).clamp_max(0.3)
+        # 只保留前3个参数（means/positions）的deltas，其他置为0
+        deltas_activated[:, 3:] = 0.0
 
-        # # Rotation normalization
-        # rotations = deltas[..., 9:13]
-        # rotation_norms = torch.norm(rotations, dim=-1, keepdim=True).clamp(min=1e-8)
-        # deltas_activated[..., 9:13] = rotations / rotation_norms
-
-        # # Opacity activation: sigmoid
-        # deltas_activated[..., 13:14] = deltas[..., 13:14].sigmoid()
-
-        # 应用激活后的deltas
         return gaussian_params + deltas_activated
 
 

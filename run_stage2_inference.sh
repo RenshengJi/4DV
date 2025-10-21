@@ -40,7 +40,7 @@ export CUDA_VISIBLE_DEVICES=7
 STAGE1_MODEL_PATH="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/aggregator_resume_noflowgrad_nearestdynamic_resume_0point1_novoxel/checkpoint-epoch_0_45568.pth"
 # STAGE1_MODEL_PATH="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(true+fixmodel+lowlr!+nolpips+onlyflow+velocitylocal+fromscratch)/checkpoint-epoch_2_17880.pth"
 
-STAGE2_MODEL_PATH="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage2_online/stage2_train+5e-4+biggermodel+onlydynamic+lowdecay5e-5/stage2-checkpoint-epoch_0_5208.pth"
+STAGE2_MODEL_PATH="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage2_online/stage2_train+5e-4+biggermodel+onlydynamic+onlymeans/stage2-checkpoint-epoch_0_5690.pth"
 # STAGE2_MODEL_PATH="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage2_online/stage2_train+5e-4+biggermodel/stage2-checkpoint-epoch_0_17070.pth"
 
 # 数据路径

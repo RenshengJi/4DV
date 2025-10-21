@@ -845,32 +845,6 @@ class Stage2RenderLoss(nn.Module):
             transform, positions_homo.T).T[:, :3]  # [N, 3]
         transformed_gaussians[:, :3] = transformed_positions
 
-        # # 变换旋转（四元数）
-        # if gaussians.shape[1] >= 13:  # 确保有四元数
-        #     R = transform[:3, :3]  # [3, 3] 旋转矩阵
-        #     quats = gaussians[:, 9:13]  # [N, 4] - [w, x, y, z]
-
-        #     # 四元数转旋转矩阵
-        #     transformed_quats = []
-        #     for i in range(quats.shape[0]):
-        #         quat = quats[i]  # [4]
-        #         # 四元数转旋转矩阵
-        #         w, x, y, z = quat[0], quat[1], quat[2], quat[3]
-        #         R_quat = torch.tensor([
-        #             [1-2*(y**2+z**2), 2*(x*y-w*z), 2*(x*z+w*y)],
-        #             [2*(x*y+w*z), 1-2*(x**2+z**2), 2*(y*z-w*x)],
-        #             [2*(x*z-w*y), 2*(y*z+w*x), 1-2*(x**2+y**2)]
-        #         ], device=gaussians.device)
-
-        #         # 应用变换
-        #         R_transformed = torch.mm(R, R_quat)
-
-        #         # 旋转矩阵转四元数
-        #         transformed_quat = self._rotation_matrix_to_quaternion(R_transformed)
-        #         transformed_quats.append(transformed_quat)
-
-        #     transformed_gaussians[:, 9:13] = torch.stack(transformed_quats, dim=0)
-
         return transformed_gaussians
 
     def _rotation_matrix_to_quaternion(self, R: torch.Tensor) -> torch.Tensor:
