@@ -447,10 +447,11 @@ def train(args):
     if online_stage2_trainer is not None and online_stage2_trainer.enable_stage2:
         stage2_params = online_stage2_trainer.get_stage2_parameters()
         if stage2_params:
-            # 为第二阶段参数创建参数组（使用全局学习率和权重衰减）
+            # 为第二阶段参数创建参数组（使用全局学习率，并设置较小的权重衰减）
             stage2_param_groups = [{
                 'params': stage2_params,
-                'name': 'stage2_params'
+                'name': 'stage2_params',
+                # 'weight_decay': 5e-5  #TODO: 可调整权重衰减，但是实验表明没有用
             }]
 
             param_groups.extend(stage2_param_groups)
