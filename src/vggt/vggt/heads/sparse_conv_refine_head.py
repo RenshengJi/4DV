@@ -155,22 +155,19 @@ class SparseConvBlock(spconv.SparseModule):
 
 
 class ResidualSparseConvBlock(spconv.SparseModule):
-    """带残差连接的稀疏卷积块，支持dilated convolution"""
+    """带残差连接的稀疏卷积块"""
 
-    def __init__(self, channels: int, kernel_size: int = 3, dilation: int = 1):
+    def __init__(self, channels: int, kernel_size: int = 3):
         super().__init__()
 
-        # 计算正确的padding以保持空间尺寸
-        # padding = dilation * (kernel_size - 1) // 2
-        padding = dilation * (kernel_size // 2)
+        padding = kernel_size // 2
 
         self.conv1 = spconv.SubMConv3d(
             channels, channels,
             kernel_size=kernel_size,
             padding=padding,
-            dilation=dilation,
             bias=False,
-            indice_key=f'subm_d{dilation}'  # 不同dilation使用不同的indice_key
+            indice_key='subm'
         )
         self.bn1 = nn.BatchNorm1d(channels)
         self.relu = nn.ReLU(inplace=True)
@@ -179,9 +176,8 @@ class ResidualSparseConvBlock(spconv.SparseModule):
             channels, channels,
             kernel_size=kernel_size,
             padding=padding,
-            dilation=dilation,
             bias=False,
-            indice_key=f'subm_d{dilation}'
+            indice_key='subm'
         )
         self.bn2 = nn.BatchNorm1d(channels)
 
@@ -277,7 +273,6 @@ class GaussianRefineHeadSparseConv(nn.Module):
     """
     使用spconv的Gaussian细化网络
     比Transformer快得多，内存占用小
-    支持dilated convolution以扩大感受野
     """
 
     def __init__(
@@ -286,18 +281,14 @@ class GaussianRefineHeadSparseConv(nn.Module):
         output_gaussian_dim: int = 14,
         feature_dim: int = 128,
         num_conv_layers: int = 2,
-        voxel_size: float = 0.05,  # 体素大小，单位米
-        max_num_points_per_voxel: int = 5,
-        use_dilated_conv: bool = False,  # 是否使用dilated convolution
-        dilation_rates: Optional[List[int]] = None  # 每层的膨胀率
+        voxel_size: float = 0.05  # 体素大小，单位米
     ):
         super().__init__()
         self.input_dim = input_gaussian_dim
         self.output_dim = output_gaussian_dim
         self.feature_dim = feature_dim
+        self.num_conv_layers = num_conv_layers
         self.voxel_size = voxel_size
-        self.max_num_points_per_voxel = max_num_points_per_voxel
-        self.use_dilated_conv = use_dilated_conv
 
         # 输入编码
         self.input_encoder = nn.Sequential(
@@ -307,30 +298,14 @@ class GaussianRefineHeadSparseConv(nn.Module):
         )
 
         # 稀疏卷积层
-        if use_dilated_conv and dilation_rates is not None:
-            # 使用指定的dilation rates
-            assert len(dilation_rates) == num_conv_layers, \
-                f"dilation_rates length ({len(dilation_rates)}) must match num_conv_layers ({num_conv_layers})"
-            self.conv_layers = spconv.SparseSequential(
-                *[ResidualSparseConvBlock(feature_dim, dilation=dilation_rates[i])
-                  for i in range(num_conv_layers)]
-            )
-            # 计算理论感受野（用于debug）
-            receptive_field = 1
-            for dilation in dilation_rates:
-                receptive_field += 2 * 2 * dilation  # 每个ResidualBlock有2个3x3卷积
-            self.receptive_field_voxels = receptive_field
-            self.receptive_field_meters = receptive_field * voxel_size
-            print(f"[GaussianRefineHead] Using dilated convolution with rates: {dilation_rates}")
-            print(f"[GaussianRefineHead] Theoretical receptive field: {receptive_field} voxels = {self.receptive_field_meters:.2f}m")
-        else:
-            # 默认：不使用dilation（向后兼容）
-            self.conv_layers = spconv.SparseSequential(
-                *[ResidualSparseConvBlock(feature_dim) for _ in range(num_conv_layers)]
-            )
-            receptive_field = 1 + num_conv_layers * 2 * 2  # 每个ResidualBlock有2个3x3卷积
-            self.receptive_field_voxels = receptive_field
-            self.receptive_field_meters = receptive_field * voxel_size
+        self.conv_layers = spconv.SparseSequential(
+            *[ResidualSparseConvBlock(feature_dim) for _ in range(num_conv_layers)]
+        )
+
+        # 计算理论感受野（用于debug）
+        receptive_field = 1 + num_conv_layers * 2 * 2  # 每个ResidualBlock有2个3x3卷积
+        self.receptive_field_voxels = receptive_field
+        self.receptive_field_meters = receptive_field * voxel_size
 
         # 输出头 - 增强版（Plan C）
         self.output_head = nn.Sequential(
@@ -494,7 +469,7 @@ class GaussianRefineHeadSparseConv(nn.Module):
         deltas_activated = deltas.clone()
 
         # 只保留前3个参数（means/positions）的deltas，其他置为0
-        deltas_activated[:, 3:] = 0.0
+        # deltas_activated[:, 3:] = 0.0
 
         return gaussian_params + deltas_activated
 
@@ -503,7 +478,6 @@ class PoseRefineHeadSparseConv(nn.Module):
     """
     使用spconv的位姿细化网络
     基于点云几何特征预测帧间变换
-    支持dilated convolution以扩大感受野
     """
 
     def __init__(
@@ -512,15 +486,14 @@ class PoseRefineHeadSparseConv(nn.Module):
         feature_dim: int = 128,
         num_conv_layers: int = 2,
         voxel_size: float = 0.1,
-        max_points: int = 4096,
-        use_dilated_conv: bool = False,  # 是否使用dilated convolution
-        dilation_rates: Optional[List[int]] = None  # 每层的膨胀率
+        max_points: int = 4096
     ):
         super().__init__()
+        self.input_dim = input_dim
         self.max_points = max_points
         self.voxel_size = voxel_size
         self.feature_dim = feature_dim
-        self.use_dilated_conv = use_dilated_conv
+        self.num_conv_layers = num_conv_layers
 
         # 点云编码
         self.point_encoder = nn.Sequential(
@@ -530,30 +503,14 @@ class PoseRefineHeadSparseConv(nn.Module):
         )
 
         # 稀疏卷积特征提取
-        if use_dilated_conv and dilation_rates is not None:
-            # 使用指定的dilation rates
-            assert len(dilation_rates) == num_conv_layers, \
-                f"dilation_rates length ({len(dilation_rates)}) must match num_conv_layers ({num_conv_layers})"
-            self.conv_layers = spconv.SparseSequential(
-                *[ResidualSparseConvBlock(feature_dim, dilation=dilation_rates[i])
-                  for i in range(num_conv_layers)]
-            )
-            # 计算理论感受野（用于debug）
-            receptive_field = 1
-            for dilation in dilation_rates:
-                receptive_field += 2 * 2 * dilation  # 每个ResidualBlock有2个3x3卷积
-            self.receptive_field_voxels = receptive_field
-            self.receptive_field_meters = receptive_field * voxel_size
-            print(f"[PoseRefineHead] Using dilated convolution with rates: {dilation_rates}")
-            print(f"[PoseRefineHead] Theoretical receptive field: {receptive_field} voxels = {self.receptive_field_meters:.2f}m")
-        else:
-            # 默认：不使用dilation（向后兼容）
-            self.conv_layers = spconv.SparseSequential(
-                *[ResidualSparseConvBlock(feature_dim) for _ in range(num_conv_layers)]
-            )
-            receptive_field = 1 + num_conv_layers * 2 * 2  # 每个ResidualBlock有2个3x3卷积
-            self.receptive_field_voxels = receptive_field
-            self.receptive_field_meters = receptive_field * voxel_size
+        self.conv_layers = spconv.SparseSequential(
+            *[ResidualSparseConvBlock(feature_dim) for _ in range(num_conv_layers)]
+        )
+
+        # 计算理论感受野（用于debug）
+        receptive_field = 1 + num_conv_layers * 2 * 2  # 每个ResidualBlock有2个3x3卷积
+        self.receptive_field_voxels = receptive_field
+        self.receptive_field_meters = receptive_field * voxel_size
 
         # 交叉注意力融合模块（替换简单的max pooling + 相加）
         # 显式建模source-target对应关系，学习哪些点对匹配
@@ -765,9 +722,12 @@ class PoseRefineHeadSparseConv(nn.Module):
         rotation_6d = pose_delta[:6]  # [6]
         translation = pose_delta[6:]  # [3]
 
-        # 【安全性检查】如果pose_delta接近零（训练初期常见），直接返回initial_transform
-        if torch.abs(rotation_6d).max() < 1e-6 and torch.abs(translation).max() < 1e-6:
-            return initial_transform.clone()
+        # 【关键修复】即使pose_delta接近零，也不能直接返回initial_transform
+        # 因为initial_transform可能没有梯度，导致backward时报错
+        # 我们需要保持与pose_delta的梯度连接
+        # 注释掉这个early return，让它继续走下面的计算流程
+        # if torch.abs(rotation_6d).max() < 1e-6 and torch.abs(translation).max() < 1e-6:
+        #     return initial_transform.clone()
 
         # 6D旋转 → 旋转矩阵 (Gram-Schmidt正交化)
         # 将6D向量重塑为2个3D向量

@@ -66,6 +66,11 @@ class DPTGSHead(DPTHead):
             down_ratio=down_ratio,
         )
         merger_channels = features // 2
+        # self.input_merger = nn.Sequential(
+        #     nn.Conv2d(3, merger_channels, kernel_size=7, stride=1, padding=3, padding_mode='reflect'),
+        #     nn.ReLU(),
+        #     nn.Conv2d(merger_channels, merger_channels, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
+        # )
         self.input_merger = nn.Sequential(
             nn.Conv2d(3, merger_channels, kernel_size=7, stride=1, padding=3),
             nn.ReLU(),

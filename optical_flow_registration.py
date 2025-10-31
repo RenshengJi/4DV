@@ -49,6 +49,7 @@ class OpticalFlowRegistration:
                  use_simple_correspondence: bool = True,
                  use_direct_correspondence: bool = True,  # 使用直接索引匹配
                  use_velocity_based_transform: bool = False,  # 使用velocity直接计算变换
+                 velocity_transform_mode: str = "simple",  # velocity变换模式: "simple"或"procrustes"
                  raft_model_path: str = None):
         """
         初始化光流配准器
@@ -62,6 +63,9 @@ class OpticalFlowRegistration:
             use_simple_correspondence: 是否使用简单对应点查找方法（更快）
             use_direct_correspondence: 是否使用直接索引匹配（最快且最准确）
             use_velocity_based_transform: 是否使用velocity直接计算变换（无需光流，最快）
+            velocity_transform_mode: velocity变换模式
+                - "simple": 仅用velocity平均值估计平移T，旋转R为单位矩阵（快速）
+                - "procrustes": 使用xyz+velocity，用Procrustes算法估计完整R和T（更准确）
             raft_model_path: RAFT模型权重文件路径（可选）
         """
         self.device = device
@@ -71,6 +75,7 @@ class OpticalFlowRegistration:
         self.use_simple_correspondence = use_simple_correspondence
         self.use_direct_correspondence = use_direct_correspondence
         self.use_velocity_based_transform = use_velocity_based_transform
+        self.velocity_transform_mode = velocity_transform_mode
 
         # 初始化光流模型
         self.flow_model = self._load_flow_model(
@@ -79,7 +84,10 @@ class OpticalFlowRegistration:
         # 存储配准结果
         self.registration_results = {}
 
-        transform_method = "Velocity-based" if use_velocity_based_transform else "Flow-based"
+        if use_velocity_based_transform:
+            transform_method = f"Velocity-based ({velocity_transform_mode})"
+        else:
+            transform_method = "Flow-based"
         print(
             f"光流配准器初始化完成 - 模型: {flow_model_name}, 变换方法: {transform_method}, 对应点查找: {'简单' if use_simple_correspondence else '复杂'}")
 
@@ -169,9 +177,11 @@ class OpticalFlowRegistration:
                                     intrinsic: torch.Tensor,
                                     image_shape: Tuple[int, int],
                                     extrinsic: torch.Tensor = None,
-                                    image_rgb: torch.Tensor = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+                                    image_rgb: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         矢量化版本：批量提取物体在2D图像和3D空间中的点，性能提升100+倍
+
+        注意：现在返回torch.Tensor以支持梯度传播
 
         Args:
             clustering_result: 聚类结果
@@ -182,12 +192,13 @@ class OpticalFlowRegistration:
             image_rgb: RGB图像 [3, H, W] 或 [H, W, 3]，可选
 
         Returns:
-            points_2d: 2D点坐标 [N, 2]
-            points_3d: 3D点坐标 [N, 3]
-            point_indices: 点在原始图像中的索引 [N]
-            colors: RGB颜色 [N, 3]
+            points_2d: 2D点坐标 [N, 2] (torch.Tensor)
+            points_3d: 3D点坐标 [N, 3] (torch.Tensor)
+            point_indices: 点在原始图像中的索引 [N] (torch.Tensor)
+            colors: RGB颜色 [N, 3] (torch.Tensor)
         """
         H, W = image_shape
+        device = depth.device
 
         # 1. 预处理：获取所有cluster的像素索引
         cluster_indices = clustering_result.get('cluster_indices', [])
@@ -207,7 +218,8 @@ class OpticalFlowRegistration:
                         cluster_indices.append(indices.tolist())
 
         if not cluster_indices:
-            return np.array([]), np.array([]), np.array([]), np.array([])
+            empty = torch.empty(0, device=device, dtype=torch.float32)
+            return empty.reshape(0, 2), empty.reshape(0, 3), empty.reshape(0).long(), empty.reshape(0, 3)
 
         # 2. 矢量化预处理：合并所有索引和对应的cluster_id
         all_indices = []
@@ -219,17 +231,19 @@ class OpticalFlowRegistration:
                 cluster_ids.extend([cluster_idx] * len(point_indices))
 
         if not all_indices:
-            return np.array([]), np.array([]), np.array([]), np.array([])
+            empty = torch.empty(0, device=device, dtype=torch.float32)
+            return empty.reshape(0, 2), empty.reshape(0, 3), empty.reshape(0).long(), empty.reshape(0, 3)
 
-        # 转换为numpy数组用于矢量化操作
-        all_indices = np.array(all_indices, dtype=np.int32)
-        cluster_ids = np.array(cluster_ids, dtype=np.int32)
+        # 转换为torch tensor用于矢量化操作
+        all_indices = torch.tensor(all_indices, dtype=torch.long, device=device)
+        cluster_ids = torch.tensor(cluster_ids, dtype=torch.long, device=device)
 
         # 3. 矢量化边界检查
         valid_mask = (all_indices >= 0) & (all_indices < H * W)
 
-        if not np.any(valid_mask):
-            return np.array([]), np.array([]), np.array([]), np.array([])
+        if not torch.any(valid_mask):
+            empty = torch.empty(0, device=device, dtype=torch.float32)
+            return empty.reshape(0, 2), empty.reshape(0, 3), empty.reshape(0).long(), empty.reshape(0, 3)
 
         # 过滤有效索引
         valid_indices = all_indices[valid_mask]
@@ -238,17 +252,17 @@ class OpticalFlowRegistration:
         # 4. 矢量化坐标转换：一维索引 -> 2D坐标
         y_coords = valid_indices // W
         x_coords = valid_indices % W
-        coords_2d = np.column_stack([x_coords, y_coords])  # [N, 2]
+        coords_2d = torch.stack([x_coords, y_coords], dim=1).float()  # [N, 2]
 
-        # 5. 矢量化深度提取
-        depth_np = depth.detach().cpu().numpy()
-        depths = depth_np[y_coords, x_coords]  # 使用fancy indexing批量提取
+        # 5. 矢量化深度提取（保持梯度）
+        depths = depth.view(-1)[valid_indices]  # 使用indexing批量提取，保持梯度
 
         # 6. 矢量化深度有效性检查
         depth_valid_mask = depths > 0
 
-        if not np.any(depth_valid_mask):
-            return np.array([]), np.array([]), np.array([]), np.array([])
+        if not torch.any(depth_valid_mask):
+            empty = torch.empty(0, device=device, dtype=torch.float32)
+            return empty.reshape(0, 2), empty.reshape(0, 3), empty.reshape(0).long(), empty.reshape(0, 3)
 
         # 过滤有效深度的点
         final_coords_2d = coords_2d[depth_valid_mask]
@@ -260,39 +274,39 @@ class OpticalFlowRegistration:
         points_3d = self._pixels_to_3d_vectorized(
             final_coords_2d, final_depths, intrinsic, extrinsic)
 
-        # 8. 矢量化颜色提取
+        # 8. 矢量化颜色提取（使用torch操作）
         if image_rgb is not None:
             # 处理RGB图像格式
             if isinstance(image_rgb, torch.Tensor):
-                rgb_np = image_rgb.detach().cpu().numpy()
-                if rgb_np.shape[0] == 3:  # [3, H, W] -> [H, W, 3]
-                    rgb_np = rgb_np.transpose(1, 2, 0)
+                rgb_tensor = image_rgb
+                if rgb_tensor.shape[0] == 3:  # [3, H, W] -> [H, W, 3]
+                    rgb_tensor = rgb_tensor.permute(1, 2, 0)
             else:
-                rgb_np = image_rgb
+                # 从numpy转换为torch
+                rgb_tensor = torch.from_numpy(image_rgb).to(device).float()
 
-            # 批量提取颜色
-            colors = rgb_np[final_coords_2d[:, 1],
-                            final_coords_2d[:, 0]]  # [N, 3]
+            # 批量提取颜色（使用torch indexing保持梯度）
+            y_indices = final_coords_2d[:, 1].long()
+            x_indices = final_coords_2d[:, 0].long()
+            colors = rgb_tensor[y_indices, x_indices]  # [N, 3]
 
             # 矢量化颜色格式转换
             if colors.max() <= 1.0:
-                colors = (colors * 255).astype(np.uint8)
-            else:
-                colors = colors.astype(np.uint8)
+                colors = colors * 255.0
         else:
-            # 矢量化默认颜色生成
-            unique_clusters = np.unique(final_cluster_ids)
+            # 矢量化默认颜色生成（使用torch）
+            unique_clusters = torch.unique(final_cluster_ids)
             color_map = {}
 
             for cluster_idx in unique_clusters:
-                hue = (cluster_idx * 137.5) % 360
-                color = (self._hsv_to_rgb(hue, 0.8, 0.9)
-                         * 255).astype(np.uint8)
-                color_map[cluster_idx] = color
+                hue = (cluster_idx.item() * 137.5) % 360
+                color_np = (self._hsv_to_rgb(hue, 0.8, 0.9) * 255)
+                color = torch.tensor(color_np, dtype=torch.float32, device=device)
+                color_map[cluster_idx.item()] = color
 
             # 批量分配颜色
-            colors = np.array([color_map[cluster_id]
-                              for cluster_id in final_cluster_ids])
+            colors = torch.stack([color_map[cluster_id.item()]
+                                 for cluster_id in final_cluster_ids])
 
         # 9. 返回结果（注意2D坐标格式调整为[x, y]）
         points_2d = final_coords_2d  # 已经是[x, y]格式
@@ -401,69 +415,71 @@ class OpticalFlowRegistration:
 
         return point_camera
 
-    def _pixels_to_3d_vectorized(self, coords_2d: np.ndarray, depths: np.ndarray,
-                                 intrinsic: torch.Tensor, extrinsic: torch.Tensor = None) -> np.ndarray:
+    def _pixels_to_3d_vectorized(self, coords_2d: torch.Tensor, depths: torch.Tensor,
+                                 intrinsic: torch.Tensor, extrinsic: torch.Tensor = None) -> torch.Tensor:
         """
         批量将像素坐标和深度转换为3D坐标（矢量化版本）
 
+        注意：现在返回torch.Tensor以支持梯度传播
+
         Args:
-            coords_2d: 像素坐标 [N, 2] (x, y)
-            depths: 深度值 [N]
+            coords_2d: 像素坐标 [N, 2] (x, y) (torch.Tensor)
+            depths: 深度值 [N] (torch.Tensor)
             intrinsic: 相机内参 [3, 3]
             extrinsic: 相机外参 [3, 4] 或 [4, 4]，可选
 
         Returns:
-            3D点坐标 [N, 3]
+            3D点坐标 [N, 3] (torch.Tensor)
         """
         if len(coords_2d) == 0:
-            return np.array([]).reshape(0, 3)
+            return torch.empty(0, 3, device=coords_2d.device, dtype=torch.float32)
 
-        # 处理内参矩阵
-        intrinsic_np = intrinsic.detach().cpu().numpy()
-        if intrinsic_np.ndim == 4:  # BxSx3x3
-            intrinsic_np = intrinsic_np[0, 0]
-        elif intrinsic_np.ndim == 3:  # Sx3x3
-            intrinsic_np = intrinsic_np[0]
+        # 处理内参矩阵（保持torch操作）
+        intrinsic_tensor = intrinsic
+        if intrinsic_tensor.ndim == 4:  # BxSx3x3
+            intrinsic_tensor = intrinsic_tensor[0, 0]
+        elif intrinsic_tensor.ndim == 3:  # Sx3x3
+            intrinsic_tensor = intrinsic_tensor[0]
 
-        fx, fy = intrinsic_np[0, 0], intrinsic_np[1, 1]
-        cx, cy = intrinsic_np[0, 2], intrinsic_np[1, 2]
+        fx, fy = intrinsic_tensor[0, 0], intrinsic_tensor[1, 1]
+        cx, cy = intrinsic_tensor[0, 2], intrinsic_tensor[1, 2]
 
-        # 矢量化计算相机坐标系下的3D点
+        # 矢量化计算相机坐标系下的3D点（保持梯度）
         x, y = coords_2d[:, 0], coords_2d[:, 1]
         X = (x - cx) * depths / fx
         Y = (y - cy) * depths / fy
         Z = depths
 
-        points_camera = np.column_stack([X, Y, Z])  # [N, 3]
+        points_camera = torch.stack([X, Y, Z], dim=1)  # [N, 3]
 
-        # 如果提供了外参，批量转换到世界坐标系
+        # 如果提供了外参，批量转换到世界坐标系（使用torch保持梯度）
         if extrinsic is not None:
-            extrinsic_np = extrinsic.detach().cpu().numpy()
+            extrinsic_tensor = extrinsic
 
             # 处理外参矩阵维度
-            if extrinsic_np.ndim == 4:  # BxSx4x4 或 BxSx3x4
-                extrinsic_np = extrinsic_np[0, 0]
-            elif extrinsic_np.ndim == 3:  # Sx4x4 或 Sx3x4
-                extrinsic_np = extrinsic_np[0]
+            if extrinsic_tensor.ndim == 4:  # BxSx4x4 或 BxSx3x4
+                extrinsic_tensor = extrinsic_tensor[0, 0]
+            elif extrinsic_tensor.ndim == 3:  # Sx4x4 或 Sx3x4
+                extrinsic_tensor = extrinsic_tensor[0]
 
             # 确保是4x4齐次变换矩阵
-            if extrinsic_np.shape == (3, 4):
-                bottom_row = np.array([[0, 0, 0, 1]])
-                extrinsic_np = np.concatenate(
-                    [extrinsic_np, bottom_row], axis=0)
-            elif extrinsic_np.shape != (4, 4):
+            if extrinsic_tensor.shape == (3, 4):
+                bottom_row = torch.tensor([[0, 0, 0, 1]], device=extrinsic_tensor.device, dtype=extrinsic_tensor.dtype)
+                extrinsic_tensor = torch.cat(
+                    [extrinsic_tensor, bottom_row], dim=0)
+            elif extrinsic_tensor.shape != (4, 4):
                 return points_camera
 
             # 求外参的逆矩阵（从相机坐标系到世界坐标系）
             try:
-                extrinsic_inv = np.linalg.inv(extrinsic_np)
-            except np.linalg.LinAlgError:
+                extrinsic_inv = torch.inverse(extrinsic_tensor)
+            except RuntimeError:
                 return points_camera
 
-            # 转换为齐次坐标并批量变换
-            points_homo = np.column_stack(
-                [points_camera, np.ones(len(points_camera))])  # [N, 4]
-            points_world_homo = (extrinsic_inv @ points_homo.T).T  # [N, 4]
+            # 转换为齐次坐标并批量变换（保持梯度）
+            ones = torch.ones(len(points_camera), 1, device=points_camera.device, dtype=points_camera.dtype)
+            points_homo = torch.cat([points_camera, ones], dim=1)  # [N, 4]
+            points_world_homo = torch.matmul(points_homo, extrinsic_inv.T)  # [N, 4]
             return points_world_homo[:, :3]  # [N, 3]
 
         return points_camera
@@ -536,69 +552,67 @@ class OpticalFlowRegistration:
 
 
     def estimate_transformation_direct(self,
-                                       points_3d_src: np.ndarray,
-                                       points_3d_dst: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+                                       points_3d_src: torch.Tensor,
+                                       points_3d_dst: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, float]:
         """
         使用Procrustes算法计算3D-3D点对应的刚体变换
 
+        注意：现在使用torch.Tensor以支持梯度传播
+
         Args:
-            points_3d_src: 源帧3D点 [N, 3]
-            points_3d_dst: 目标帧3D点 [N, 3]
+            points_3d_src: 源帧3D点 [N, 3] (torch.Tensor)
+            points_3d_dst: 目标帧3D点 [N, 3] (torch.Tensor)
 
         Returns:
-            R: 旋转矩阵 [3, 3]
-            t: 平移向量 [3]
-            inlier_ratio: 内点比例
+            R: 旋转矩阵 [3, 3] (torch.Tensor)
+            t: 平移向量 [3] (torch.Tensor)
+            inlier_ratio: 内点比例 (float)
         """
         if len(points_3d_src) < 3:
-            return np.eye(3), np.zeros(3), 0.0
+            return torch.eye(3, device=self.device, dtype=torch.float32), torch.zeros(3, device=self.device, dtype=torch.float32), 0.0
 
         # 检查输入有效性
         if len(points_3d_src) != len(points_3d_dst):
             print(f"警告: 3D点对应数量不匹配 - src: {len(points_3d_src)}, dst: {len(points_3d_dst)}")
-            return np.eye(3), np.zeros(3), 0.0
+            return torch.eye(3, device=self.device, dtype=torch.float32), torch.zeros(3, device=self.device, dtype=torch.float32), 0.0
 
-        # 检查点是否包含无效值
-        if np.any(np.isnan(points_3d_src)) or np.any(np.isnan(points_3d_dst)):
+        # 检查点是否包含无效值（使用torch操作）
+        if torch.any(torch.isnan(points_3d_src)) or torch.any(torch.isnan(points_3d_dst)):
             print("警告: 3D点包含NaN值")
-            return np.eye(3), np.zeros(3), 0.0
+            return torch.eye(3, device=self.device, dtype=torch.float32), torch.zeros(3, device=self.device, dtype=torch.float32), 0.0
 
-        if np.any(np.isinf(points_3d_src)) or np.any(np.isinf(points_3d_dst)):
+        if torch.any(torch.isinf(points_3d_src)) or torch.any(torch.isinf(points_3d_dst)):
             print("警告: 3D点包含无限值")
-            return np.eye(3), np.zeros(3), 0.0
+            return torch.eye(3, device=self.device, dtype=torch.float32), torch.zeros(3, device=self.device, dtype=torch.float32), 0.0
 
         try:
-            # 使用RANSAC进行鲁棒估计
-            if len(points_3d_src) > 100:
-                return self._estimate_transformation_ransac(points_3d_src, points_3d_dst)
-            else:
-                # 点数较少时直接使用Procrustes算法
-                R, t = self._procrustes_algorithm(points_3d_src, points_3d_dst)
-                # 计算内点比例
-                inlier_ratio = self._compute_inlier_ratio(points_3d_src, points_3d_dst, R, t)
-                return R, t, inlier_ratio
-            
-            # 直接使用差值计算变换T，R不管了
-            # best_R = np.eye(3)
-            # best_t = points_3d_dst.mean(axis=0) - points_3d_src.mean(axis=0)
-            # best_inlier_ratio = 0.99
-            # return best_R, best_t, best_inlier_ratio
+            # 直接使用Procrustes算法（torch版本，支持梯度）
+            # 注意：不再使用RANSAC，因为RANSAC是numpy实现且不支持梯度
+            # 对于velocity-based方法，点云质量通常较好，不需要RANSAC
+            R, t = self._procrustes_algorithm(points_3d_src, points_3d_dst)
 
-        except (ValueError, np.linalg.LinAlgError) as e:
+            # 计算内点比例
+            inlier_ratio = self._compute_inlier_ratio(points_3d_src, points_3d_dst, R, t)
+
+            return R, t, inlier_ratio
+
+        except (ValueError, RuntimeError) as e:
             print(f"变换估计失败: {str(e)}")
-            return np.eye(3), np.zeros(3), 0.0
+            return torch.eye(3, device=self.device, dtype=torch.float32), torch.zeros(3, device=self.device, dtype=torch.float32), 0.0
 
-    def _procrustes_algorithm(self, points_src: np.ndarray, points_dst: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def _procrustes_algorithm(self, points_src: torch.Tensor, points_dst: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Procrustes/Kabsch算法：计算3D点云之间的最优刚体变换
 
+        注意：现在使用torch.Tensor以支持梯度传播
+
         Args:
-            points_src: 源点云 [N, 3]
-            points_dst: 目标点云 [N, 3]
+            points_src: 源点云 [N, 3] (torch.Tensor)
+            points_dst: 目标点云 [N, 3] (torch.Tensor)
 
         Returns:
-            R: 旋转矩阵 [3, 3]
-            t: 平移向量 [3]
+            R: 旋转矩阵 [3, 3] (torch.Tensor)
+            t: 平移向量 [3] (torch.Tensor)
         """
 
         with tf32_off():
@@ -609,58 +623,61 @@ class OpticalFlowRegistration:
             if len(points_src) < 3:
                 raise ValueError(f"点数不足，至少需要3个点，实际有{len(points_src)}个")
 
-            # 1. 计算质心
-            centroid_src = np.mean(points_src, axis=0)
-            centroid_dst = np.mean(points_dst, axis=0)
+            # 1. 计算质心（使用torch）
+            centroid_src = torch.mean(points_src, dim=0)
+            centroid_dst = torch.mean(points_dst, dim=0)
 
             # 2. 去中心化
             points_src_centered = points_src - centroid_src
             points_dst_centered = points_dst - centroid_dst
 
             # 检查点是否共线（协方差矩阵是否退化）
-            if np.allclose(points_src_centered, 0) or np.allclose(points_dst_centered, 0):
+            if torch.allclose(points_src_centered, torch.zeros_like(points_src_centered)) or \
+               torch.allclose(points_dst_centered, torch.zeros_like(points_dst_centered)):
                 # 所有点都是同一个点，只需要平移
-                return np.eye(3), centroid_dst - centroid_src
+                return torch.eye(3, device=self.device, dtype=torch.float32), centroid_dst - centroid_src
 
-            # 3. 计算协方差矩阵 H = P_src^T * P_dst
-            H = points_src_centered.T @ points_dst_centered
+            # 3. 计算协方差矩阵 H = P_src^T * P_dst（使用torch.matmul）
+            H = torch.matmul(points_src_centered.T, points_dst_centered)
 
             # 检查矩阵是否退化
-            if np.allclose(H, 0):
+            if torch.allclose(H, torch.zeros_like(H)):
                 # 协方差矩阵为零矩阵，返回单位变换
-                return np.eye(3), centroid_dst - centroid_src
+                return torch.eye(3, device=self.device, dtype=torch.float32), centroid_dst - centroid_src
 
-            # 4. SVD分解
+            # 4. SVD分解（使用torch.linalg.svd）
             try:
-                U, S, Vt = np.linalg.svd(H)
-            except np.linalg.LinAlgError as e:
-                raise np.linalg.LinAlgError(f"SVD分解失败: {str(e)}")
+                U, S, Vt = torch.linalg.svd(H)
+            except RuntimeError as e:
+                raise RuntimeError(f"SVD分解失败: {str(e)}")
 
-            # 5. 计算旋转矩阵
-            R = Vt.T @ U.T
+            # 5. 计算旋转矩阵（使用torch.matmul）
+            R = torch.matmul(Vt.T, U.T)
 
-            # 6. 处理反射情况（确保det(R) = 1）
-            if np.linalg.det(R) < 0:
+            # 6. 处理反射情况（确保det(R) = 1）（使用torch.linalg.det）
+            if torch.linalg.det(R) < 0:
                 # 修正最小奇异值对应的向量
-                Vt_corrected = Vt.copy()
+                Vt_corrected = Vt.clone()
                 Vt_corrected[-1, :] *= -1
-                R = Vt_corrected.T @ U.T
+                R = torch.matmul(Vt_corrected.T, U.T)
 
             # 验证旋转矩阵
             if not self._is_valid_rotation_matrix(R):
                 raise ValueError("计算得到的旋转矩阵无效")
 
-            # 7. 计算平移向量
-            t = centroid_dst - R @ centroid_src
+            # 7. 计算平移向量（使用torch.matmul）
+            t = centroid_dst - torch.matmul(R, centroid_src)
 
         return R, t
 
-    def _is_valid_rotation_matrix(self, R: np.ndarray, tolerance: float = 1e-6) -> bool:
+    def _is_valid_rotation_matrix(self, R: torch.Tensor, tolerance: float = 1e-6) -> bool:
         """
         验证是否为有效的旋转矩阵
 
+        注意：现在支持torch.Tensor
+
         Args:
-            R: 待验证的矩阵 [3, 3]
+            R: 待验证的矩阵 [3, 3] (torch.Tensor or np.ndarray)
             tolerance: 数值精度容差
 
         Returns:
@@ -670,43 +687,45 @@ class OpticalFlowRegistration:
         if R.shape != (3, 3):
             return False
 
-        # 检查是否正交：R^T * R = I
-        should_be_identity = R.T @ R
-        identity = np.eye(3)
-        if not np.allclose(should_be_identity, identity, atol=tolerance):
+        # 检查是否正交：R^T * R = I（使用torch操作）
+        should_be_identity = torch.matmul(R.T, R)
+        identity = torch.eye(3, device=R.device, dtype=R.dtype)
+        if not torch.allclose(should_be_identity, identity, atol=tolerance):
             return False
 
-        # 检查行列式是否为1
-        det = np.linalg.det(R)
-        if not np.isclose(det, 1.0, atol=tolerance):
+        # 检查行列式是否为1（使用torch）
+        det = torch.linalg.det(R)
+        if not torch.isclose(det, torch.tensor(1.0, device=R.device, dtype=R.dtype), atol=tolerance):
             return False
 
         return True
 
-    def _compute_inlier_ratio(self, points_src: np.ndarray, points_dst: np.ndarray,
-                             R: np.ndarray, t: np.ndarray, threshold: float = 0.1) -> float:
+    def _compute_inlier_ratio(self, points_src: torch.Tensor, points_dst: torch.Tensor,
+                             R: torch.Tensor, t: torch.Tensor, threshold: float = 0.1) -> float:
         """
         计算内点比例
 
+        注意：现在支持torch.Tensor
+
         Args:
-            points_src: 源点云 [N, 3]
-            points_dst: 目标点云 [N, 3]
-            R: 旋转矩阵 [3, 3]
-            t: 平移向量 [3]
+            points_src: 源点云 [N, 3] (torch.Tensor)
+            points_dst: 目标点云 [N, 3] (torch.Tensor)
+            R: 旋转矩阵 [3, 3] (torch.Tensor)
+            t: 平移向量 [3] (torch.Tensor)
             threshold: 距离阈值
 
         Returns:
             内点比例
         """
-        # 变换源点云
-        points_src_transformed = (R @ points_src.T).T + t
+        # 变换源点云（使用torch操作）
+        points_src_transformed = torch.matmul(points_src, R.T) + t
 
-        # 计算距离
-        distances = np.linalg.norm(points_src_transformed - points_dst, axis=1)
+        # 计算距离（使用torch.norm）
+        distances = torch.norm(points_src_transformed - points_dst, dim=1)
 
         # 计算内点
         inliers = distances < threshold
-        inlier_ratio = np.sum(inliers) / len(points_src)
+        inlier_ratio = torch.sum(inliers).item() / len(points_src)
 
         return inlier_ratio
 
@@ -1016,6 +1035,11 @@ class OpticalFlowRegistration:
                 velocity_src = preds['velocity'][0, frame_idx]  # [H, W, 3]
                 velocity_dst = preds['velocity'][0, next_frame]  # [H, W, 3]
 
+            # 获取depth_conf数据（如果可用）
+            depth_conf_src = None
+            if 'depth_conf' in preds:
+                depth_conf_src = preds['depth_conf'][0, frame_idx]  # [H, W]
+
             # 获取对应帧的内参和外参
             intrinsic_src = intrinsic[0, frame_idx]  # [3, 3]
             intrinsic_dst = intrinsic[0, next_frame]  # [3, 3]
@@ -1028,7 +1052,8 @@ class OpticalFlowRegistration:
                 depth_src, depth_dst,
                 flow, intrinsic_src, intrinsic_dst, extrinsic_src, extrinsic_dst, global_id,
                 velocity_src=velocity_src, velocity_dst=velocity_dst,
-                direction=direction
+                direction=direction,
+                depth_conf_src=depth_conf_src
             )
 
             if step_transformation is None:
@@ -1048,13 +1073,15 @@ class OpticalFlowRegistration:
                                                preds: Dict,
                                                vggt_batch: Dict,
                                                global_id: int,
-                                               transformation_cache: Dict) -> Optional[np.ndarray]:
+                                               transformation_cache: Dict) -> Optional[torch.Tensor]:
         """
         优化版本的链式变换计算，使用缓存避免重复计算
 
+        注意：现在返回torch.Tensor以支持梯度传播
+
         Args:
             start_frame: 起始帧
-            end_frame: 目标帧  
+            end_frame: 目标帧
             flows: 预计算的光流字典
             clustering_results: 聚类结果
             preds: 模型预测结果
@@ -1063,15 +1090,20 @@ class OpticalFlowRegistration:
             transformation_cache: 变换缓存字典
 
         Returns:
-            累积变换矩阵或None
+            累积变换矩阵(torch.Tensor)或None
         """
         if start_frame == end_frame:
-            return np.eye(4)
+            return torch.eye(4, device=self.device, dtype=torch.float32, requires_grad=True)
 
         # 检查缓存中是否已有这个变换
         cache_key = (start_frame, end_frame)
         if cache_key in transformation_cache:
-            return transformation_cache[cache_key]
+            cached_transform = transformation_cache[cache_key]
+            # 确保cached transformation是torch tensor（兼容旧的numpy cache）
+            if isinstance(cached_transform, np.ndarray):
+                cached_transform = torch.from_numpy(cached_transform).to(self.device).float()
+                transformation_cache[cache_key] = cached_transform  # 更新cache
+            return cached_transform
 
         # 获取相机参数
         extrinsic, intrinsic = pose_encoding_to_extri_intri(
@@ -1092,14 +1124,24 @@ class OpticalFlowRegistration:
             key2 = (intermediate_frame, end_frame)
 
             if key1 in transformation_cache and key2 in transformation_cache:
-                # 组合已有的变换
-                combined_transformation = np.dot(
-                    transformation_cache[key2], transformation_cache[key1])
+                # 组合已有的变换（使用torch.matmul保持梯度）
+                trans1 = transformation_cache[key1]
+                trans2 = transformation_cache[key2]
+
+                # 确保都是torch tensor（兼容旧的numpy cache）
+                if isinstance(trans1, np.ndarray):
+                    trans1 = torch.from_numpy(trans1).to(self.device).float()
+                    transformation_cache[key1] = trans1
+                if isinstance(trans2, np.ndarray):
+                    trans2 = torch.from_numpy(trans2).to(self.device).float()
+                    transformation_cache[key2] = trans2
+
+                combined_transformation = torch.matmul(trans2, trans1)
                 transformation_cache[cache_key] = combined_transformation
                 return combined_transformation
 
         # 如果没有可用的缓存组合，按照原来的方法计算
-        cumulative_transformation = np.eye(4)
+        cumulative_transformation = torch.eye(4, device=self.device, dtype=torch.float32, requires_grad=True)
 
         for i, frame_idx in enumerate(frame_sequence):
             next_frame = frame_idx + direction
@@ -1108,6 +1150,9 @@ class OpticalFlowRegistration:
             step_key = (frame_idx, next_frame)
             if step_key in transformation_cache:
                 step_transformation = transformation_cache[step_key]
+                # 确保cached transformation是torch tensor（兼容旧的numpy cache）
+                if isinstance(step_transformation, np.ndarray):
+                    step_transformation = torch.from_numpy(step_transformation).to(self.device).float()
             else:
                 # 获取当前帧和下一帧的聚类结果
                 current_result = clustering_results[frame_idx]
@@ -1146,6 +1191,11 @@ class OpticalFlowRegistration:
                     velocity_src = preds['velocity'][0, frame_idx]  # [H, W, 3]
                     velocity_dst = preds['velocity'][0, next_frame]  # [H, W, 3]
 
+                # 获取depth_conf数据（如果可用）
+                depth_conf_src = None
+                if 'depth_conf' in preds:
+                    depth_conf_src = preds['depth_conf'][0, frame_idx]  # [H, W]
+
                 # 计算单步变换
                 step_transformation = self.compute_single_step_transformation(
                     current_result, next_result, depth_src, depth_dst, flow,
@@ -1153,7 +1203,8 @@ class OpticalFlowRegistration:
                     extrinsic[0, frame_idx], extrinsic[0, next_frame],
                     global_id,
                     velocity_src=velocity_src, velocity_dst=velocity_dst,
-                    direction=direction
+                    direction=direction,
+                    depth_conf_src=depth_conf_src
                 )
 
                 if step_transformation is None:
@@ -1162,8 +1213,12 @@ class OpticalFlowRegistration:
                 # 缓存单步变换
                 transformation_cache[step_key] = step_transformation
 
-            # 累积变换
-            cumulative_transformation = np.dot(
+            # 确保step_transformation是torch tensor（最后一道防线）
+            if isinstance(step_transformation, np.ndarray):
+                step_transformation = torch.from_numpy(step_transformation).to(self.device).float()
+
+            # 累积变换（使用torch.matmul保持梯度）
+            cumulative_transformation = torch.matmul(
                 step_transformation, cumulative_transformation)
 
         # 缓存最终结果
@@ -1179,15 +1234,23 @@ class OpticalFlowRegistration:
                                                 global_id: int,
                                                 H: int,
                                                 W: int,
-                                                direction: int = 1) -> Optional[np.ndarray]:
+                                                direction: int = 1,
+                                                depth_conf: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
         """
-        基于velocity直接计算变换矩阵（无需光流）
+        基于velocity计算变换矩阵（无需光流）
 
-        策略：
-        1. 提取源帧中属于该物体的所有点的velocity
-        2. 对这些velocity取平均，得到平均运动向量
-        3. 如果是backward (direction=-1)，对velocity取反
-        4. 构建变换矩阵：R = I（单位阵），t = 平均velocity * direction
+        支持两种模式（由self.velocity_transform_mode控制）：
+        1. "simple"模式：
+           - 提取源帧中属于该物体的所有点的velocity
+           - 对这些velocity取平均，得到平均运动向量
+           - 构建变换矩阵：R = I（单位阵），t = 平均velocity * direction
+           - 优点：快速、简单
+
+        2. "procrustes"模式：
+           - 提取源帧物体的xyz坐标和velocity
+           - 计算目标点：dst_xyz = src_xyz + velocity * direction
+           - 使用Procrustes算法估计从src_xyz到dst_xyz的刚体变换（R和t）
+           - 优点：更准确，同时估计旋转R和平移t
 
         Args:
             clustering_src: 源帧聚类结果
@@ -1197,12 +1260,12 @@ class OpticalFlowRegistration:
             global_id: 物体全局ID
             H, W: 图像尺寸
             direction: 变换方向，1表示forward，-1表示backward
+            depth_conf: 深度置信度 [H, W]（可选，用于过滤velocity）
 
         Returns:
-            4x4变换矩阵或None
+            4x4变换矩阵(torch.Tensor)或None
         """
         # 1. 提取属于该物体的点的索引
-        # 从clustering_src中找到global_id对应的聚类索引
         global_ids = clustering_src.get('global_ids', [])
         if global_id not in global_ids:
             return None
@@ -1216,7 +1279,7 @@ class OpticalFlowRegistration:
         if len(object_indices) == 0:
             return None
 
-        # 2. 将velocity从[H, W, 3]转为[H*W, 3]并提取对应点的velocity
+        # 2. 提取对应点的velocity
         if isinstance(velocity_src, torch.Tensor):
             if len(velocity_src.shape) == 3:  # [H, W, 3]
                 velocity_flat = velocity_src.reshape(H * W, 3)
@@ -1227,34 +1290,147 @@ class OpticalFlowRegistration:
 
             # 提取对应点的velocity
             object_velocities = velocity_flat[object_indices]  # [N, 3]
-
-            # 3. 计算平均velocity
-            mean_velocity = object_velocities.mean(dim=0)  # [3]
-
-            # 转为numpy (先detach再转换)
-            if isinstance(mean_velocity, torch.Tensor):
-                mean_velocity = mean_velocity.detach().cpu().numpy()
         else:
-            # velocity_src已经是numpy
+            # velocity_src是numpy
             if len(velocity_src.shape) == 3:
                 velocity_flat = velocity_src.reshape(H * W, 3)
             else:
                 velocity_flat = velocity_src
 
             object_velocities = velocity_flat[object_indices]
-            mean_velocity = np.mean(object_velocities, axis=0)
+            object_velocities = torch.from_numpy(object_velocities).to(self.device).float()
 
-        # 4. 根据方向调整velocity
-        # direction = 1: forward (src -> dst), 使用原velocity
-        # direction = -1: backward (dst -> src), velocity取反
-        adjusted_velocity = mean_velocity * direction
+        # 确保object_velocities在正确的设备上
+        if object_velocities.device != torch.device(self.device):
+            object_velocities = object_velocities.to(self.device)
 
-        # 5. 构建变换矩阵：R = I, t = adjusted_velocity
-        transformation = np.eye(4)
-        transformation[:3, :3] = np.eye(3)  # 单位旋转矩阵
-        transformation[:3, 3] = adjusted_velocity  # 平移为调整后的velocity
+        # 2.5. 使用depth_conf过滤velocity（只使用置信度前50%的点）
+        if depth_conf is not None:
+            # 提取depth_conf并detach
+            if isinstance(depth_conf, torch.Tensor):
+                if len(depth_conf.shape) == 2:  # [H, W]
+                    depth_conf_flat = depth_conf.reshape(H * W)
+                elif len(depth_conf.shape) == 1:  # [H*W]
+                    depth_conf_flat = depth_conf
+                else:
+                    depth_conf_flat = None
 
-        return transformation
+                if depth_conf_flat is not None:
+                    # 提取对应点的depth_conf并detach
+                    object_conf = depth_conf_flat[object_indices].detach()  # [N]
+
+                    # 计算50%分位数
+                    num_points = len(object_conf)
+                    if num_points > 0:
+                        conf_threshold = torch.quantile(object_conf, 0.2)  # 取20%分位数作为阈值
+
+                        # 过滤：只保留置信度 >= 阈值的点
+                        high_conf_mask = object_conf >= conf_threshold
+
+                        if high_conf_mask.sum() > 0:
+                            object_velocities = object_velocities[high_conf_mask]
+                            # 保存高置信度mask用于后续procrustes模式过滤点云
+                            high_conf_mask_for_points = high_conf_mask
+                        else:
+                            # 如果没有点满足条件，保持原样（不过滤）
+                            high_conf_mask_for_points = None
+                else:
+                    high_conf_mask_for_points = None
+            else:
+                high_conf_mask_for_points = None
+        else:
+            high_conf_mask_for_points = None
+
+        # ========== 模式1: Simple模式 - 仅估计平移 ==========
+        if self.velocity_transform_mode == "simple":
+            # 3. 计算平均velocity
+            mean_velocity = object_velocities.mean(dim=0)  # [3]
+
+            # 4. 根据方向调整velocity
+            # direction = 1: forward (src -> dst), 使用原velocity
+            # direction = -1: backward (dst -> src), velocity取反
+            adjusted_velocity = mean_velocity * direction
+
+            # 5. 构建变换矩阵：R = I, t = adjusted_velocity (使用torch)
+            transformation = torch.eye(4, device=self.device, dtype=torch.float32)
+            transformation[:3, 3] = adjusted_velocity
+
+            return transformation
+
+        # ========== 模式2: Procrustes模式 - 估计旋转和平移 ==========
+        elif self.velocity_transform_mode == "procrustes":
+            # 3. 提取源帧物体的xyz坐标
+            points_src = clustering_src.get('points', None)
+            if points_src is None:
+                return None
+
+            labels = clustering_src.get('labels', None)
+            if labels is None:
+                return None
+
+            # 获取该物体的点云
+            object_mask = labels == cluster_idx
+            points_src_object = points_src[object_mask]  # [N, 3]
+
+            # 确保是torch tensor
+            if not isinstance(points_src_object, torch.Tensor):
+                points_src_object = torch.from_numpy(points_src_object).to(self.device).float()
+            elif points_src_object.device != torch.device(self.device):
+                points_src_object = points_src_object.to(self.device)
+
+            # 应用depth_conf过滤（如果有的话）
+            if high_conf_mask_for_points is not None:
+                points_src_object = points_src_object[high_conf_mask_for_points]
+
+            # 检查点数是否匹配
+            if len(object_velocities) != len(points_src_object):
+                # 如果不匹配，尝试截断到最小长度
+                min_len = min(len(object_velocities), len(points_src_object))
+                if min_len < 3:  # 至少需要3个点用于Procrustes
+                    # 回退到simple模式
+                    mean_velocity = object_velocities.mean(dim=0)
+                    adjusted_velocity = mean_velocity * direction
+                    transformation = torch.eye(4, device=self.device, dtype=torch.float32)
+                    transformation[:3, 3] = adjusted_velocity
+                    return transformation
+
+                object_velocities = object_velocities[:min_len]
+                points_src_object = points_src_object[:min_len]
+
+            # 4. 计算目标点：dst = src + velocity * direction
+            points_dst_object = points_src_object + object_velocities * direction  # [N, 3]
+
+            # 5. 使用Procrustes算法估计刚体变换（R和t）
+            try:
+                R, t, inlier_ratio = self.estimate_transformation_direct(
+                    points_src_object,
+                    points_dst_object
+                )
+
+                # 6. 构建4x4变换矩阵
+                transformation = torch.eye(4, device=self.device, dtype=torch.float32)
+                transformation[:3, :3] = R
+                transformation[:3, 3] = t
+
+                return transformation
+
+            except Exception as e:
+                print(f"    Procrustes估计失败: {e}，回退到simple模式")
+                # 回退到simple模式
+                mean_velocity = object_velocities.mean(dim=0)
+                adjusted_velocity = mean_velocity * direction
+                transformation = torch.eye(4, device=self.device, dtype=torch.float32)
+                transformation[:3, 3] = adjusted_velocity
+                return transformation
+
+        else:
+            print(f"    警告: 未知的velocity_transform_mode: {self.velocity_transform_mode}，使用simple模式")
+            # 默认使用simple模式
+            mean_velocity = object_velocities.mean(dim=0)
+            adjusted_velocity = mean_velocity * direction
+            transformation = torch.eye(4, device=self.device, dtype=torch.float32)
+            transformation[:3, 3] = adjusted_velocity
+            return transformation
 
     def compute_single_step_transformation(self,
                                            clustering_src: Dict,
@@ -1269,9 +1445,12 @@ class OpticalFlowRegistration:
                                            global_id: int,
                                            velocity_src: Optional[torch.Tensor] = None,
                                            velocity_dst: Optional[torch.Tensor] = None,
-                                           direction: int = 1) -> Optional[np.ndarray]:
+                                           direction: int = 1,
+                                           depth_conf_src: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
         """
         计算单步变换（相邻两帧之间）
+
+        注意：现在返回torch.Tensor以支持梯度传播
 
         Args:
             clustering_src: 源帧聚类结果
@@ -1287,9 +1466,10 @@ class OpticalFlowRegistration:
             velocity_src: 源帧velocity场 [H, W, 3]（可选，用于velocity-based方法）
             velocity_dst: 目标帧velocity场 [H, W, 3]（可选，用于velocity-based方法）
             direction: 变换方向，1表示forward (src->dst)，-1表示backward (dst->src)
+            depth_conf_src: 源帧深度置信度 [H, W]（可选，用于过滤velocity）
 
         Returns:
-            变换矩阵或None
+            变换矩阵(torch.Tensor)或None
         """
         import time
         method_start_time = time.time()
@@ -1300,7 +1480,8 @@ class OpticalFlowRegistration:
         if self.use_velocity_based_transform and velocity_src is not None:
             # 使用velocity直接计算变换（无需光流，更快更简单）
             return self._compute_velocity_based_transformation(
-                clustering_src, clustering_dst, velocity_src, velocity_dst, global_id, H, W, direction
+                clustering_src, clustering_dst, velocity_src, velocity_dst, global_id, H, W, direction,
+                depth_conf=depth_conf_src
             )
 
         # ========== Flow-based方法（原方法） ==========
@@ -1330,17 +1511,6 @@ class OpticalFlowRegistration:
         # 为了减少计算量，只选取indices_src中的部分点进行匹配（随机0.1）
         # indices_src = np.random.choice(indices_src, int(len(indices_src) * 0.5), replace=False)
 
-        # # For debug: 超级简单的方法------------------
-        # src_centroid_3d = np.mean(points_3d_src, axis=0)
-        # dst_centroid_3d = np.mean(points_3d_dst, axis=0)
-        # translation_3d = dst_centroid_3d - src_centroid_3d
-        # # 构建变换矩阵
-        # transformation = np.eye(4)
-        # transformation[:3, :3] = np.eye(3)  # 单位旋转矩阵
-        # transformation[:3, 3] = translation_3d
-        # return transformation
-        # # --------------------------------------
-
         corresponding_points = self._find_corresponding_points_direct(
             indices_src, indices_dst, flow, self.max_flow_magnitude, H, W)
         correspondence_time = time.time() - correspondence_start
@@ -1348,21 +1518,21 @@ class OpticalFlowRegistration:
         if len(corresponding_points) < 3:  # Procrustes算法至少需要3个点
             method_name = "直接索引匹配" if self.use_direct_correspondence else "光流+最近邻匹配"
 
-            # 回退方案：使用3D点质心偏移计算简单变换
+            # 回退方案：使用3D点质心偏移计算简单变换（使用torch）
             if len(points_3d_src) >= 1 and len(points_3d_dst) >= 1:
                 # 计算3D质心偏移作为简单变换
-                src_centroid_3d = np.mean(points_3d_src, axis=0)
-                dst_centroid_3d = np.mean(points_3d_dst, axis=0)
+                src_centroid_3d = torch.mean(points_3d_src, dim=0)
+                dst_centroid_3d = torch.mean(points_3d_dst, dim=0)
                 translation_3d = dst_centroid_3d - src_centroid_3d
 
-                # 构建变换矩阵
-                transformation = np.eye(4)
-                transformation[:3, :3] = np.eye(3)  # 单位旋转矩阵
+                # 构建变换矩阵（使用torch）
+                transformation = torch.eye(4, device=self.device, dtype=torch.float32)
+                transformation[:3, :3] = torch.eye(3, device=self.device, dtype=torch.float32)  # 单位旋转矩阵
                 transformation[:3, 3] = translation_3d
                 return transformation
             else:
-                # 返回单位变换矩阵
-                return np.eye(4)
+                # 返回单位变换矩阵（使用torch）
+                return torch.eye(4, device=self.device, dtype=torch.float32)
 
         # 4. 对应点数据准备
         correspondence_prep_start = time.time()
@@ -1374,19 +1544,6 @@ class OpticalFlowRegistration:
         points_3d_dst_corr = points_3d_dst[dst_indices]
         correspondence_prep_time = time.time() - correspondence_prep_start
 
-
-        # For debug: 超级简单的方法------------------
-        src_centroid_3d = np.mean(points_3d_src_corr, axis=0)
-        dst_centroid_3d = np.mean(points_3d_dst_corr, axis=0)
-        translation_3d = dst_centroid_3d - src_centroid_3d
-        # 构建变换矩阵
-        transformation = np.eye(4)
-        transformation[:3, :3] = np.eye(3)  # 单位旋转矩阵
-        transformation[:3, 3] = translation_3d
-        return transformation
-        # --------------------------------------
-
-
         # 5. 变换估计
         transformation_estimation_start = time.time()
         # 使用Procrustes算法估计变换
@@ -1397,15 +1554,24 @@ class OpticalFlowRegistration:
         # 检查内点比例
         if inlier_ratio < self.min_inliers_ratio:
             method_total_time = time.time() - method_start_time
-            pass  # 单步变换性能分析已移除
             print(
-                f"          调试: 内点比例过低 - {inlier_ratio:.3f} < {self.min_inliers_ratio}")
-            return None
+                f"          调试: 内点比例过低 - {inlier_ratio:.3f} < {self.min_inliers_ratio}, 使用简单质心平移方法")
 
-        # 6. 变换矩阵构建
+            # Fallback: 使用超级简单的方法（只用质心平移，使用torch保持梯度）
+            src_centroid_3d = torch.mean(points_3d_src_corr, dim=0)
+            dst_centroid_3d = torch.mean(points_3d_dst_corr, dim=0)
+            translation_3d = dst_centroid_3d - src_centroid_3d
+
+            # 构建变换矩阵（使用torch）
+            transformation = torch.eye(4, device=self.device, dtype=torch.float32)
+            transformation[:3, :3] = torch.eye(3, device=self.device, dtype=torch.float32)  # 单位旋转矩阵
+            transformation[:3, 3] = translation_3d
+            return transformation
+
+        # 6. 变换矩阵构建（使用torch）
         matrix_construction_start = time.time()
         # 构建变换矩阵
-        transformation = np.eye(4)
+        transformation = torch.eye(4, device=self.device, dtype=torch.float32)
         transformation[:3, :3] = R
         transformation[:3, 3] = t
         matrix_construction_time = time.time() - matrix_construction_start
@@ -1735,7 +1901,7 @@ class OpticalFlowRegistration:
             extracted_gaussians = gaussian_params[0, valid_global_indices].clone()  # [N_valid, 14]
 
             # 用聚合后的点坐标替换Gaussian参数的前三维
-            aggregated_points_tensor = torch.from_numpy(aggregated_points).float()
+            aggregated_points_tensor = torch.from_numpy(aggregated_points).float() # FIXME:
 
             # 只使用有效索引对应的点
             valid_points = aggregated_points_tensor[valid_mask]
@@ -1811,19 +1977,33 @@ class OpticalFlowRegistration:
             print(f"    提取Gaussian参数失败: {e}")
             return None
 
-    def _apply_transformation(self, points: torch.Tensor, transformation: np.ndarray) -> np.ndarray:
-        """应用变换矩阵到点云"""
-        points_np = points.detach().cpu().numpy()
+    def _apply_transformation(self, points: torch.Tensor, transformation: torch.Tensor) -> np.ndarray:
+        """应用变换矩阵到点云
 
-        # 转换为齐次坐标
-        points_homo = np.concatenate(
-            [points_np, np.ones((len(points_np), 1))], axis=1)
+        Args:
+            points: Input points as torch.Tensor (N, 3)
+            transformation: 4x4 transformation matrix as torch.Tensor
 
-        # 应用变换
-        transformed_points_homo = (transformation @ points_homo.T).T
+        Returns:
+            Transformed points as numpy array (N, 3)
+        """
+        # Ensure transformation is a torch tensor
+        if isinstance(transformation, np.ndarray):
+            transformation = torch.from_numpy(transformation).to(self.device).float()
 
-        # 返回3D坐标
-        return transformed_points_homo[:, :3]
+        # Ensure points are on the same device
+        if points.device != transformation.device:
+            points = points.to(transformation.device)
+
+        # Convert to homogeneous coordinates (torch)
+        ones = torch.ones((points.shape[0], 1), device=points.device, dtype=points.dtype)
+        points_homo = torch.cat([points, ones], dim=1)  # (N, 4)
+
+        # Apply transformation (torch matmul)
+        transformed_points_homo = torch.matmul(points_homo, transformation.T)  # (N, 4)
+
+        # Return 3D coordinates as numpy
+        return transformed_points_homo[:, :3].detach().cpu().numpy()
 
     def process_pointcloud_data(self, data_path: str, output_dir: str) -> Dict:
         """

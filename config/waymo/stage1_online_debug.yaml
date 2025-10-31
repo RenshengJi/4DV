@@ -8,7 +8,8 @@ model: "VGGT(img_size=518, patch_size=14, embed_dim=1024)"
 # pretrained: model.pt
 # pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow+depthgrad(true)+depth+flowgradconf+aggregatorenderloss+fixopacity+no1opacityloss+fixdirection+fromvresume+lpips/checkpoint-epoch_0_2848.pth"
 pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow/checkpoint-epoch_7_9968.pth"
-
+# pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/aggregator_resume_noflowgrad_nearestdynamic_resume_0point1_novoxel/checkpoint-epoch_0_19936.pth"
+# pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/fix_velocity/checkpoint-epoch_0_3255.pth"
 
 
 # VGGT冻结策略配置
@@ -59,7 +60,7 @@ training_stage: 'stage1'
 # 权重为0则完全不计算该损失
 
 # 1. Self Render Loss (训练gaussian head)
-self_render_weight: 0.0                    # Gaussian参数学习的主要损失 (已弃用，使用下面的分项权重)
+self_render_weight: 1.0                    # Gaussian参数学习的主要损失 (已弃用，使用下面的分项权重)
 self_render_rgb_weight: 1.0                # RGB损失权重
 self_render_lpips_weight: 0.1              # LPIPS感知损失权重
 self_render_depth_weight: 1.0              # 深度损失权重
@@ -70,9 +71,12 @@ flow_interval: 1                           # 光流计算的帧间隔
 
 # 3. GT Flow Loss (直接使用GT flowmap监督velocity head)
 # 类似depth loss，返回三个损失：conf、reg、grad
-conf_flow_loss_weight: 1.0                 # GT flowmap conf损失权重
-grad_flow_loss_weight: 1.0                 # GT flowmap gradient损失权重
-reg_flow_loss_weight: 1.0                  # GT flowmap reg损失权重
+conf_flow_loss_weight: 0.0                 # GT flowmap conf损失权重
+grad_flow_loss_weight: 0.0                 # GT flowmap gradient损失权重
+reg_flow_loss_weight: 0.0                  # GT flowmap reg损失权重
+
+# 3b. GT Flow Loss Ours (我们自己实现的版本)
+gt_flow_loss_ours_weight: 1.0              # 自定义GT flowmap损失权重
 
 # 4. SAM2 Velocity Consistency Loss (辅助velocity head监督)
 sam2_velocity_weight: 0.0                  # SAM2掩码一致性监督
@@ -102,11 +106,33 @@ reg_depth_loss_weight: 1.0                      # 深度正则化损失权重
 scale_loss_weight: 1.0                      # 场景尺度预测损失权重
 
 # 12. Aggregator Render Loss (监督gaussian_head，辅助监督depth和velocity)
-aggregator_render_rgb_weight: 1.0           # Aggregator render RGB损失权重
-aggregator_render_depth_weight: 1.0         # Aggregator render depth损失权重
-aggregator_render_lpips_weight: 0.1         # Aggregator render LPIPS损失权重
+aggregator_render_rgb_weight: 0.0           # Aggregator render RGB损失权重
+aggregator_render_depth_weight: 0.0         # Aggregator render depth损失权重
+aggregator_render_lpips_weight: 0.0         # Aggregator render LPIPS损失权重
 aggregator_voxel_size: 0.05                # 体素量化大小(metric尺度, 单位m)
 aggregator_dynamic_threshold: 0.1          # 动静态分离的速度阈值(metric尺度, 单位m/s)
+
+# 13. Aggregator_all Render Loss (代替Stage2 refine网络的渲染loss)
+# 这个loss直接在Stage1中使用动态物体处理+渲染监督,跳过Stage2的refine网络
+# 需要enable_stage2=true才能使用(需要OnlineDynamicProcessor和Stage2Loss)
+aggregator_all_render_rgb_weight: 1.0      # Aggregator_all RGB渲染损失权重
+aggregator_all_render_depth_weight: 1.0    # Aggregator_all depth渲染损失权重
+aggregator_all_static_black_weight: 0.0    # 非动态区域渲染为黑色的loss权重
+# Stage2配置（用于aggregator_all loss的渲染配置）
+stage2_render_only_dynamic: false          # 是否只渲染动态物体
+stage2_supervise_only_dynamic: false       # 是否只监督动态区域
+stage2_static_black_weight: 0.0            # 非动态区域渲染为黑色的loss权重
+# 动态处理器配置（用于aggregator_all loss的动态物体处理）
+min_object_size: 100                       # 最小物体尺寸（点数）
+max_objects_per_frame: 10                  # 每帧最大物体数量
+velocity_threshold: 0.1                    # 速度阈值（metric尺度，m/s）
+clustering_eps: 0.02                       # DBSCAN邻域半径
+clustering_min_samples: 10                 # DBSCAN最小样本数
+tracking_position_threshold: 2.0           # 位置匹配阈值
+tracking_velocity_threshold: 0.2           # 速度匹配阈值
+enable_optical_flow_aggregation: true      # 是否使用光流聚合
+use_velocity_based_transform: true        # 是否使用velocity直接计算变换（false=光流方法，true=velocity方法）
+velocity_transform_mode: "procrustes"          # velocity变换模式: "simple"(仅T)或"procrustes"(R+T)
 
 # =============== 数据集配置 ===============
 
@@ -160,11 +186,14 @@ task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/
 
-# =============== 第二阶段配置 (禁用) ===============
-# 第一阶段训练时禁用第二阶段
-enable_stage2: false
-stage2_start_epoch: 999                    # 设置很大的值以禁用
+# =============== 第二阶段配置 ===============
+# 注意：如果使用 aggregator_all_render loss，需要设置 enable_stage2: true
+# 但保持 training_stage: 'stage1'，这样只初始化动态处理器和loss，不训练refine网络
+enable_stage2: false                       # 设为true以启用aggregator_all loss
+stage2_start_epoch: 999                    # 设置很大的值以禁用Stage2训练
 stage2_frequency: 999
+
+
 
 # =============== Hydra配置 ===============
 hydra:

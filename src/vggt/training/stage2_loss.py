@@ -124,7 +124,8 @@ class Stage2RenderLoss(nn.Module):
         depth_weight: float = 0.0,  # 禁用depth loss
         render_only_dynamic: bool = False,  # 是否只渲染动态物体
         supervise_only_dynamic: bool = False,  # 是否只监督动态区域
-        static_black_weight: float = 0.1  # 非动态区域渲染为黑色的loss权重
+        static_black_weight: float = 0.1,  # 非动态区域渲染为黑色的loss权重
+        supervise_middle_frame_only: bool = False  # 是否只渲染监督中间帧
     ):
         super().__init__()
         self.rgb_weight = rgb_weight
@@ -132,6 +133,7 @@ class Stage2RenderLoss(nn.Module):
         self.render_only_dynamic = render_only_dynamic
         self.supervise_only_dynamic = supervise_only_dynamic
         self.static_black_weight = static_black_weight
+        self.supervise_middle_frame_only = supervise_middle_frame_only
 
     def forward(
         self,
@@ -174,7 +176,17 @@ class Stage2RenderLoss(nn.Module):
 
         # 渲染每一帧 - 确保frame_idx不超过张量的维度
         actual_S = min(S, intrinsics.shape[1], extrinsics.shape[1])
-        for frame_idx in range(actual_S):
+
+        # 确定要渲染的帧范围
+        if self.supervise_middle_frame_only:
+            # 只渲染中间帧
+            middle_frame_idx = actual_S // 2
+            frame_indices = [middle_frame_idx]
+        else:
+            # 渲染所有帧
+            frame_indices = list(range(actual_S))
+
+        for frame_idx in frame_indices:
             frame_intrinsic = intrinsics[0, frame_idx]  # [3, 3]
             frame_extrinsic = extrinsics[0, frame_idx]  # [4, 4]
             frame_gt_image = gt_images[0, frame_idx]  # [3, H, W]

@@ -59,36 +59,37 @@ class OnlineStage2Trainer:
         self.stage2_start_epoch = stage2_start_epoch
         self.stage2_frequency = stage2_frequency
         self.memory_efficient = memory_efficient
-        
-        if not enable_stage2:
-            print("Stage2 training disabled")
-            return
-        
-        # 初始化第二阶段模型
-        self.stage2_model = self._create_stage2_model(stage2_config)
-        self.stage2_criterion = self._create_stage2_criterion(stage2_config)
-        
-        # 初始化在线动态物体处理器
+
+        # 初始化在线动态物体处理器和loss函数（即使stage2禁用，也可能被aggregator_all loss使用）
         self.dynamic_processor = OnlineDynamicProcessor(
             device=device,
             memory_efficient=memory_efficient,
             **stage2_config.get('dynamic_processor', {})
         )
-        
-        # 优化器（将在外部设置）
-        self.stage2_optimizer = None
-        
-        # 统计信息
+        self.stage2_criterion = self._create_stage2_criterion(stage2_config)
+
+        # 统计信息（总是初始化，便于外部调用）
         self.stage2_iteration_count = 0
         self.last_stage2_loss = 0.0
         self.stage2_training_time = 0.0
-        self.stage2_skip_count = 0  # 跳过的训练次数
-        self.stage2_memory_usage = []  # 内存使用记录
+        self.stage2_skip_count = 0
+        self.stage2_memory_usage = []
 
         # 网络耗时统计
-        self.gaussian_refine_times = []  # Gaussian refine网络耗时
-        self.pose_refine_times = []  # Pose refine网络耗时
-        
+        self.gaussian_refine_times = []
+        self.pose_refine_times = []
+
+        if not enable_stage2:
+            print("Stage2 training disabled (but dynamic_processor and criterion are available)")
+            print(f"  - Memory efficient mode: {memory_efficient}")
+            return
+
+        # 初始化第二阶段模型（仅在enable_stage2=True时需要）
+        self.stage2_model = self._create_stage2_model(stage2_config)
+
+        # 优化器（将在外部设置）
+        self.stage2_optimizer = None
+
         print(f"OnlineStage2Trainer initialized:")
         print(f"  - Start epoch: {stage2_start_epoch}")
         print(f"  - Training frequency: {stage2_frequency}")
@@ -96,36 +97,29 @@ class OnlineStage2Trainer:
     
     def _create_stage2_model(self, config: Dict[str, Any]) -> Stage2Refiner:
         """创建第二阶段模型"""
-        # 使用稀疏卷积配置
+        # Gaussian细化网络配置
         gaussian_refine_config = {
             "input_gaussian_dim": config.get('input_gaussian_dim', 14),
             "output_gaussian_dim": config.get('output_gaussian_dim', 14),
             "feature_dim": config.get('gaussian_feature_dim', 128),
             "num_conv_layers": config.get('gaussian_num_conv_layers', 2),
-            "voxel_size": config.get('gaussian_voxel_size', 0.05),
-            "max_num_points_per_voxel": config.get('max_num_points_per_voxel', 5),
-            "use_dilated_conv": config.get('use_dilated_conv', False),
-            "dilation_rates": config.get('gaussian_dilation_rates', None)
+            "voxel_size": config.get('gaussian_voxel_size', 0.05)
         }
 
+        # 位姿细化网络配置
         pose_refine_config = {
-            "input_dim": 3,
+            "input_dim": config.get('pose_input_dim', 3),
             "feature_dim": config.get('pose_feature_dim', 128),
             "num_conv_layers": config.get('pose_num_conv_layers', 2),
             "voxel_size": config.get('pose_voxel_size', 0.1),
-            "max_points": config.get('max_points_per_object', 4096),
-            "use_dilated_conv": config.get('use_dilated_conv', False),
-            "dilation_rates": config.get('pose_dilation_rates', None)
+            "max_points": config.get('pose_max_points', 4096)
         }
 
         training_mode = config.get('stage2_training_mode', config.get('training_mode', 'joint'))
-        print(f"  - Stage2 training mode: {training_mode}")
 
-        # 打印dilated conv配置
-        if config.get('use_dilated_conv', False):
-            print(f"  - Using dilated convolution:")
-            print(f"    Gaussian dilation rates: {config.get('gaussian_dilation_rates', None)}")
-            print(f"    Pose dilation rates: {config.get('pose_dilation_rates', None)}")
+        print(f"  - Stage2 training mode: {training_mode}")
+        print(f"  - Gaussian refine config: feature_dim={gaussian_refine_config['feature_dim']}, num_layers={gaussian_refine_config['num_conv_layers']}")
+        print(f"  - Pose refine config: feature_dim={pose_refine_config['feature_dim']}, num_layers={pose_refine_config['num_conv_layers']}")
 
         model = Stage2Refiner(
             gaussian_refine_config=gaussian_refine_config,
@@ -145,6 +139,7 @@ class OnlineStage2Trainer:
             'render_only_dynamic': config.get('stage2_render_only_dynamic', False),  # 是否只渲染动态物体
             'supervise_only_dynamic': config.get('stage2_supervise_only_dynamic', False),  # 是否只监督动态区域
             'static_black_weight': config.get('stage2_static_black_weight', 0.1),  # 非动态区域渲染为黑色的loss权重
+            'supervise_middle_frame_only': config.get('stage2_supervise_middle_frame_only', False),  # 是否只渲染监督中间帧
         }
 
         criterion = Stage2CompleteLoss(

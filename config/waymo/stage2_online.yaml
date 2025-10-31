@@ -114,20 +114,22 @@ stage2_frequency: 1                       # 每个iteration都进行第二阶段
 stage2_loss_weight: 1.0                   # 第二阶段渲染损失权重
 
 # 第二阶段模型配置（稀疏卷积）
+# Gaussian细化网络配置
 input_gaussian_dim: 14
 output_gaussian_dim: 14
-gaussian_feature_dim: 384                 # 增加到384以提升网络容量（Plan C）
-gaussian_num_conv_layers: 10              # 增加到10层以提升网络容量（Plan C）
+gaussian_feature_dim: 384                 # 特征维度，增加到384以提升网络容量
+gaussian_num_conv_layers: 10              # 卷积层数，增加到10层以提升网络容量
 gaussian_voxel_size: 0.05                 # Gaussian细化体素大小（米），保持高分辨率
-use_dilated_conv: true                    # 启用dilated convolution
-gaussian_dilation_rates: [1, 2, 2, 4, 4, 8, 8, 16, 16, 16]
-max_num_points_per_voxel: 5
-pose_feature_dim: 384                     # 增加到384以提升网络容量（Plan C）
-pose_num_conv_layers: 10                  # 增加到10层以提升网络容量（Plan C）
+
+# 位姿细化网络配置
+pose_input_dim: 3                         # 输入维度（xyz坐标）
+pose_feature_dim: 384                     # 特征维度，增加到384以提升网络容量
+pose_num_conv_layers: 10                  # 卷积层数，增加到10层以提升网络容量
 pose_voxel_size: 0.1                      # 位姿细化体素大小（米）
-pose_dilation_rates: [1, 2, 2, 4, 4, 8, 8, 16, 16, 16]         
-max_points_per_object: 4096
-stage2_training_mode: 'joint'             # 第二阶段专用的refine模式
+pose_max_points: 4096                     # 每个物体最大点数
+
+# 训练模式
+stage2_training_mode: 'gaussian_only'     # 第二阶段专用的refine模式：'joint', 'gaussian_only', 'pose_only'             # 第二阶段专用的refine模式
 
 # 第二阶段损失配置
 stage2_rgb_loss_weight: 1.0               # RGB渲染损失
@@ -135,12 +137,13 @@ stage2_depth_loss_weight: 1.0             # 深度渲染损失
 stage2_render_only_dynamic: true          # 是否只渲染动态物体（不渲染静态背景）
 stage2_supervise_only_dynamic: true       # 是否只监督动态区域（使用2D pixel mask）
 stage2_static_black_weight: 1.0           # 非动态区域渲染为黑色的loss权重
+stage2_supervise_middle_frame_only: true # 是否只渲染监督中间帧（true=只监督中间帧，false=监督所有帧）
 
 # 动态处理器配置
 min_object_size: 100                      # 最小物体尺寸（点数）
 max_objects_per_frame: 10                 # 每帧最大物体数量
 enable_optical_flow_aggregation: true     # 是否使用光流聚合
-use_velocity_based_transform: true       # 是否使用velocity直接计算变换（false=光流方法，true=velocity方法）
+use_velocity_based_transform: false       # 是否使用velocity直接计算变换（false=光流方法，true=velocity方法）
 
 # Stage 2: 动态物体聚类参数
 velocity_threshold: 0.1                   # 速度阈值（metric尺度，m/s）
@@ -198,7 +201,7 @@ num_imgs_vis: 4
 
 # =============== 输出配置 ===============
 save_dir: 'checkpoints/waymo_stage2_online'
-exp_name: 'stage2_train+5e-4+biggermodel+onlydynamic+onlymeans'
+exp_name: 'stage2_train+5e-4+biggermodel+onlydynamic+poseinput+gaussian_only+flow+10layers+onlymiddle'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/

@@ -413,22 +413,54 @@ def _import_optical_flow():
         import importlib.util
         import sys
 
-        # 添加根目录到sys.path
+        # 添加根目录和src目录到sys.path
         root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        if root_dir not in sys.path:
-            sys.path.insert(0, root_dir)
+        src_dir = os.path.join(root_dir, 'src')
+        vggt_dir = os.path.join(src_dir, 'vggt')  # vggt 模块目录
+        raft_core_dir = os.path.join(src_dir, 'SEA-RAFT', 'core')  # RAFT 模块目录
+        optical_flow_path = os.path.join(root_dir, "optical_flow_registration.py")
+
+        # 检查文件是否存在
+        if not os.path.exists(optical_flow_path):
+            _print_main(f"Error: optical_flow_registration.py not found at: {optical_flow_path}")
+            _print_main(f"Root dir: {root_dir}")
+            _print_main(f"Current file: {__file__}")
+            return None
+
+        # 添加必要的路径到sys.path（用于导入vggt、raft等模块）
+        # - vggt_dir: 用于 'from vggt.utils.auxiliary import ...'
+        # - raft_core_dir: 用于 'from raft import RAFT'
+        for path in [root_dir, src_dir, vggt_dir, raft_core_dir]:
+            if path not in sys.path:
+                sys.path.insert(0, path)
 
         optical_flow_spec = importlib.util.spec_from_file_location(
             "optical_flow_reg",
-            os.path.join(root_dir, "optical_flow_registration.py")
+            optical_flow_path
         )
-        optical_flow_module = importlib.util.module_from_spec(
-            optical_flow_spec)
+
+        if optical_flow_spec is None:
+            _print_main(f"Error: Failed to create spec for {optical_flow_path}")
+            return None
+
+        optical_flow_module = importlib.util.module_from_spec(optical_flow_spec)
+
+        if optical_flow_spec.loader is None:
+            _print_main(f"Error: Spec loader is None for {optical_flow_path}")
+            return None
+
         optical_flow_spec.loader.exec_module(optical_flow_module)
+
+        if not hasattr(optical_flow_module, 'OpticalFlowRegistration'):
+            _print_main(f"Error: OpticalFlowRegistration class not found in module")
+            _print_main(f"Available attributes: {dir(optical_flow_module)}")
+            return None
 
         return optical_flow_module.OpticalFlowRegistration
     except Exception as e:
         _print_main(f"Failed to import optical flow: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -456,6 +488,7 @@ class OnlineDynamicProcessor:
         tracking_velocity_threshold: float = 0.2,  # 跨帧跟踪速度阈值
         use_optical_flow_aggregation: bool = True,
         use_velocity_based_transform: bool = False,  # 使用velocity计算变换（无需光流）
+        velocity_transform_mode: str = "simple",  # velocity变换模式: "simple"或"procrustes"
         enable_temporal_cache: bool = True,
         cache_size: int = 16
     ):
@@ -473,6 +506,10 @@ class OnlineDynamicProcessor:
             tracking_position_threshold: 跨帧跟踪位置阈值
             tracking_velocity_threshold: 跨帧跟踪速度阈值
             use_optical_flow_aggregation: 是否使用光流聚合
+            use_velocity_based_transform: 是否使用velocity计算变换（无需光流）
+            velocity_transform_mode: velocity变换模式
+                - "simple": 仅用velocity平均值估计平移T，旋转R为单位矩阵（快速）
+                - "procrustes": 使用xyz+velocity，用Procrustes算法估计完整R和T（更准确）
             enable_temporal_cache: 是否启用时序缓存
             cache_size: 缓存大小
         """
@@ -486,24 +523,37 @@ class OnlineDynamicProcessor:
         self.tracking_position_threshold = tracking_position_threshold
         self.tracking_velocity_threshold = tracking_velocity_threshold
         self.use_optical_flow_aggregation = use_optical_flow_aggregation
+        self.velocity_transform_mode = velocity_transform_mode
 
-        # 初始化光流配准系统
+        # 初始化光流配准系统（必须成功）
         self.optical_flow_registration = None
         self._optical_flow_class = None
         if use_optical_flow_aggregation:
             self._optical_flow_class = _import_optical_flow()
-            # 立即初始化光流配准系统
-            if self._optical_flow_class is not None:
-                try:
-                    self.optical_flow_registration = self._optical_flow_class(
-                        device=str(device),
-                        min_inliers_ratio=0.1,  # 降低最小内点比例
-                        ransac_threshold=5.0,   # 增加RANSAC阈值
-                        max_flow_magnitude=200.0,  # 增加最大光流幅度
-                        use_velocity_based_transform=use_velocity_based_transform  # 使用velocity计算变换
-                    )
-                except Exception as e:
-                    self.optical_flow_registration = None
+
+            # 必须成功导入光流类
+            if self._optical_flow_class is None:
+                raise RuntimeError(
+                    "Failed to import OpticalFlowRegistration class. "
+                    "Please ensure optical_flow_registration.py exists and is accessible."
+                )
+
+            # 立即初始化光流配准系统（必须成功）
+            try:
+                self.optical_flow_registration = self._optical_flow_class(
+                    device=str(device),
+                    min_inliers_ratio=0.1,  # 降低最小内点比例
+                    ransac_threshold=5.0,   # 增加RANSAC阈值
+                    max_flow_magnitude=200.0,  # 增加最大光流幅度
+                    use_velocity_based_transform=use_velocity_based_transform,  # 使用velocity计算变换
+                    velocity_transform_mode=velocity_transform_mode  # velocity变换模式
+                )
+                _print_main(f"✓ Optical flow registration initialized successfully")
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to initialize OpticalFlowRegistration: {e}. "
+                    "Optical flow aggregation is required and must be initialized successfully."
+                ) from e
 
         # 聚类函数已直接定义在此文件中，不需要缓存
 
@@ -553,12 +603,12 @@ class OnlineDynamicProcessor:
 
             # ========== Stage 1: 数据预处理 ==========
             preprocessing_start = time.time()
-            preds = self._preprocess_predictions(preds, images, B, S, H, W)
+            preds = self._preprocess_predictions(preds, vggt_batch, images, B, S, H, W)
             velocity = preds.get('velocity')
             gaussian_params = preds.get('gaussian_params')
             stage_times['preprocessing'] = time.time() - preprocessing_start
 
-            # ========== Stage 2: 聚类 + 背景分离 ==========
+            # ========== Stage 2: 聚类 + 背景分离 ========== FIXME: points need grad?
             clustering_start = time.time()
             clustering_results = self._perform_clustering_with_existing_method(preds, vggt_batch, velocity)
             static_gaussians = self._create_static_background_from_labels(preds, clustering_results, H, W, S, sky_masks)
@@ -605,6 +655,7 @@ class OnlineDynamicProcessor:
     def _preprocess_predictions(
         self,
         preds: Dict[str, Any],
+        vggt_batch: Dict[str, Any],
         images: torch.Tensor,
         B: int, S: int, H: int, W: int
     ) -> Dict[str, Any]:
@@ -693,24 +744,18 @@ class OnlineDynamicProcessor:
         gaussian_params: torch.Tensor,
         H: int, W: int
     ) -> List[Dict]:
-        """聚合动态物体（使用光流或简单方法）"""
+        """聚合动态物体（必须使用光流聚合）"""
         if not matched_clustering_results:
             return []
 
-        # 尝试使用光流聚合
-        if self.optical_flow_registration is not None:
-            try:
-                dynamic_objects, _ = self._aggregate_with_existing_optical_flow_method(
-                    matched_clustering_results, preds, vggt_batch
-                )
-                return dynamic_objects
-            except Exception as e:
-                _print_main(f"  光流聚合失败，使用简单方法: {e}")
+        # 必须使用光流聚合
+        if self.optical_flow_registration is None:
+            raise RuntimeError("Optical flow registration is not initialized! Must use optical flow aggregation.")
 
-        # 回退到简单方法
-        return self._create_objects_from_clustering_results(
-            matched_clustering_results, gaussian_params, H, W, preds
+        dynamic_objects, _ = self._aggregate_with_existing_optical_flow_method(
+            matched_clustering_results, preds, vggt_batch
         )
+        return dynamic_objects
 
     def _update_stats(self, num_objects: int, total_time: float):
         """更新处理统计信息"""

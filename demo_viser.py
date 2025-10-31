@@ -439,12 +439,12 @@ parser = argparse.ArgumentParser(description="VGGT demo with viser for 3D visual
 # parser.add_argument(
 #     "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/val/segment-1505698981571943321_1186_773_1206_773_with_camera_labels.tfrecord", help="Path to folder containing images"
 # )
-# parser.add_argument(
-#     "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train/segment-15795616688853411272_1245_000_1265_000_with_camera_labels.tfrecord", help="Path to folder containing images"
-# )
 parser.add_argument(
-    "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train/segment-10023947602400723454_1120_000_1140_000_with_camera_labels.tfrecord", help="Path to folder containing images"
+    "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train/segment-15795616688853411272_1245_000_1265_000_with_camera_labels.tfrecord", help="Path to folder containing images"
 )
+# parser.add_argument(
+#     "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train/segment-10023947602400723454_1120_000_1140_000_with_camera_labels.tfrecord", help="Path to folder containing images"
+# )
 # parser.add_argument(
 #     "--image_folder", type=str, default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train/segment-14830022845193837364_3488_060_3508_060_with_camera_labels.tfrecord", help="Path to folder containing images"
 # )
@@ -495,14 +495,14 @@ def main():
     print("Initializing and loading VGGT model...")
     # model = VGGT.from_pretrained("facebook/VGGT-1B")
 
-    model = VGGT()
+    # model = VGGT()
     # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo/step2(true+fixmodel+lowlr!+nolpips+onlyflow+velocitylocal+fromscratch)/checkpoint-epoch_2_17880.pth", map_location=device)['model']
-    ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/aggregator_resume_noflowgrad_nearestdynamic_resume_nostatic_novoxel/checkpoint-epoch_0_8544.pth", map_location=device)['model']
+    # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/aggregator_all/checkpoint-epoch_0_25632.pth", map_location=device)['model']
     # ckpt = torch.load("/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow/checkpoint-epoch_4_24208.pth", map_location=device)['model']
-    ckpt = {k.replace("module.", ""): v for k, v in ckpt.items()}
-    model.load_state_dict(ckpt, strict=False)
-    # model = VGGT(use_sky_token=False, use_scale_token=False)    
-    # model.load_state_dict(torch.load("src/model.pt"), strict=False)
+    # ckpt = {k.replace("module.", ""): v for k, v in ckpt.items()}
+    # model.load_state_dict(ckpt, strict=False)
+    model = VGGT(use_sky_token=False, use_scale_token=False)    
+    model.load_state_dict(torch.load("src/model.pt"), strict=False)
 
     model.eval()
     model = model.to(device)

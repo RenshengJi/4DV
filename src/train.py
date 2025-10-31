@@ -141,7 +141,7 @@ def train(args):
         gradient_accumulation_steps=args.accum_iter,
         mixed_precision="bf16",
         kwargs_handlers=[
-            # DistributedDataParallelKwargs(find_unused_parameters=True),
+            DistributedDataParallelKwargs(find_unused_parameters=True),
             InitProcessGroupKwargs(timeout=timedelta(seconds=6000)),
         ],
     )
@@ -151,18 +151,22 @@ def train(args):
     
     # 初始化在线第二阶段训练器
     stage2_config = {
-        # 模型配置
+        # Gaussian细化网络配置（稀疏卷积）
         'input_gaussian_dim': getattr(args, 'input_gaussian_dim', 14),
-        'output_gaussian_dim': getattr(args, 'output_gaussian_dim', 11),
+        'output_gaussian_dim': getattr(args, 'output_gaussian_dim', 14),
         'gaussian_feature_dim': getattr(args, 'gaussian_feature_dim', 128),
-        'gaussian_num_layers': getattr(args, 'gaussian_num_layers', 2),
-        'gaussian_num_heads': getattr(args, 'gaussian_num_heads', 4),
-        'gaussian_mlp_ratio': getattr(args, 'gaussian_mlp_ratio', 2.0),
+        'gaussian_num_conv_layers': getattr(args, 'gaussian_num_conv_layers', 2),
+        'gaussian_voxel_size': getattr(args, 'gaussian_voxel_size', 0.05),
+
+        # 位姿细化网络配置（稀疏卷积）
+        'pose_input_dim': getattr(args, 'pose_input_dim', 3),
         'pose_feature_dim': getattr(args, 'pose_feature_dim', 128),
-        'pose_num_heads': getattr(args, 'pose_num_heads', 4),
-        'pose_num_layers': getattr(args, 'pose_num_layers', 2),
-        'max_points_per_object': getattr(args, 'max_points_per_object', 2048),
-        'training_mode': getattr(args, 'stage2_training_mode', 'joint'),
+        'pose_num_conv_layers': getattr(args, 'pose_num_conv_layers', 2),
+        'pose_voxel_size': getattr(args, 'pose_voxel_size', 0.1),
+        'pose_max_points': getattr(args, 'pose_max_points', 4096),
+
+        # 训练模式
+        'stage2_training_mode': getattr(args, 'stage2_training_mode', 'joint'),
 
         # 损失配置 - 使用stage2_前缀的键名以匹配online_stage2_trainer.py
         'stage2_rgb_loss_weight': getattr(args, 'stage2_rgb_loss_weight', 0.5),
@@ -181,7 +185,8 @@ def train(args):
             'tracking_position_threshold': getattr(args, 'tracking_position_threshold', 2.0),
             'tracking_velocity_threshold': getattr(args, 'tracking_velocity_threshold', 0.2),
             'use_optical_flow_aggregation': getattr(args, 'enable_optical_flow_aggregation', True),
-            'use_velocity_based_transform': getattr(args, 'use_velocity_based_transform', False)
+            'use_velocity_based_transform': getattr(args, 'use_velocity_based_transform', False),
+            'velocity_transform_mode': getattr(args, 'velocity_transform_mode', 'simple')
         }
     }
     
@@ -609,6 +614,9 @@ def train(args):
                     'aggregator_render_rgb_weight': getattr(args, 'aggregator_render_rgb_weight', 1.0),
                     'aggregator_render_depth_weight': getattr(args, 'aggregator_render_depth_weight', 1.0),
                     'aggregator_render_lpips_weight': getattr(args, 'aggregator_render_lpips_weight', 0.0),
+                    'aggregator_all_render_rgb_weight': getattr(args, 'aggregator_all_render_rgb_weight', 0.0),
+                    'aggregator_all_render_depth_weight': getattr(args, 'aggregator_all_render_depth_weight', 0.0),
+                    'aggregator_all_static_black_weight': getattr(args, 'aggregator_all_static_black_weight', 0.0),
                 }
 
                 # VGGT teacher predictions
@@ -963,6 +971,121 @@ def train(args):
                         import traceback
                         traceback.print_exc()
 
+                # 12. Aggregator_all Render Loss (代替Stage2 refine网络的渲染loss)
+                # 这个loss直接在Stage1中使用动态物体处理+渲染监督,跳过Stage2的refine网络
+                aggregator_all_rgb_weight = loss_weights.get('aggregator_all_render_rgb_weight', 0.0)
+                aggregator_all_depth_weight = loss_weights.get('aggregator_all_render_depth_weight', 0.0)
+                aggregator_all_static_black_weight = loss_weights.get('aggregator_all_static_black_weight', 0.0)
+
+                if (aggregator_all_rgb_weight > 0 or
+                    aggregator_all_depth_weight > 0 or
+                    aggregator_all_static_black_weight > 0) and \
+                   online_stage2_trainer is not None and \
+                   hasattr(online_stage2_trainer, 'dynamic_processor') and \
+                   hasattr(online_stage2_trainer, 'stage2_criterion'):
+                    try:
+                        # 修复velocity前三行异常 (与Stage2训练逻辑一致). FIXME:
+                        # if 'velocity' in preds and preds['velocity'] is not None:
+                        #     velocity = preds['velocity']  # [B, S, H, W, 3]
+                        #     if velocity.dim() == 5 and velocity.shape[2] >= 5:
+                        #         velocity[:, :, :5, :, :] = 0.0
+                        #         preds['velocity'] = velocity
+
+                        # Step 1: 处理动态物体 (使用OnlineDynamicProcessor)
+                        # Detach pose_enc before processing to prevent gradient flow
+                        preds_for_dynamic = preds.copy()
+                        if 'pose_enc' in preds_for_dynamic:
+                            preds_for_dynamic['pose_enc'] = preds_for_dynamic['pose_enc'].detach() 
+                            # preds_for_dynamic['velocity'] = preds_for_dynamic['velocity'].detach() 
+
+                        dynamic_objects_data = online_stage2_trainer.dynamic_processor.process_dynamic_objects(
+                            preds_for_dynamic, vggt_batch, auxiliary_models
+                        )
+
+                        # 检查是否有有效的动态物体（注意：即使没有动态物体，也要计算静态物体的loss）
+                        num_objects = len(dynamic_objects_data['dynamic_objects']) if dynamic_objects_data else 0
+                        has_valid_dynamic = num_objects > 0 and online_stage2_trainer._validate_dynamic_objects(dynamic_objects_data)
+
+                        # 无论是否有动态物体，都需要计算loss（因为有静态物体）
+                        if dynamic_objects_data is not None:
+                            # Step 2: 跳过Stage2 refine网络,直接构建场景
+                            # 不调用 stage2_model()，直接使用原始的canonical gaussians
+                            dynamic_objects = dynamic_objects_data['dynamic_objects'] if has_valid_dynamic else []
+                            static_gaussians = dynamic_objects_data.get('static_gaussians')
+
+                            # 构建"refined"场景 (实际上是未refine的原始数据)
+                            aggregator_all_scene = {
+                                'static_gaussians': static_gaussians,
+                                'dynamic_objects': dynamic_objects  # 可能为空列表，但静态物体仍然存在
+                            }
+
+                            # Step 3: 计算渲染loss (使用Stage2的loss函数)
+                            B, S, C, H, W = vggt_batch['images'].shape
+                            gt_images = vggt_batch['images']
+                            gt_depths = vggt_batch.get('depths', torch.ones(B, S, H, W, device=device) * 5.0)
+
+                            # 使用预测的相机参数（从preds['pose_enc']中获取）
+                            from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+                            extrinsics, intrinsics = pose_encoding_to_extri_intri(
+                                preds['pose_enc'].detach(),
+                                vggt_batch['images'].shape[-2:]
+                            )
+
+                            # extrinsics: [B, S, 3, 4], intrinsics: [B, S, 3, 3]
+                            # 添加齐次坐标行使extrinsics变为[B, S, 4, 4]
+                            extrinsics = torch.cat([
+                                extrinsics,
+                                torch.tensor([0, 0, 0, 1], device=extrinsics.device)[None, None, None, :].repeat(B, S, 1, 1)
+                            ], dim=-2)
+
+                            sky_masks = vggt_batch.get('sky_masks', None)
+
+                            # 使用Stage2的criterion计算loss
+                            aggregator_all_loss_dict = online_stage2_trainer.stage2_criterion(
+                                refinement_results={'refined_dynamic_objects': dynamic_objects},  # 无refine结果
+                                refined_scene=aggregator_all_scene,
+                                gt_images=gt_images,
+                                gt_depths=gt_depths,
+                                intrinsics=intrinsics,
+                                extrinsics=extrinsics,
+                                sky_masks=sky_masks,
+                                original_dynamic_objects=dynamic_objects
+                            )
+
+                            # 提取各项loss并加权
+                            aggregator_all_rgb_loss = aggregator_all_loss_dict.get('stage2_rgb_loss', 0.0)
+                            aggregator_all_depth_loss = aggregator_all_loss_dict.get('stage2_depth_loss', 0.0)
+                            aggregator_all_static_black_loss = aggregator_all_loss_dict.get('stage2_static_black_loss', 0.0)
+
+                            # 加入总loss
+                            if aggregator_all_rgb_weight > 0:
+                                loss += aggregator_all_rgb_weight * aggregator_all_rgb_loss
+                            if aggregator_all_depth_weight > 0:
+                                loss += aggregator_all_depth_weight * aggregator_all_depth_loss
+                            if aggregator_all_static_black_weight > 0:
+                                loss += aggregator_all_static_black_weight * aggregator_all_static_black_loss
+
+                            # 记录到loss_dict (重命名为aggregator_all前缀)
+                            loss_dict.update({
+                                'aggregator_all_rgb_loss': float(aggregator_all_rgb_loss) if isinstance(aggregator_all_rgb_loss, torch.Tensor) else aggregator_all_rgb_loss,
+                                'aggregator_all_depth_loss': float(aggregator_all_depth_loss) if isinstance(aggregator_all_depth_loss, torch.Tensor) else aggregator_all_depth_loss,
+                                'aggregator_all_static_black_loss': float(aggregator_all_static_black_loss) if isinstance(aggregator_all_static_black_loss, torch.Tensor) else aggregator_all_static_black_loss,
+                                'aggregator_all_num_objects': num_objects
+                            })
+                        else:
+                            # dynamic_objects_data为None，无法计算loss
+                            loss_dict.update({
+                                'aggregator_all_rgb_loss': 0.0,
+                                'aggregator_all_depth_loss': 0.0,
+                                'aggregator_all_static_black_loss': 0.0,
+                                'aggregator_all_num_objects': 0
+                            })
+
+                    except Exception as e:
+                        print(f"Error in aggregator_all render loss computation: {e}")
+                        import traceback
+                        traceback.print_exc()
+
                 lr = optimizer.param_groups[0]["lr"]
                 metric_logger.update(epoch=epoch)
                 metric_logger.update(lr=lr)
@@ -1066,6 +1189,19 @@ def train(args):
                         online_stage2_trainer.enable_stage2):
                         stage2_params = online_stage2_trainer.get_stage2_parameters()
                         if stage2_params:
+                            # 【关键补丁】确保stage2_loss有梯度连接，否则backward会报错
+                            # 检查stage2_loss是否有grad_fn（是否连接到计算图）
+                            if stage2_loss.grad_fn is None and stage2_loss.requires_grad == False:
+                                # 如果没有grad_fn也不需要梯度，说明这是一个detached tensor或常量
+                                # 通过stage2模型参数创建一个有梯度连接的零损失
+                                print(f"[WARNING] stage2_loss has no grad_fn! Creating a gradient-connected version.")
+                                if len(stage2_params) > 0:
+                                    # 使用所有参数的和来建立梯度连接，确保所有参数都能收到梯度
+                                    dummy_loss = sum((p * 0.0).sum() for p in stage2_params)
+                                    stage2_loss = stage2_loss + dummy_loss
+                                else:
+                                    print(f"[ERROR] No stage2_params available to fix gradient!")
+
                             # 第二阶段使用独立的损失和参数
                             # 即使stage2_skipped=True（零损失），也必须调用backward保持DDP同步
                             loss_scaler(

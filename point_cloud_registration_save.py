@@ -34,9 +34,10 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'src/vggt'))
 class AdvancedPointCloudRegistration:
     """高级点云配准类"""
 
-    def __init__(self, voxel_size: float = 0.01, max_iterations: int = 50, 
+    def __init__(self, voxel_size: float = 0.01, max_iterations: int = 50,
                  use_coarse_registration: bool = True, coarse_registration_threshold: float = 0.1,
-                 use_color_features: bool = True):
+                 use_color_features: bool = True, ransac_max_iteration: int = 5000,
+                 ransac_confidence: int = 5):
         """
         初始化点云配准器
 
@@ -46,12 +47,16 @@ class AdvancedPointCloudRegistration:
             use_coarse_registration: 是否使用粗匹配
             coarse_registration_threshold: 粗匹配质量阈值
             use_color_features: 是否启用颜色特征
+            ransac_max_iteration: RANSAC最大迭代次数
+            ransac_confidence: RANSAC置信度参数
         """
         self.voxel_size = voxel_size
         self.max_iterations = max_iterations
         self.use_coarse_registration = use_coarse_registration
         self.coarse_registration_threshold = coarse_registration_threshold
         self.use_color_features = use_color_features
+        self.ransac_max_iteration = ransac_max_iteration
+        self.ransac_confidence = ransac_confidence
         self.transformation_matrices = []
         self.point_clouds = []
         self.colors = []
@@ -438,32 +443,35 @@ class AdvancedPointCloudRegistration:
                 o3d.geometry.KDTreeSearchParamHybrid(radius=0.25, max_nn=100)
             )
             
-            # 提取SIFT特征
+            # 提取SIFT特征（仅当有图像和对应关系时）
+            sift_features = np.array([])  # 默认为空
             if image is not None and correspondence is not None and image_height is not None and image_width is not None:
+                # 只有在有完整的图像信息和对应关系时才提取SIFT特征
                 sift_features = self.extract_sift_features_from_image(image, pcd, correspondence, image_height, image_width)
-            elif image is not None:
-                # 如果没有对应关系，使用兼容性方法
-                sift_features = self.extract_sift_features(pcd)
             else:
-                sift_features = self.extract_sift_features(pcd)
-            
-            # 结合FPFH和SIFT特征
+                # 没有图像或对应关系，直接使用FPFH特征
+                print("没有图像或对应关系信息，仅使用FPFH特征")
+
+            # 结合FPFH和SIFT特征（如果SIFT特征可用）
             if sift_features.size > 0 and pcd_fpfh is not None:
                 fpfh_data = np.asarray(pcd_fpfh.data).T  # [N, 33]
                 combined_features = np.concatenate([fpfh_data, sift_features], axis=1)  # [N, 33+128=161]
-                
+
                 # 创建新的特征对象
                 combined_feature = o3d.pipelines.registration.Feature()
                 combined_feature.data = combined_features.T  # 转置回 [161, N]
-                
+
                 # 缓存结果
                 self.feature_cache[cache_key] = combined_feature
-                
+
                 print(f"特征提取成功 - FPFH: {fpfh_data.shape}, SIFT: {sift_features.shape}, 组合: {combined_features.shape}")
                 return combined_feature, np.asarray(pcd.points)
             else:
-                # 如果SIFT特征提取失败，只使用FPFH
-                print("SIFT特征提取失败，仅使用FPFH特征")
+                # 如果没有SIFT特征，只使用FPFH
+                if sift_features.size == 0:
+                    print("未提取SIFT特征，仅使用FPFH特征")
+                else:
+                    print("SIFT特征提取失败，仅使用FPFH特征")
                 self.feature_cache[cache_key] = pcd_fpfh
                 return pcd_fpfh, np.asarray(pcd.points)
 
@@ -1003,6 +1011,72 @@ class AdvancedPointCloudRegistration:
         return self._compute_geometric_center_transform(source, target)
 
 
+    def coarse_registration(self, source: o3d.geometry.PointCloud, target: o3d.geometry.PointCloud) -> np.ndarray:
+        """
+        粗匹配：使用特征匹配进行初始配准
+
+        Args:
+            source: 源点云
+            target: 目标点云
+
+        Returns:
+            初始变换矩阵
+        """
+        try:
+            if len(source.points) == 0 or len(target.points) == 0:
+                print("点云为空，返回单位矩阵")
+                return np.eye(4)
+
+            # 预处理点云
+            source_down = self.preprocess_point_cloud(source)
+            target_down = self.preprocess_point_cloud(target)
+
+            if len(source_down.points) == 0 or len(target_down.points) == 0:
+                print("预处理后点云为空，返回单位矩阵")
+                return np.eye(4)
+
+            print(f"开始粗匹配 - 源点云: {len(source_down.points)} 点, 目标点云: {len(target_down.points)} 点")
+
+            # 策略1：尝试RANSAC特征匹配
+            print("策略1：RANSAC特征匹配（FPFH+SIFT）...")
+            try:
+                # 提取组合特征
+                source_features, source_points = self.extract_features(source_down)
+                target_features, target_points = self.extract_features(target_down)
+
+                if source_features is not None and target_features is not None:
+                    # 使用RANSAC进行特征匹配
+                    result_ransac = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+                        source_down, target_down, source_features, target_features, True,
+                        max_correspondence_distance=self.voxel_size * 2.0,
+                        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
+                        ransac_n=3,
+                        checkers=[
+                            o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.8),
+                            o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(self.voxel_size * 2.0)
+                        ],
+                        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(
+                            self.ransac_max_iteration, self.ransac_confidence)
+                    )
+
+                    if result_ransac.fitness > self.coarse_registration_threshold:
+                        print(f"RANSAC特征匹配成功 - 适应度: {result_ransac.fitness:.3f}, RMSE: {result_ransac.inlier_rmse:.3f}")
+                        return result_ransac.transformation
+                    else:
+                        print(f"RANSAC特征匹配效果不佳 - 适应度: {result_ransac.fitness:.3f}")
+                else:
+                    print("特征提取失败，跳过RANSAC")
+            except Exception as e:
+                print(f"RANSAC特征匹配失败: {e}")
+
+            # 策略2：几何中心变换
+            print("策略2：几何中心变换")
+            return self._compute_geometric_center_transform(source_down, target_down)
+
+        except Exception as e:
+            print(f"粗匹配失败: {e}，使用单位矩阵")
+            return np.eye(4)
+
     def coarse_registration_with_images(self, source: o3d.geometry.PointCloud, target: o3d.geometry.PointCloud,
                                        source_image: np.ndarray, target_image: np.ndarray,
                                        source_correspondence: List[int], target_correspondence: List[int],
@@ -1058,8 +1132,8 @@ class AdvancedPointCloudRegistration:
                             o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.8),
                             o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(self.voxel_size * 2.0)
                         ],
-                        # criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(50000, 50)
-                        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(5000, 5)
+                        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(
+                            self.ransac_max_iteration, self.ransac_confidence)
                     )
 
                     if result_ransac.fitness > self.coarse_registration_threshold:

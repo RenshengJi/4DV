@@ -14,8 +14,8 @@ import logging
 from collections import defaultdict
 
 # 导入头网络
-from vggt.heads.sparse_conv_refine_head import GaussianRefineHeadSparseConv, PoseRefineHeadSparseConv
-from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+from vggt.vggt.heads.sparse_conv_refine_head import GaussianRefineHeadSparseConv, PoseRefineHeadSparseConv
+from vggt.vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
 
 class Stage2Refiner(nn.Module):
@@ -40,10 +40,7 @@ class Stage2Refiner(nn.Module):
                 "output_gaussian_dim": 14,
                 "feature_dim": 128,
                 "num_conv_layers": 2,
-                "voxel_size": 0.05,
-                "max_num_points_per_voxel": 5,
-                "use_dilated_conv": False,  # 默认不使用dilated conv（向后兼容）
-                "dilation_rates": None
+                "voxel_size": 0.05
             }
 
         if pose_refine_config is None:
@@ -52,9 +49,7 @@ class Stage2Refiner(nn.Module):
                 "feature_dim": 128,
                 "num_conv_layers": 2,
                 "voxel_size": 0.1,
-                "max_points": 4096,
-                "use_dilated_conv": False,  # 默认不使用dilated conv（向后兼容）
-                "dilation_rates": None
+                "max_points": 4096
             }
 
         # 初始化网络组件 - 使用稀疏卷积版本
@@ -166,7 +161,7 @@ class Stage2Refiner(nn.Module):
             # 位姿细化（仅对多帧物体进行）
             if self.training_mode in ["joint", "pose_only"] and len(initial_transforms) > 1:
                 pose_start_time = time.time()
-                refined_positions = refined_obj['refined_gaussians'][:, :3].detach()  # 使用refined后的Gaussian位置,不计算梯度
+                refined_positions = refined_obj['original_canonical_gaussians'][:, :3].detach() 
                 refined_transforms = {}  # 改为字典以保持frame_idx映射
                 pose_deltas = {}  # 改为字典以保持frame_idx映射
 

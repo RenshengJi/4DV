@@ -91,7 +91,7 @@ def parse_args():
     parser.add_argument(
         "--num_views",
         type=int,
-        default=8,
+        default=4,
         help="Number of views for inference",
     )
 
@@ -128,6 +128,13 @@ def parse_args():
         "--use_velocity_based_transform",
         action="store_true",
         help="Use velocity-based transformation instead of optical flow",
+    )
+    parser.add_argument(
+        "--velocity_transform_mode",
+        type=str,
+        default="simple",
+        choices=["simple", "procrustes"],
+        help="Velocity transformation mode: 'simple' (translation only) or 'procrustes' (rotation + translation)",
     )
 
     # 动态物体聚类和跟踪参数
@@ -243,11 +250,15 @@ def detect_checkpoint_config(stage2_model_path):
 
 
 def load_stage2_components(stage2_model_path, device, use_velocity_based_transform=False,
+                          velocity_transform_mode="simple",
                           velocity_threshold=0.1, clustering_eps=0.02, clustering_min_samples=10,
                           tracking_position_threshold=2.0, tracking_velocity_threshold=0.2):
     """加载Stage2组件"""
     print(f"Loading Stage2 components...")
-    print(f"  Transformation method: {'Velocity-based' if use_velocity_based_transform else 'Flow-based'}")
+    if use_velocity_based_transform:
+        print(f"  Transformation method: Velocity-based ({velocity_transform_mode})")
+    else:
+        print(f"  Transformation method: Flow-based")
     print(f"  Clustering parameters: velocity_threshold={velocity_threshold}, eps={clustering_eps}, min_samples={clustering_min_samples}")
     print(f"  Tracking parameters: position_threshold={tracking_position_threshold}, velocity_threshold={tracking_velocity_threshold}")
 
@@ -289,6 +300,7 @@ def load_stage2_components(stage2_model_path, device, use_velocity_based_transfo
         'depth_loss_weight': 0.0,
         'dynamic_processor': {
             'use_velocity_based_transform': use_velocity_based_transform,
+            'velocity_transform_mode': velocity_transform_mode,
             'velocity_threshold': velocity_threshold,
             'clustering_eps': clustering_eps,
             'clustering_min_samples': clustering_min_samples,
@@ -768,12 +780,42 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
     stage1_pred_time = time.time() - start_time
 
     # Stage1的VGGT输出的velocity前三行容易出现异常，直接置零
-    if 'velocity' in stage1_preds and stage1_preds['velocity'] is not None:
-        velocity = stage1_preds['velocity']  # [B, S, H, W, 3]
-        if velocity.dim() == 5 and velocity.shape[2] >= 3:
-            print(f"Applying velocity patch: zeroing top 3 rows (shape: {velocity.shape})")
-            velocity[:, :, :5, :, :] = 0.0
-            stage1_preds['velocity'] = velocity
+    # if 'velocity' in stage1_preds and stage1_preds['velocity'] is not None:
+    #     velocity = stage1_preds['velocity']  # [B, S, H, W, 3]
+    #     if velocity.dim() == 5 and velocity.shape[2] >= 3:
+    #         print(f"Applying velocity patch: zeroing top 3 rows (shape: {velocity.shape})")
+    #         velocity[:, :, :5, :, :] = 0.0
+    #         stage1_preds['velocity'] = velocity
+
+    # ========== Scale Debugging/Override Section ==========
+    # 控制是否使用GT scale替换pred scale
+    USE_GT_SCALE = False  # 设为True以使用GT scale (来自vggt_batch['depth_scale_factor'])
+
+    # 输出预测的scale信息
+    if 'scale' in stage1_preds and stage1_preds['scale'] is not None:
+        pred_scale = stage1_preds['scale']  # [B]
+        print("\n========== Scale Head Output ==========")
+        print(f"Predicted scale shape: {pred_scale.shape}")
+        print(f"Predicted scale value: {pred_scale.cpu().numpy()}")
+
+        # 如果vggt_batch中有GT scale数据，输出并可选择性替换
+        if 'depth_scale_factor' in vggt_batch and vggt_batch['depth_scale_factor'] is not None:
+            gt_scale = vggt_batch['depth_scale_factor']  # scalar or [B]
+            print(f"\nGround truth scale (depth_scale_factor): {gt_scale if isinstance(gt_scale, (int, float)) else gt_scale.cpu().numpy()}")
+
+            if USE_GT_SCALE:
+                # 替换pred scale为GT scale
+                if isinstance(gt_scale, (int, float)):
+                    stage1_preds['scale'] = torch.tensor([gt_scale], device=pred_scale.device, dtype=pred_scale.dtype)
+                else:
+                    stage1_preds['scale'] = gt_scale
+                print("\n[INFO] Replaced predicted scale with GT scale!")
+        else:
+            print("\n[INFO] No GT scale (depth_scale_factor) available in vggt_batch")
+    else:
+        print("\n[WARNING] No 'scale' output from scale_head in stage1_preds")
+    print("=" * 40 + "\n")
+    # ========== End Scale Debugging/Override Section ==========
 
     # 生成动态聚类可视化
     start_time = time.time()
@@ -1258,6 +1300,7 @@ def main():
     stage2_trainer, stage2_render_loss = load_stage2_components(
         args.stage2_model_path, device,
         use_velocity_based_transform=args.use_velocity_based_transform,
+        velocity_transform_mode=args.velocity_transform_mode,
         velocity_threshold=args.velocity_threshold,
         clustering_eps=args.clustering_eps,
         clustering_min_samples=args.clustering_min_samples,

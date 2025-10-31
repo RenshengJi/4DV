@@ -107,8 +107,16 @@ class DPTHead(nn.Module):
             self.scratch.output_conv1 = nn.Conv2d(
                 head_features_1, head_features_1 // 2, kernel_size=3, stride=1, padding=1
             )
+            # self.scratch.output_conv1 = nn.Conv2d(
+            #     head_features_1, head_features_1 // 2, kernel_size=3, stride=1, padding=1, padding_mode='reflect'
+            # )
             conv2_in_channels = head_features_1 // 2
 
+            # self.scratch.output_conv2 = nn.Sequential(
+            #     nn.Conv2d(conv2_in_channels, head_features_2, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
+            #     nn.ReLU(inplace=True),
+            #     nn.Conv2d(head_features_2, output_dim, kernel_size=1, stride=1, padding=0),
+            # )
             self.scratch.output_conv2 = nn.Sequential(
                 nn.Conv2d(conv2_in_channels, head_features_2, kernel_size=3, stride=1, padding=1),
                 nn.ReLU(inplace=True),

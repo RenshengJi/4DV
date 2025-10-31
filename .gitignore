@@ -62,3 +62,11 @@ debug_*.png
 demo_tmp/
 results/
 saved_pointclouds/
+
+# ICP training and inference outputs
+icp_collection_temp/
+icp_supervision_data_real/
+icp_train_output/
+icp_train_output_largelr/
+icp_train_output_lowlr/
+inference_output/
