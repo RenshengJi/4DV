@@ -7,9 +7,10 @@ debug: true
 model: "VGGT(img_size=518, patch_size=14, embed_dim=1024)"
 # pretrained: model.pt
 # pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow+depthgrad(true)+depth+flowgradconf+aggregatorenderloss+fixopacity+no1opacityloss+fixdirection+fromvresume+lpips/checkpoint-epoch_0_2848.pth"
-pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow/checkpoint-epoch_7_9968.pth"
+# pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow/checkpoint-epoch_7_9968.pth"
 # pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/aggregator_resume_noflowgrad_nearestdynamic_resume_0point1_novoxel/checkpoint-epoch_0_19936.pth"
 # pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/fix_velocity/checkpoint-epoch_0_3255.pth"
+pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/fromaggregator_all_lr3e-6_procrustes_area3000_velocityconstraint0.05_gtcamera/checkpoint-epoch_0_19530.pth"
 
 
 # VGGT冻结策略配置
@@ -60,7 +61,7 @@ training_stage: 'stage1'
 # 权重为0则完全不计算该损失
 
 # 1. Self Render Loss (训练gaussian head)
-self_render_weight: 1.0                    # Gaussian参数学习的主要损失 (已弃用，使用下面的分项权重)
+self_render_weight: 0.0                    # Gaussian参数学习的主要损失 (已弃用，使用下面的分项权重)
 self_render_rgb_weight: 1.0                # RGB损失权重
 self_render_lpips_weight: 0.1              # LPIPS感知损失权重
 self_render_depth_weight: 1.0              # 深度损失权重
@@ -111,22 +112,22 @@ aggregator_render_depth_weight: 0.0         # Aggregator render depth损失权�
 aggregator_render_lpips_weight: 0.0         # Aggregator render LPIPS损失权重
 aggregator_voxel_size: 0.05                # 体素量化大小(metric尺度, 单位m)
 aggregator_dynamic_threshold: 0.1          # 动静态分离的速度阈值(metric尺度, 单位m/s)
+aggregator_frame_sample_ratio: 1.0         # Aggregator渲染时的帧采样比例(用于控制渲染的帧数量)
 
 # 13. Aggregator_all Render Loss (代替Stage2 refine网络的渲染loss)
 # 这个loss直接在Stage1中使用动态物体处理+渲染监督,跳过Stage2的refine网络
 # 需要enable_stage2=true才能使用(需要OnlineDynamicProcessor和Stage2Loss)
 aggregator_all_render_rgb_weight: 1.0      # Aggregator_all RGB渲染损失权重
 aggregator_all_render_depth_weight: 1.0    # Aggregator_all depth渲染损失权重
-aggregator_all_static_black_weight: 0.0    # 非动态区域渲染为黑色的loss权重
+aggregator_all_render_lpips_weight: 0.2    # Aggregator_all LPIPS渲染损失权重
 # Stage2配置（用于aggregator_all loss的渲染配置）
 stage2_render_only_dynamic: false          # 是否只渲染动态物体
 stage2_supervise_only_dynamic: false       # 是否只监督动态区域
-stage2_static_black_weight: 0.0            # 非动态区域渲染为黑色的loss权重
 # 动态处理器配置（用于aggregator_all loss的动态物体处理）
 min_object_size: 100                       # 最小物体尺寸（点数）
 max_objects_per_frame: 10                  # 每帧最大物体数量
 velocity_threshold: 0.1                    # 速度阈值（metric尺度，m/s）
-clustering_eps: 0.02                       # DBSCAN邻域半径
+clustering_eps: 0.5                       # DBSCAN邻域半径
 clustering_min_samples: 10                 # DBSCAN最小样本数
 tracking_position_threshold: 2.0           # 位置匹配阈值
 tracking_velocity_threshold: 0.2           # 速度匹配阈值

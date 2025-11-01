@@ -136,9 +136,9 @@ class OnlineStage2Trainer:
         render_loss_config = {
             'rgb_weight': config.get('stage2_rgb_loss_weight', 0.5),  # 修正：使用stage2_前缀的键名
             'depth_weight': config.get('stage2_depth_loss_weight', 0.0),  # 修正：使用stage2_前缀的键名
+            'lpips_weight': config.get('aggregator_all_render_lpips_weight', 0.0),  # LPIPS loss权重
             'render_only_dynamic': config.get('stage2_render_only_dynamic', False),  # 是否只渲染动态物体
             'supervise_only_dynamic': config.get('stage2_supervise_only_dynamic', False),  # 是否只监督动态区域
-            'static_black_weight': config.get('stage2_static_black_weight', 0.1),  # 非动态区域渲染为黑色的loss权重
             'supervise_middle_frame_only': config.get('stage2_supervise_middle_frame_only', False),  # 是否只渲染监督中间帧
         }
 

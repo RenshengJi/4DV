@@ -1620,7 +1620,7 @@ class OpticalFlowRegistration:
             result = clustering_results[frame_idx]
             cluster_idx = result['global_ids'].index(global_id)
             object_mask = result['labels'] == cluster_idx
-            object_points = result['points'][object_mask]
+            object_points = result['points'][object_mask]  # 保留torch.Tensor，保留梯度
 
             # 单帧颜色处理已删除（不再需要）
 
@@ -1632,12 +1632,11 @@ class OpticalFlowRegistration:
             canonical_gaussians = None
             frame_gaussians = {}  # 新增：每帧的原始Gaussian参数
             if preds and 'gaussian_params' in preds:
-                object_points_np = object_points.cpu().numpy() if isinstance(object_points, torch.Tensor) else object_points
                 # 创建单帧的点索引对应关系
-                single_frame_point_indices = [(frame_idx, pixel_idx) for pixel_idx in single_frame_pixel_indices[:len(object_points_np)]]
+                single_frame_point_indices = [(frame_idx, pixel_idx) for pixel_idx in single_frame_pixel_indices[:len(object_points)]]
 
                 canonical_gaussians = self._extract_all_frames_gaussian_params(
-                    object_points_np,
+                    object_points,  # 直接传torch.Tensor，保留梯度
                     single_frame_point_indices,
                     preds['gaussian_params'],
                     vggt_batch
@@ -1657,7 +1656,7 @@ class OpticalFlowRegistration:
 
             return {
                 'global_id': global_id,
-                'aggregated_points': object_points.cpu().numpy() if isinstance(object_points, torch.Tensor) else object_points,
+                'aggregated_points': object_points,  # 保持torch.Tensor格式，保留梯度
                 'point_indices': [(frame_idx, pixel_idx) for pixel_idx in single_frame_pixel_indices[:len(object_points)]],  # 添加点索引对应关系
                 'middle_frame': frame_idx,  # 统一使用middle_frame
                 'object_frames': [frame_idx],
@@ -1683,13 +1682,7 @@ class OpticalFlowRegistration:
 
         # 提取中间帧物体的点
         middle_object_mask = middle_labels == middle_cluster_idx
-        middle_object_points = middle_points[middle_object_mask]
-
-        # 确保中间帧点云在CPU上
-        if isinstance(middle_object_points, torch.Tensor):
-            middle_object_points_cpu = middle_object_points.detach().cpu().numpy()
-        else:
-            middle_object_points_cpu = middle_object_points
+        middle_object_points = middle_points[middle_object_mask]  # 保留在CUDA且不detach！
 
         # 获取中间帧的像素索引（用于后续Gaussian参数提取）
         cluster_indices = middle_result.get('cluster_indices', [])
@@ -1698,12 +1691,12 @@ class OpticalFlowRegistration:
         # 中间帧颜色处理已删除（不再需要）
         step_times['2. 中间帧数据提取'] = time.time() - middle_frame_start
 
-        # 3. 存储所有帧的变换 - 优化版本
+        # 3. 存储所有帧的变换 - 优化版本（保持张量格式以保留梯度）
         transformations = {}
         transformation_cache = {}  # 缓存已计算的变换
-        aggregated_points = [middle_object_points_cpu]
+        aggregated_points = [middle_object_points]  # 保持torch.Tensor格式
         # 同时记录每个点对应的(frame_idx, pixel_idx)
-        all_point_indices = [(middle_frame_idx, pixel_idx) for pixel_idx in middle_pixel_indices[:len(middle_object_points_cpu)]]
+        all_point_indices = [(middle_frame_idx, pixel_idx) for pixel_idx in middle_pixel_indices[:len(middle_object_points)]]
 
         # 4. 对其他帧进行链式变换
         chain_transform_start = time.time()
@@ -1803,9 +1796,9 @@ class OpticalFlowRegistration:
         step_times['3.8 成功变换数'] = successful_transforms
         step_times['3.9 失败变换数'] = failed_transforms
 
-        # 4. 合并所有点云
+        # 4. 合并所有点云（保持torch.Tensor格式）
         merge_start = time.time()
-        all_points = np.concatenate(aggregated_points, axis=0)
+        all_points = torch.cat(aggregated_points, dim=0)  # 使用torch.cat保留梯度
         step_times['4. 点云合并'] = time.time() - merge_start
 
         # 5. 提取所有帧对应的Gaussian参数，并用实际点坐标替换位置
@@ -1814,7 +1807,7 @@ class OpticalFlowRegistration:
         frame_gaussians = {}  # 新增：每帧的原始Gaussian参数
         if preds and 'gaussian_params' in preds:
             canonical_gaussians = self._extract_all_frames_gaussian_params(
-                all_points,  # 聚合后的实际点坐标
+                all_points,  # 直接传入torch.Tensor - 保留梯度！
                 all_point_indices,  # 每个点对应的(frame_idx, pixel_idx)
                 preds['gaussian_params'],
                 vggt_batch
@@ -1850,7 +1843,7 @@ class OpticalFlowRegistration:
         }
 
     def _extract_all_frames_gaussian_params(self,
-                                            aggregated_points: np.ndarray,
+                                            aggregated_points: torch.Tensor,  # 改为torch.Tensor
                                             point_indices: List[Tuple[int, int]],
                                             gaussian_params: torch.Tensor,
                                             vggt_batch: Dict) -> torch.Tensor:
@@ -1858,13 +1851,13 @@ class OpticalFlowRegistration:
         使用矢量操作直接提取对应的Gaussian参数，并用聚合后的点坐标替换位置
 
         Args:
-            aggregated_points: 聚合后的3D点坐标 [N, 3]
+            aggregated_points: 聚合后的3D点坐标 [N, 3] - torch.Tensor，保留梯度
             point_indices: 每个点对应的(frame_idx, pixel_idx) [(frame, pixel), ...]
             gaussian_params: VGGT预测的Gaussian参数 [B, S*H*W, 14]
             vggt_batch: 批次数据
 
         Returns:
-            合并的Gaussian参数 [N, 14] 或 None
+            合并的Gaussian参数 [N, 14] 或 None，保留梯度
         """
         try:
             if 'images' not in vggt_batch:
@@ -1882,9 +1875,10 @@ class OpticalFlowRegistration:
             frame_indices = [idx[0] for idx in point_indices]
             pixel_indices = [idx[1] for idx in point_indices]
 
-            # 转换为tensor进行矢量操作
-            frame_indices_tensor = torch.tensor(frame_indices, dtype=torch.long)
-            pixel_indices_tensor = torch.tensor(pixel_indices, dtype=torch.long)
+            # 转换为tensor进行矢量操作（放在相同设备上）
+            device = gaussian_params.device
+            frame_indices_tensor = torch.tensor(frame_indices, dtype=torch.long, device=device)
+            pixel_indices_tensor = torch.tensor(pixel_indices, dtype=torch.long, device=device)
 
             # 计算全局索引：frame_idx * H*W + pixel_idx
             global_indices = frame_indices_tensor * H_W + pixel_indices_tensor
@@ -1900,12 +1894,14 @@ class OpticalFlowRegistration:
             # 使用矢量操作一次性提取所有对应的Gaussian参数
             extracted_gaussians = gaussian_params[0, valid_global_indices].clone()  # [N_valid, 14]
 
-            # 用聚合后的点坐标替换Gaussian参数的前三维
-            aggregated_points_tensor = torch.from_numpy(aggregated_points).float() # FIXME:
+            # 用聚合后的点坐标替换Gaussian参数的前三维（保留梯度！）
+            # aggregated_points已经是torch.Tensor，直接使用
+            if aggregated_points.device != extracted_gaussians.device:
+                aggregated_points = aggregated_points.to(extracted_gaussians.device)
 
             # 只使用有效索引对应的点
-            valid_points = aggregated_points_tensor[valid_mask]
-            extracted_gaussians[:, :3] = valid_points
+            valid_points = aggregated_points[valid_mask]
+            extracted_gaussians[:, :3] = valid_points  # 保留梯度！
 
             return extracted_gaussians
 
@@ -1977,15 +1973,15 @@ class OpticalFlowRegistration:
             print(f"    提取Gaussian参数失败: {e}")
             return None
 
-    def _apply_transformation(self, points: torch.Tensor, transformation: torch.Tensor) -> np.ndarray:
-        """应用变换矩阵到点云
+    def _apply_transformation(self, points: torch.Tensor, transformation: torch.Tensor) -> torch.Tensor:
+        """应用变换矩阵到点云（保留梯度）
 
         Args:
-            points: Input points as torch.Tensor (N, 3)
+            points: Input points as torch.Tensor (N, 3) - 保留梯度
             transformation: 4x4 transformation matrix as torch.Tensor
 
         Returns:
-            Transformed points as numpy array (N, 3)
+            Transformed points as torch.Tensor (N, 3) - 保留梯度，在CUDA上
         """
         # Ensure transformation is a torch tensor
         if isinstance(transformation, np.ndarray):
@@ -1999,11 +1995,11 @@ class OpticalFlowRegistration:
         ones = torch.ones((points.shape[0], 1), device=points.device, dtype=points.dtype)
         points_homo = torch.cat([points, ones], dim=1)  # (N, 4)
 
-        # Apply transformation (torch matmul)
+        # Apply transformation (torch matmul) - 保留梯度！
         transformed_points_homo = torch.matmul(points_homo, transformation.T)  # (N, 4)
 
-        # Return 3D coordinates as numpy
-        return transformed_points_homo[:, :3].detach().cpu().numpy()
+        # Return 3D coordinates as torch.Tensor - 保留梯度！
+        return transformed_points_homo[:, :3]  # 不detach，不转numpy
 
     def process_pointcloud_data(self, data_path: str, output_dir: str) -> Dict:
         """

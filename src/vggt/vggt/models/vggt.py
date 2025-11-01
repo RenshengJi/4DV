@@ -244,8 +244,16 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
 
         # Add sky token processing if enabled
         if self.use_sky_token:
-            # Extract sky token from the first aggregated tokens (last iteration)
-            sky_token = aggregated_tokens_list[-1][:, :, :1]  # [B, S, 1, embed_dim]
+            # Extract sky token from all aggregated tokens and average them
+            # Stack all layers and take the mean
+            all_sky_tokens = []
+            for layer_idx in sorted(aggregated_tokens_list.keys()):
+                layer_sky_token = aggregated_tokens_list[layer_idx][:, :, :1]  # [B, S, 1, embed_dim]
+                all_sky_tokens.append(layer_sky_token)
+
+            # Stack and average across all layers
+            stacked_sky_tokens = torch.stack(all_sky_tokens, dim=0)  # [num_layers, B, S, 1, embed_dim]
+            sky_token = stacked_sky_tokens.mean(dim=0)  # [B, S, 1, embed_dim]
             predictions["sky_token"] = sky_token
 
             # Pre-compute sky colors if GT camera parameters are provided (for training)
@@ -261,7 +269,10 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
 
                 # Generate ray directions using plucker embedder (only for sampled frames)
                 sampled_intrinsics = gt_intrinsics[0, sampled_frame_indices]  # [num_frames, 3, 3]
-                sampled_extrinsics = gt_extrinsics[0, sampled_frame_indices]  # [num_frames, 4, 4]
+                sampled_extrinsics_w2c = gt_extrinsics[0, sampled_frame_indices]  # [num_frames, 4, 4] world2camera
+
+                # Convert world2camera to camera2world by inverting
+                sampled_extrinsics = torch.inverse(sampled_extrinsics_w2c)  # [num_frames, 4, 4] camera2world
 
                 ray_dict = self.plucker_embedder(
                     sampled_intrinsics,
@@ -286,8 +297,10 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         if self.use_scale_token:
             # Extract scale token from aggregated tokens (last iteration)
             # Scale token is typically placed after sky_token if both are enabled
+            # Get the last layer (max key) from the dict
+            last_layer_idx = max(aggregated_tokens_list.keys())
             token_idx = 1 if self.use_sky_token else 0
-            scale_token_features = aggregated_tokens_list[-1][:, :, token_idx:token_idx+1]  # [B, S, 1, embed_dim]
+            scale_token_features = aggregated_tokens_list[last_layer_idx][:, :, token_idx:token_idx+1]  # [B, S, 1, embed_dim]
             # Average across sequence dimension to get global scale
             scale_token_pooled = scale_token_features.mean(dim=1).squeeze(1)  # [B, embed_dim]
             # Pass through scale head to get predicted scale

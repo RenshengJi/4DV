@@ -90,7 +90,9 @@ class CameraHead(nn.Module):
             list: A list of predicted camera encodings (post-activation) from each iteration.
         """
         # Use tokens from the last block for camera prediction.
-        tokens = aggregated_tokens_list[-1]
+        # Get the last layer (max key) from the dict
+        last_layer_idx = max(aggregated_tokens_list.keys())
+        tokens = aggregated_tokens_list[last_layer_idx]
 
         # Extract the camera tokens
         pose_tokens = tokens[:, :, 0]

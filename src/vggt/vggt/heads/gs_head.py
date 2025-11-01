@@ -112,18 +112,13 @@ class DPTGSHead(DPTHead):
         dpt_idx = 0
 
         for i, layer_idx in enumerate(self.intermediate_layer_idx):
-            # In memory efficient mode, aggregated_tokens_list might only contain required layers
-            # Try to access by original index first, fall back to sequential access
-            try:
-                x = aggregated_tokens_list[layer_idx][:, :, patch_start_idx:]
-            except IndexError:
-                # Memory efficient mode: layers are stored sequentially, not by original index
-                if i < len(aggregated_tokens_list):
-                    x = aggregated_tokens_list[i][:, :, patch_start_idx:]
-                else:
-                    raise IndexError(f"Required layer {layer_idx} not found in aggregated_tokens_list. "
-                                   f"Available layers: {len(aggregated_tokens_list)}, "
-                                   f"Required layers: {self.intermediate_layer_idx}")
+            # Access layer directly from dict using layer_idx as key
+            if layer_idx not in aggregated_tokens_list:
+                raise KeyError(f"Required layer {layer_idx} not found in aggregated_tokens_list. "
+                             f"Available layers: {list(aggregated_tokens_list.keys())}, "
+                             f"Required layers: {self.intermediate_layer_idx}")
+
+            x = aggregated_tokens_list[layer_idx][:, :, patch_start_idx:]
 
             # Select frames if processing a chunk
             if frames_start_idx is not None and frames_end_idx is not None:

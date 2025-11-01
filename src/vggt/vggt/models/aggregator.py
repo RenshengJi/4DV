@@ -211,7 +211,7 @@ class Aggregator(nn.Module):
             if hasattr(self.patch_embed, "mask_token"):
                 self.patch_embed.mask_token.requires_grad_(False)
 
-    def forward(self, images: torch.Tensor, sky_token: torch.Tensor = None, scale_token: torch.Tensor = None) -> Tuple[List[torch.Tensor], int]:
+    def forward(self, images: torch.Tensor, sky_token: torch.Tensor = None, scale_token: torch.Tensor = None) -> Tuple[Dict[int, torch.Tensor], int]:
         """
         Args:
             images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
@@ -222,8 +222,8 @@ class Aggregator(nn.Module):
                 Required if use_scale_token=True.
 
         Returns:
-            (list[torch.Tensor], int):
-                The list of outputs from the attention blocks,
+            (Dict[int, torch.Tensor], int):
+                A dictionary mapping layer indices to output tensors from the attention blocks,
                 and the patch_start_idx indicating where patch tokens begin.
         """
         B, S, C_in, H, W = images.shape
@@ -279,7 +279,7 @@ class Aggregator(nn.Module):
 
         frame_idx = 0
         global_idx = 0
-        output_list = []
+        output_dict = {}  # Changed from list to dict
         current_layer = 0
 
         # 使用更简单的逻辑：恢复原始结构，但在concatenate时检查是否需要该输出
@@ -304,7 +304,9 @@ class Aggregator(nn.Module):
                 for i in range(len(frame_intermediates)):
                     # concat frame and global intermediates, [B x S x P x 2C]
                     concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
-                    output_list.append(concat_inter)
+                    # Store in dict with layer index as key
+                    layer_idx = current_layer_index * len(frame_intermediates) + i
+                    output_dict[layer_idx] = concat_inter
 
         # Clean up memory
         if 'concat_inter' in locals():
@@ -316,7 +318,7 @@ class Aggregator(nn.Module):
         if 'layer_outputs' in locals():
             del layer_outputs
 
-        return output_list, self.patch_start_idx
+        return output_dict, self.patch_start_idx
 
     def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
         """

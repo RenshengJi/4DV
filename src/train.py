@@ -173,7 +173,7 @@ def train(args):
         'stage2_depth_loss_weight': getattr(args, 'stage2_depth_loss_weight', 0.05),
         'stage2_render_only_dynamic': getattr(args, 'stage2_render_only_dynamic', False),
         'stage2_supervise_only_dynamic': getattr(args, 'stage2_supervise_only_dynamic', False),
-        'stage2_static_black_weight': getattr(args, 'stage2_static_black_weight', 0.1),
+        'aggregator_all_render_lpips_weight': getattr(args, 'aggregator_all_render_lpips_weight', 0.0),
 
         # 动态处理器配置
         'dynamic_processor': {
@@ -578,7 +578,7 @@ def train(args):
                 # For VGGT model, extract images from vggt_batch
                 if vggt_batch.get("images") is not None:
                     # Get frame sample ratio from config for aggregator_render_loss
-                    frame_sample_ratio = getattr(args, 'aggregator_frame_sample_ratio', 0.25)
+                    frame_sample_ratio = getattr(args, 'aggregator_frame_sample_ratio', 1.0)
                     preds = model(
                         vggt_batch["images"],
                         gt_extrinsics=vggt_batch.get("extrinsics"),
@@ -616,7 +616,7 @@ def train(args):
                     'aggregator_render_lpips_weight': getattr(args, 'aggregator_render_lpips_weight', 0.0),
                     'aggregator_all_render_rgb_weight': getattr(args, 'aggregator_all_render_rgb_weight', 0.0),
                     'aggregator_all_render_depth_weight': getattr(args, 'aggregator_all_render_depth_weight', 0.0),
-                    'aggregator_all_static_black_weight': getattr(args, 'aggregator_all_static_black_weight', 0.0),
+                    'aggregator_all_render_lpips_weight': getattr(args, 'aggregator_all_render_lpips_weight', 0.0),
                 }
 
                 # VGGT teacher predictions
@@ -975,11 +975,11 @@ def train(args):
                 # 这个loss直接在Stage1中使用动态物体处理+渲染监督,跳过Stage2的refine网络
                 aggregator_all_rgb_weight = loss_weights.get('aggregator_all_render_rgb_weight', 0.0)
                 aggregator_all_depth_weight = loss_weights.get('aggregator_all_render_depth_weight', 0.0)
-                aggregator_all_static_black_weight = loss_weights.get('aggregator_all_static_black_weight', 0.0)
+                aggregator_all_lpips_weight = loss_weights.get('aggregator_all_render_lpips_weight', 0.0)
 
                 if (aggregator_all_rgb_weight > 0 or
                     aggregator_all_depth_weight > 0 or
-                    aggregator_all_static_black_weight > 0) and \
+                    aggregator_all_lpips_weight > 0) and \
                    online_stage2_trainer is not None and \
                    hasattr(online_stage2_trainer, 'dynamic_processor') and \
                    hasattr(online_stage2_trainer, 'stage2_criterion'):
@@ -992,10 +992,18 @@ def train(args):
                         #         preds['velocity'] = velocity
 
                         # Step 1: 处理动态物体 (使用OnlineDynamicProcessor)
-                        # Detach pose_enc before processing to prevent gradient flow
+                        # 使用GT camera而不是预测的pose_enc
                         preds_for_dynamic = preds.copy()
                         if 'pose_enc' in preds_for_dynamic:
-                            preds_for_dynamic['pose_enc'] = preds_for_dynamic['pose_enc'].detach() 
+                            # 将GT的extrinsics和intrinsics转换为pose_enc格式
+                            gt_extrinsics = vggt_batch['extrinsics']  # [B, S, 4, 4]
+                            gt_intrinsics = vggt_batch['intrinsics']  # [B, S, 3, 3]
+                            image_size_hw = vggt_batch['images'].shape[-2:]
+
+                            gt_pose_enc = extri_intri_to_pose_encoding(
+                                gt_extrinsics, gt_intrinsics, image_size_hw, pose_encoding_type="absT_quaR_FoV"
+                            )
+                            preds_for_dynamic['pose_enc'] = gt_pose_enc
                             # preds_for_dynamic['velocity'] = preds_for_dynamic['velocity'].detach() 
 
                         dynamic_objects_data = online_stage2_trainer.dynamic_processor.process_dynamic_objects(
@@ -1024,21 +1032,15 @@ def train(args):
                             gt_images = vggt_batch['images']
                             gt_depths = vggt_batch.get('depths', torch.ones(B, S, H, W, device=device) * 5.0)
 
-                            # 使用预测的相机参数（从preds['pose_enc']中获取）
-                            from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-                            extrinsics, intrinsics = pose_encoding_to_extri_intri(
-                                preds['pose_enc'].detach(),
-                                vggt_batch['images'].shape[-2:]
-                            )
-
-                            # extrinsics: [B, S, 3, 4], intrinsics: [B, S, 3, 3]
-                            # 添加齐次坐标行使extrinsics变为[B, S, 4, 4]
-                            extrinsics = torch.cat([
-                                extrinsics,
-                                torch.tensor([0, 0, 0, 1], device=extrinsics.device)[None, None, None, :].repeat(B, S, 1, 1)
-                            ], dim=-2)
+                            # 使用GT相机参数（从vggt_batch中获取）
+                            intrinsics = vggt_batch['intrinsics']  # [B, S, 3, 3]
+                            extrinsics = vggt_batch['extrinsics']  # [B, S, 4, 4]
 
                             sky_masks = vggt_batch.get('sky_masks', None)
+
+                            # 获取sky_colors和sampled_frame_indices（如果有）
+                            sky_colors = preds.get('sky_colors', None)  # [B, num_frames, 3, H, W]
+                            sampled_frame_indices = preds.get('sampled_frame_indices', None)  # [num_frames]
 
                             # 使用Stage2的criterion计算loss
                             aggregator_all_loss_dict = online_stage2_trainer.stage2_criterion(
@@ -1049,35 +1051,49 @@ def train(args):
                                 intrinsics=intrinsics,
                                 extrinsics=extrinsics,
                                 sky_masks=sky_masks,
-                                original_dynamic_objects=dynamic_objects
+                                original_dynamic_objects=dynamic_objects,
+                                sky_colors=sky_colors,
+                                sampled_frame_indices=sampled_frame_indices
                             )
 
                             # 提取各项loss并加权
                             aggregator_all_rgb_loss = aggregator_all_loss_dict.get('stage2_rgb_loss', 0.0)
                             aggregator_all_depth_loss = aggregator_all_loss_dict.get('stage2_depth_loss', 0.0)
-                            aggregator_all_static_black_loss = aggregator_all_loss_dict.get('stage2_static_black_loss', 0.0)
+                            aggregator_all_lpips_loss = aggregator_all_loss_dict.get('stage2_lpips_loss', 0.0)
+
+                            # 提取可视化指标 (不参与梯度回传)
+                            aggregator_all_rgb_loss_sky = aggregator_all_loss_dict.get('stage2_rgb_loss_sky', None)
+                            aggregator_all_rgb_loss_nonsky = aggregator_all_loss_dict.get('stage2_rgb_loss_nonsky', None)
 
                             # 加入总loss
                             if aggregator_all_rgb_weight > 0:
                                 loss += aggregator_all_rgb_weight * aggregator_all_rgb_loss
                             if aggregator_all_depth_weight > 0:
                                 loss += aggregator_all_depth_weight * aggregator_all_depth_loss
-                            if aggregator_all_static_black_weight > 0:
-                                loss += aggregator_all_static_black_weight * aggregator_all_static_black_loss
+                            if aggregator_all_lpips_weight > 0:
+                                loss += aggregator_all_lpips_weight * aggregator_all_lpips_loss
 
                             # 记录到loss_dict (重命名为aggregator_all前缀)
-                            loss_dict.update({
+                            loss_dict_update = {
                                 'aggregator_all_rgb_loss': float(aggregator_all_rgb_loss) if isinstance(aggregator_all_rgb_loss, torch.Tensor) else aggregator_all_rgb_loss,
                                 'aggregator_all_depth_loss': float(aggregator_all_depth_loss) if isinstance(aggregator_all_depth_loss, torch.Tensor) else aggregator_all_depth_loss,
-                                'aggregator_all_static_black_loss': float(aggregator_all_static_black_loss) if isinstance(aggregator_all_static_black_loss, torch.Tensor) else aggregator_all_static_black_loss,
+                                'aggregator_all_lpips_loss': float(aggregator_all_lpips_loss) if isinstance(aggregator_all_lpips_loss, torch.Tensor) else aggregator_all_lpips_loss,
                                 'aggregator_all_num_objects': num_objects
-                            })
+                            }
+
+                            # 添加可视化指标 (如果存在)
+                            if aggregator_all_rgb_loss_sky is not None:
+                                loss_dict_update['aggregator_all_rgb_loss_sky'] = float(aggregator_all_rgb_loss_sky) if isinstance(aggregator_all_rgb_loss_sky, torch.Tensor) else aggregator_all_rgb_loss_sky
+                            if aggregator_all_rgb_loss_nonsky is not None:
+                                loss_dict_update['aggregator_all_rgb_loss_nonsky'] = float(aggregator_all_rgb_loss_nonsky) if isinstance(aggregator_all_rgb_loss_nonsky, torch.Tensor) else aggregator_all_rgb_loss_nonsky
+
+                            loss_dict.update(loss_dict_update)
                         else:
                             # dynamic_objects_data为None，无法计算loss
                             loss_dict.update({
                                 'aggregator_all_rgb_loss': 0.0,
                                 'aggregator_all_depth_loss': 0.0,
-                                'aggregator_all_static_black_loss': 0.0,
+                                'aggregator_all_lpips_loss': 0.0,
                                 'aggregator_all_num_objects': 0
                             })
 
@@ -2068,7 +2084,7 @@ def run(cfg: OmegaConf):
     if cfg.get("debug", False):
         cfg.num_workers = 0
         import debugpy
-        debugpy.listen(5696)
+        debugpy.listen(5697)
         print("Waiting for debugger to attach...")
         debugpy.wait_for_client()
     logdir = pathlib.Path(cfg.logdir)

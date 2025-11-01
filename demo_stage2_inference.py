@@ -136,6 +136,11 @@ def parse_args():
         choices=["simple", "procrustes"],
         help="Velocity transformation mode: 'simple' (translation only) or 'procrustes' (rotation + translation)",
     )
+    parser.add_argument(
+        "--use_gt_camera",
+        action="store_true",
+        help="Use ground truth camera parameters instead of predicted ones",
+    )
 
     # 动态物体聚类和跟踪参数
     parser.add_argument(
@@ -167,6 +172,12 @@ def parse_args():
         type=float,
         default=0.2,
         help="Velocity threshold for object tracking across frames",
+    )
+    parser.add_argument(
+        "--min_object_size",
+        type=int,
+        default=100,
+        help="Minimum object size (number of points) for filtering small clusters",
     )
 
     return parser.parse_args()
@@ -250,8 +261,9 @@ def detect_checkpoint_config(stage2_model_path):
 
 
 def load_stage2_components(stage2_model_path, device, use_velocity_based_transform=False,
-                          velocity_transform_mode="simple",
+                          velocity_transform_mode="simple", use_gt_camera=False,
                           velocity_threshold=0.1, clustering_eps=0.02, clustering_min_samples=10,
+                          min_object_size=100,
                           tracking_position_threshold=2.0, tracking_velocity_threshold=0.2):
     """加载Stage2组件"""
     print(f"Loading Stage2 components...")
@@ -259,7 +271,9 @@ def load_stage2_components(stage2_model_path, device, use_velocity_based_transfo
         print(f"  Transformation method: Velocity-based ({velocity_transform_mode})")
     else:
         print(f"  Transformation method: Flow-based")
+    print(f"  Camera parameters: {'Ground Truth' if use_gt_camera else 'Predicted'}")
     print(f"  Clustering parameters: velocity_threshold={velocity_threshold}, eps={clustering_eps}, min_samples={clustering_min_samples}")
+    print(f"  Object filtering: min_object_size={min_object_size}")
     print(f"  Tracking parameters: position_threshold={tracking_position_threshold}, velocity_threshold={tracking_velocity_threshold}")
 
     # 【智能配置】自动检测checkpoint的网络架构
@@ -306,7 +320,7 @@ def load_stage2_components(stage2_model_path, device, use_velocity_based_transfo
             'clustering_min_samples': clustering_min_samples,
             'tracking_position_threshold': tracking_position_threshold,
             'tracking_velocity_threshold': tracking_velocity_threshold,
-            'min_object_size': 50  # 降低最小物体尺寸阈值以检测更多动态物体
+            'min_object_size': min_object_size  # 使用传入的参数
         }
     }
 
@@ -754,6 +768,28 @@ def parse_seq_path(p):
     return img_paths, tmpdirname
 
 
+def get_camera_parameters(vggt_batch, stage1_preds, use_gt_camera=False):
+    """获取相机参数（GT或预测）"""
+    if use_gt_camera:
+        # 使用GT相机参数
+        intrinsics = vggt_batch['intrinsics']  # [B, S, 3, 3]
+        extrinsics = vggt_batch['extrinsics']  # [B, S, 4, 4]
+    else:
+        # 使用预测的相机参数
+        from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+        extrinsics, intrinsics = pose_encoding_to_extri_intri(
+            stage1_preds["pose_enc"], vggt_batch["images"].shape[-2:]
+        )
+        # 添加齐次坐标行到外参矩阵
+        extrinsics = torch.cat([
+            extrinsics,
+            torch.tensor([0, 0, 0, 1], device=extrinsics.device)[
+                None, None, None, :].repeat(1, extrinsics.shape[1], 1, 1)
+        ], dim=-2)
+
+    return extrinsics, intrinsics
+
+
 def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_loss, device, args):
     """执行Stage2推理 - 同时运行两种模式并返回拼接结果"""
 
@@ -853,8 +889,25 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
         else:
             print("No pred_sky_colors found in predictions")
 
+        # 根据use_gt_camera参数决定是否替换相机参数
+        preds_for_dynamic = stage1_preds.copy()
+        if args.use_gt_camera and 'pose_enc' in preds_for_dynamic:
+            # 将GT的extrinsics和intrinsics转换为pose_enc格式
+            from vggt.utils.pose_enc import extri_intri_to_pose_encoding
+            gt_extrinsics = vggt_batch['extrinsics']  # [B, S, 4, 4]
+            gt_intrinsics = vggt_batch['intrinsics']  # [B, S, 3, 3]
+            image_size_hw = vggt_batch['images'].shape[-2:]
+
+            gt_pose_enc = extri_intri_to_pose_encoding(
+                gt_extrinsics, gt_intrinsics, image_size_hw, pose_encoding_type="absT_quaR_FoV"
+            )
+            preds_for_dynamic['pose_enc'] = gt_pose_enc
+            print(f"[INFO] Using GT camera parameters for dynamic object processing")
+        else:
+            print(f"[INFO] Using predicted camera parameters for dynamic object processing")
+
         dynamic_objects_data = stage2_trainer.dynamic_processor.process_dynamic_objects(
-            stage1_preds, vggt_batch, auxiliary_models
+            preds_for_dynamic, vggt_batch, auxiliary_models
         )
         dynamic_process_time = time.time() - start_time
 
@@ -874,17 +927,10 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
             # 如果没有动态物体，使用静态Gaussian进行渲染
             B, S, C, H, W = vggt_batch['images'].shape
 
-            # 准备渲染参数
-            from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-            extrinsics, intrinsics = pose_encoding_to_extri_intri(
-                stage1_preds["pose_enc"], vggt_batch["images"].shape[-2:]
+            # 准备渲染参数（使用GT或预测的相机参数）
+            extrinsics, intrinsics = get_camera_parameters(
+                vggt_batch, stage1_preds, use_gt_camera=args.use_gt_camera
             )
-            # 添加齐次坐标行到外参矩阵
-            extrinsics = torch.cat([
-                extrinsics,
-                torch.tensor([0, 0, 0, 1], device=extrinsics.device)[
-                    None, None, None, :].repeat(1, extrinsics.shape[1], 1, 1)
-            ], dim=-2)
 
             # 使用静态Gaussian场景进行渲染（没有动态物体）
             static_scene = {
@@ -920,17 +966,10 @@ def run_stage2_inference(dataset, stage1_model, stage2_trainer, stage2_render_lo
             B, S, C, H, W = vggt_batch['images'].shape
             gt_images = vggt_batch['images']
 
-            # 使用预测的相机参数
-            from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-            extrinsics, intrinsics = pose_encoding_to_extri_intri(
-                stage1_preds["pose_enc"], vggt_batch["images"].shape[-2:]
+            # 准备渲染参数（使用GT或预测的相机参数）
+            extrinsics, intrinsics = get_camera_parameters(
+                vggt_batch, stage1_preds, use_gt_camera=args.use_gt_camera
             )
-            # 添加齐次坐标行到外参矩阵
-            extrinsics = torch.cat([
-                extrinsics,
-                torch.tensor([0, 0, 0, 1], device=extrinsics.device)[
-                    None, None, None, :].repeat(1, extrinsics.shape[1], 1, 1)
-            ], dim=-2)
 
             # 模式1: 不使用Stage2细化，直接使用原始动态物体数据
             start_time = time.time()
@@ -1301,9 +1340,11 @@ def main():
         args.stage2_model_path, device,
         use_velocity_based_transform=args.use_velocity_based_transform,
         velocity_transform_mode=args.velocity_transform_mode,
+        use_gt_camera=args.use_gt_camera,
         velocity_threshold=args.velocity_threshold,
         clustering_eps=args.clustering_eps,
         clustering_min_samples=args.clustering_min_samples,
+        min_object_size=args.min_object_size,
         tracking_position_threshold=args.tracking_position_threshold,
         tracking_velocity_threshold=args.tracking_velocity_threshold
     )

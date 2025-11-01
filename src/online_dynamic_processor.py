@@ -46,37 +46,36 @@ def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, 
     对每一帧进行动态物体聚类
 
     Args:
-        xyz: [S, H*W, 3] 点云坐标
-        velocity: [S, H*W, 3] 速度向量（非metric尺度）
+        xyz: [S, H*W, 3] 点云坐标（非metric尺度，保留梯度）
+        velocity: [S, H*W, 3] 速度向量（非metric尺度，保留梯度）
         velocity_threshold: 速度阈值（metric尺度，m/s），用于过滤静态背景
-        eps: DBSCAN的邻域半径
+        eps: DBSCAN的邻域半径（metric尺度，米）
         min_samples: DBSCAN的最小样本数
         area_threshold: 面积阈值，过滤掉面积小于此值的聚类
         conf_mask: [S, H*W] confidence掩码，True表示高置信度像素
-        gt_scale: float or tensor - GT scale factor，用于将velocity转换到metric尺度
+        gt_scale: float or tensor - GT scale factor，用于将xyz和velocity转换到metric尺度
 
     Returns:
         list: 每一帧的聚类结果，每个元素包含点云坐标和聚类标签
+              注意：返回的 'points' 是非metric尺度，但保留梯度，可以用于反向传播！
+              聚类过程在metric空间进行，因此eps参数是真实的物理距离（米）
     """
     clustering_results = []
     device = xyz.device
 
-    # 将gt_scale转换为tensor
-    if gt_scale is not None:
-        if not isinstance(gt_scale, torch.Tensor):
-            gt_scale_tensor = torch.tensor(gt_scale, device=device, dtype=velocity.dtype)
-        else:
-            gt_scale_tensor = gt_scale
-    else:
-        gt_scale_tensor = torch.tensor(1.0, device=device, dtype=velocity.dtype)
+    # 确保 gt_scale 是标量
+    if gt_scale is None:
+        gt_scale = 1.0
+    if isinstance(gt_scale, torch.Tensor):
+        gt_scale = gt_scale.item() if gt_scale.numel() == 1 else float(gt_scale)
 
     for frame_idx in range(xyz.shape[0]):
-        # 获取当前帧的点云和速度
-        frame_points = xyz[frame_idx]  # [H*W, 3]
-        frame_velocity = velocity[frame_idx]  # [H*W, 3]
+        # 获取当前帧的点云和速度（保留梯度！）
+        frame_points = xyz[frame_idx]  # [H*W, 3] - 保留梯度
+        frame_velocity = velocity[frame_idx]  # [H*W, 3] - 保留梯度
 
         # 将velocity转换到metric尺度: velocity_metric = velocity / gt_scale
-        frame_velocity_metric = frame_velocity / gt_scale_tensor
+        frame_velocity_metric = frame_velocity / gt_scale
 
         # 计算速度大小（metric尺度，m/s）
         velocity_magnitude = torch.norm(frame_velocity_metric, dim=-1)  # [H*W]
@@ -89,8 +88,8 @@ def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, 
             frame_conf_mask = conf_mask[frame_idx]  # [H*W]
             dynamic_mask = dynamic_mask & frame_conf_mask  # 同时满足动态和高置信度
 
-        dynamic_points = frame_points[dynamic_mask]  # [N_dynamic, 3]
-        dynamic_velocities = frame_velocity[dynamic_mask]  # [N_dynamic, 3]
+        dynamic_points = frame_points[dynamic_mask]  # [N_dynamic, 3] - 非metric尺度
+        dynamic_velocities = frame_velocity[dynamic_mask]  # [N_dynamic, 3] - 非metric尺度
 
         if len(dynamic_points) < min_samples:
             # 如果动态点太少，返回空聚类
@@ -105,33 +104,25 @@ def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, 
             })
             continue
 
+        # 将动态点转换到metric尺度（用于DBSCAN聚类）
+        # 这样eps参数就是真实的物理距离（米）
+        dynamic_points_metric = dynamic_points / gt_scale  # [N_dynamic, 3] - metric尺度
+
         # 尝试使用cuML GPU加速的DBSCAN聚类
         try:
-            # 检查dynamic_points是否在GPU上
-            if dynamic_points.is_cuda:
-                # 如果已经在GPU上，直接转换为CuPy数组
-                dynamic_points_cp = cp.asarray(dynamic_points.detach())
-            else:
-                # 如果在CPU上，先移到GPU再转换为CuPy数组
-                dynamic_points_cp = cp.asarray(dynamic_points.detach().cpu().numpy())
-
-            # 执行cuML DBSCAN聚类（GPU加速）
+            # 转换为CuPy数组（使用metric尺度的坐标）
+            dynamic_points_metric_cp = cp.asarray(dynamic_points_metric.detach())
             dbscan = DBSCAN(eps=eps, min_samples=min_samples)
-            cluster_labels_cp = dbscan.fit_predict(dynamic_points_cp)
-
+            cluster_labels_cp = dbscan.fit_predict(dynamic_points_metric_cp)
             # 转换回NumPy数组
             cluster_labels = cp.asnumpy(cluster_labels_cp)
-            # print(f"cuML DBSCAN成功: 找到 {len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)} 个聚类")
         except Exception as e:
             # 回退到sklearn CPU版本
-            # print(f"cuML DBSCAN失败，回退到sklearn: {e}")
             try:
-                dynamic_points_np = dynamic_points.detach().cpu().numpy()
+                dynamic_points_metric_np = dynamic_points_metric.detach().cpu().numpy()
                 dbscan_sklearn = SklearnDBSCAN(eps=eps, min_samples=min_samples)
-                cluster_labels = dbscan_sklearn.fit_predict(dynamic_points_np)
-                # print(f"sklearn DBSCAN成功: 找到 {len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)} 个聚类")
+                cluster_labels = dbscan_sklearn.fit_predict(dynamic_points_metric_np)
             except Exception as sklearn_e:
-                # print(f"sklearn DBSCAN也失败: {sklearn_e}")
                 # 简单回退：所有点标记为噪声
                 cluster_labels = np.full(len(dynamic_points), -1)
 
@@ -153,12 +144,12 @@ def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, 
 
         for label in sorted(all_unique_labels):
             cluster_mask = cluster_labels == label
-            cluster_points = dynamic_points[cluster_mask]
-            cluster_vel = dynamic_velocities[cluster_mask]
+            # 这些只用于统计计算，不需要梯度
+            cluster_points = dynamic_points[cluster_mask].detach()
+            cluster_vel = dynamic_velocities[cluster_mask].detach()
 
-            # 计算聚类中心（平均位置）
+            # 计算聚类中心（平均位置和平均速度）
             center = cluster_points.mean(dim=0)
-            # 计算平均速度
             avg_velocity = cluster_vel.mean(dim=0)
             cluster_size = len(cluster_points)
 
@@ -608,7 +599,7 @@ class OnlineDynamicProcessor:
             gaussian_params = preds.get('gaussian_params')
             stage_times['preprocessing'] = time.time() - preprocessing_start
 
-            # ========== Stage 2: 聚类 + 背景分离 ========== FIXME: points need grad?
+            # ========== Stage 2: 聚类 + 背景分离 ==========
             clustering_start = time.time()
             clustering_results = self._perform_clustering_with_existing_method(preds, vggt_batch, velocity)
             static_gaussians = self._create_static_background_from_labels(preds, clustering_results, H, W, S, sky_masks)
@@ -793,21 +784,13 @@ class OnlineDynamicProcessor:
                         None, None, None, :].repeat(1, extrinsics.shape[1], 1, 1)
                 ], dim=-2)
 
-                # 处理不同的depth形状
-                if len(depths.shape) == 5 and depths.shape[-1] == 1:
-                    # 形状为 [B, S, H, W, 1]，转换为 [B, S, H, W]
-                    B, S, H, W, _ = depths.shape
-                    depths = depths.squeeze(-1)  # [B, S, H, W]
-                elif len(depths.shape) == 4 and depths.shape[-1] == 1:
-                    # 形状为 [S, H, W, 1]，转换为 [B, S, H, W]
-                    S, H, W, _ = depths.shape
-                    B = 1
-                    depths = depths.squeeze(-1).unsqueeze(0)  # [B, S, H, W]
-                elif len(depths.shape) == 4:
-                    # 已经是 [B, S, H, W] 格式
-                    B, S, H, W = depths.shape
-                else:
-                    raise ValueError(f"Unexpected depth shape: {depths.shape}")
+                # 统一depth格式为 [B, S, H, W]
+                depths = depths.squeeze(-1) if depths.shape[-1] == 1 else depths
+                if depths.ndim == 3:  # [S, H, W] -> [B, S, H, W]
+                    depths = depths.unsqueeze(0)
+                if depths.ndim != 4:
+                    raise ValueError(f"Unexpected depth shape: {depths.shape}, expected 4D after normalization")
+                B, S, H, W = depths.shape
 
                 # 计算世界坐标点云
                 # 先添加最后一个维度到depth以匹配函数期望的[N, H, W, 1]格式
@@ -834,19 +817,13 @@ class OnlineDynamicProcessor:
                 H, W = 224, 224  # 默认尺寸
                 xyz = torch.zeros(S, H*W, 3, device=self.device)
 
-            # 处理速度信息（已经在函数开头处理过了，这里只需要reshape）
+            # 统一velocity格式为 [S, H*W, 3]（取第一个batch）
             if velocity is not None:
-                if len(velocity.shape) == 5:
-                    B, S, H, W, _ = velocity.shape
-                    velocity_reshaped = velocity[0].reshape(
-                        S, H*W, 3)  # 取第一个batch: [S, H*W, 3]
-                elif len(velocity.shape) == 4:
-                    # Handle case where velocity is [B, S, H*W, 3] format
-                    B, S, HW, _ = velocity.shape
-                    velocity_reshaped = velocity[0]  # [S, H*W, 3]
-                else:
-                    raise ValueError(
-                        f"Unexpected velocity shape: {velocity.shape}")
+                velocity_reshaped = velocity[0]  # [S, ...]
+                if velocity_reshaped.ndim == 4:  # [S, H, W, 3] -> [S, H*W, 3]
+                    velocity_reshaped = velocity_reshaped.reshape(velocity_reshaped.shape[0], -1, 3)
+                if velocity_reshaped.ndim != 3 or velocity_reshaped.shape[-1] != 3:
+                    raise ValueError(f"Unexpected velocity shape: {velocity.shape}")
                 # 注意：速度后处理和坐标变换已经在process_dynamic_objects开头完成
             else:
                 velocity_reshaped = torch.zeros(S, H*W, 3, device=self.device)
@@ -865,13 +842,11 @@ class OnlineDynamicProcessor:
                 gt_scale = gt_scale[0] if gt_scale.ndim > 0 else gt_scale
 
             # 使用直接定义的动态物体聚类函数
-            # 分离张量梯度以便在聚类中使用numpy
-            xyz_detached = xyz.detach()
-            velocity_detached = velocity_reshaped.detach()
-
+            # 注意：不在这里detach，让xyz和velocity保留梯度
+            # 在clustering函数内部，只在需要numpy/cupy操作时才detach
             clustering_results = dynamic_object_clustering(
-                xyz_detached,  # [S, H*W, 3]
-                velocity_detached,  # [S, H*W, 3] (非metric尺度)
+                xyz,  # [S, H*W, 3] - 保留梯度！
+                velocity_reshaped,  # [S, H*W, 3] (非metric尺度) - 保留梯度！
                 velocity_threshold=self.velocity_threshold,  # 速度阈值(metric尺度, m/s)
                 eps=self.clustering_eps,  # DBSCAN的邻域半径
                 min_samples=self.clustering_min_samples,  # DBSCAN的最小样本数

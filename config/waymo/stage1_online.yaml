@@ -5,7 +5,8 @@
 model: "VGGT(img_size=518, patch_size=14, embed_dim=1024)"
 # pretrained: model.pt
 # pretrained_velocity: False
-pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/aggregator_all/checkpoint-epoch_0_28480.pth"
+# pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/aggregator_all/checkpoint-epoch_0_28480.pth"
+pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/fromaggregator_all_lr3e-6_procrustes_area3000_velocityconstraint0.05_gtcamera/checkpoint-epoch_0_26040.pth"
 # pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/aggregator_resume_noflowgrad_nearestdynamic_resume_0point1_novoxel/checkpoint-epoch_0_19936.pth"
 # pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow/checkpoint-epoch_7_9968.pth"
 
@@ -98,7 +99,7 @@ camera_loss_weight: 5.0                   # 相机参数预测损失权重
 
 # 10. Depth Loss (监督depth head训练)
 conf_depth_loss_weight: 1.0                    # 深度预测损失权重
-grad_depth_loss_weight: 1.0                 # 深度梯度损失权重
+grad_depth_loss_weight: 0.0                 # 深度梯度损失权重
 reg_depth_loss_weight: 1.0                      # 深度正则化损失权重
 
 # 11. Scale Loss (监督scale head训练，使用depth_scale_factor作为GT)
@@ -110,20 +111,19 @@ aggregator_render_depth_weight: 0.0         # Aggregator render depth损失权�
 aggregator_render_lpips_weight: 0.0         # Aggregator render LPIPS损失权重
 aggregator_voxel_size: 0                # 体素量化大小(metric尺度, 单位m)
 aggregator_dynamic_threshold: 0.1          # 动静态分离的速度阈值(metric尺度, 单位m/s)
-aggregator_frame_sample_ratio: 0.25         # Aggregator渲染时的帧采样比例(用于控制渲染的帧数量)
+aggregator_frame_sample_ratio: 1.0         # Aggregator渲染时的帧采样比例(用于控制渲染的帧数量)
 
 # 13. Aggregator_all Render Loss (代替Stage2 refine网络的渲染loss)
 # 这个loss直接在Stage1中使用动态物体处理+渲染监督,跳过Stage2的refine网络
 # 需要enable_stage2=true才能使用(需要OnlineDynamicProcessor和Stage2Loss)
 aggregator_all_render_rgb_weight: 1.0      # Aggregator_all RGB渲染损失权重
 aggregator_all_render_depth_weight: 1.0    # Aggregator_all depth渲染损失权重
-aggregator_all_static_black_weight: 0.0    # 非动态区域渲染为黑色的loss权重
+aggregator_all_render_lpips_weight: 0.2    # Aggregator_all LPIPS渲染损失权重
 # Stage2配置（用于aggregator_all loss的渲染配置）
 stage2_render_only_dynamic: false          # 是否只渲染动态物体
 stage2_supervise_only_dynamic: false       # 是否只监督动态区域
-stage2_static_black_weight: 0.0            # 非动态区域渲染为黑色的loss权重
 # 动态处理器配置（用于aggregator_all loss的动态物体处理）
-min_object_size: 3000                       # 最小物体尺寸（点数）
+min_object_size: 500                       # 最小物体尺寸（点数）
 max_objects_per_frame: 10                  # 每帧最大物体数量
 velocity_threshold: 0.1                    # 速度阈值（metric尺度，m/s）
 clustering_eps: 0.02                       # DBSCAN邻域半径
@@ -157,7 +157,7 @@ gradient_checkpointing: True
 epochs: 2
 start_epoch: 0
 weight_decay: 0.05
-lr: 3e-6
+lr: 1e-5
 min_lr: 1e-8
 warmup_epochs: 0.02
 amp: 1
@@ -182,7 +182,7 @@ num_imgs_vis: 4
 # =============== 输出配置 ===============
 save_dir: 'checkpoints/waymo_stage1_online'
 # exp_name: 'aggregator_from_scratch'
-exp_name: 'fromaggregator_all_lr3e-6_procrustes_area3000_velocityconstraint0.05'
+exp_name: 'fromaggregator_all_lr1e-5_procrustes_area500_velocityconstraint0.05_gtcamera_xyzgrad+fixdbscan+sky+lpips'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/
