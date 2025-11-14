@@ -1322,7 +1322,7 @@ class OpticalFlowRegistration:
                     # 计算50%分位数
                     num_points = len(object_conf)
                     if num_points > 0:
-                        conf_threshold = torch.quantile(object_conf, 0.2)  # 取20%分位数作为阈值
+                        conf_threshold = torch.quantile(object_conf, 0.0)  # 取0%分位数作为阈值
 
                         # 过滤：只保留置信度 >= 阈值的点
                         high_conf_mask = object_conf >= conf_threshold

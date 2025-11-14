@@ -6,9 +6,8 @@ model: "VGGT(img_size=518, patch_size=14, embed_dim=1024)"
 # pretrained: model.pt
 # pretrained_velocity: False
 # pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/aggregator_all/checkpoint-epoch_0_28480.pth"
-pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/fromaggregator_all_lr3e-6_procrustes_area3000_velocityconstraint0.05_gtcamera/checkpoint-epoch_0_26040.pth"
-# pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/aggregator_resume_noflowgrad_nearestdynamic_resume_0point1_novoxel/checkpoint-epoch_0_19936.pth"
-# pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow/checkpoint-epoch_7_9968.pth"
+pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/fromaggregator_all_lr1e-5_procrustes_area500_velocityconstraint0.05_gtcamera_xyzgrad+fixdbscan+sky+fixepsmetric+noconf/checkpoint-epoch_0_37980.pth"
+# pretrained_velocity: ""
 
 # VGGT冻结策略配置
 # 可选值: "none", "encoder", "encoder_frame", "backbone", "backbone_camera", "backbone_pts",
@@ -76,7 +75,7 @@ grad_flow_loss_weight: 0.0                 # GT flowmap gradient损失权重
 reg_flow_loss_weight: 0.0                  # GT flowmap reg损失权重
 
 # 3b. GT Flow Loss Ours (我们自己实现的版本)
-gt_flow_loss_ours_weight: 1.0              # 自定义GT flowmap损失权重
+gt_flow_loss_ours_weight: 0.0              # 自定义GT flowmap损失权重
 
 # 4. SAM2 Velocity Consistency Loss (辅助velocity head监督)
 sam2_velocity_weight: 0.0                  # SAM2掩码一致性监督
@@ -118,7 +117,7 @@ aggregator_frame_sample_ratio: 1.0         # Aggregator渲染时的帧采样比�
 # 需要enable_stage2=true才能使用(需要OnlineDynamicProcessor和Stage2Loss)
 aggregator_all_render_rgb_weight: 1.0      # Aggregator_all RGB渲染损失权重
 aggregator_all_render_depth_weight: 1.0    # Aggregator_all depth渲染损失权重
-aggregator_all_render_lpips_weight: 0.2    # Aggregator_all LPIPS渲染损失权重
+aggregator_all_render_lpips_weight: 0.1    # Aggregator_all LPIPS渲染损失权重
 # Stage2配置（用于aggregator_all loss的渲染配置）
 stage2_render_only_dynamic: false          # 是否只渲染动态物体
 stage2_supervise_only_dynamic: false       # 是否只监督动态区域
@@ -126,7 +125,7 @@ stage2_supervise_only_dynamic: false       # 是否只监督动态区域
 min_object_size: 500                       # 最小物体尺寸（点数）
 max_objects_per_frame: 10                  # 每帧最大物体数量
 velocity_threshold: 0.1                    # 速度阈值（metric尺度，m/s）
-clustering_eps: 0.02                       # DBSCAN邻域半径
+clustering_eps: 0.3                       # DBSCAN邻域半径
 clustering_min_samples: 10                 # DBSCAN最小样本数
 tracking_position_threshold: 2.0           # 位置匹配阈值
 tracking_velocity_threshold: 0.2           # 速度匹配阈值
@@ -182,7 +181,7 @@ num_imgs_vis: 4
 # =============== 输出配置 ===============
 save_dir: 'checkpoints/waymo_stage1_online'
 # exp_name: 'aggregator_from_scratch'
-exp_name: 'fromaggregator_all_lr1e-5_procrustes_area500_velocityconstraint0.05_gtcamera_xyzgrad+fixdbscan+sky+lpips'
+exp_name: 'fromaggregator_all_lr1e-5_procrustes_area500_velocityconstraint0.05_gtcamera_xyzgrad+fixdbscan+sky+fixepsmetric+noconf+novelocity!'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/
