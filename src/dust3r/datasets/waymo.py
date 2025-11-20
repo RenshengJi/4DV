@@ -13,7 +13,7 @@ class Waymo_Multi(BaseMultiViewDataset):
     """Dataset of outdoor street scenes, 5 images each time"""
 
     def __init__(self, *args, ROOT, img_ray_mask_p=[0.85, 0.10, 0.05], valid_camera_id_list=["1", "2", "3"],
-                 load_sam_masks=False, load_ground_masks=True, **kwargs):
+                 load_sam_masks=False, **kwargs):
         self.ROOT = ROOT
         self.img_ray_mask_p = img_ray_mask_p
         self.max_interval = 8
@@ -21,7 +21,6 @@ class Waymo_Multi(BaseMultiViewDataset):
         self.is_metric = True
         self.valid_camera_id_list = valid_camera_id_list
         self.load_sam_masks = load_sam_masks  # 是否加载SAM掩码
-        self.load_ground_masks = load_ground_masks  # 是否加载ground掩码
         super().__init__(*args, **kwargs)
         assert self.split is None
         self._load_data()
@@ -135,27 +134,6 @@ class Waymo_Multi(BaseMultiViewDataset):
             print(f"Error loading SAM masks from {sam_mask_path}: {e}")
             return None
 
-    def _load_ground_mask(self, scene_dir, impath):
-        """加载ground掩码，用于标识地面区域"""
-        try:
-            # Ground掩码文件路径：与图像同目录，文件名为{impath}.ground.png
-            ground_mask_path = osp.join(scene_dir, impath + ".ground.png")
-            if osp.exists(ground_mask_path):
-                # 读取ground mask (灰度图)
-                ground_mask = imread_cv2(ground_mask_path)
-                # 如果是3通道，取第一个通道
-                if ground_mask.ndim == 3:
-                    ground_mask = ground_mask[:, :, 0]
-                # 二值化：非零值表示地面
-                ground_mask = (ground_mask > 0).astype(np.bool_)
-                return ground_mask
-            else:
-                # 如果ground mask不存在，返回None
-                return None
-        except Exception as e:
-            print(f"Error loading ground mask from {ground_mask_path}: {e}")
-            return None
-
     def _get_views(self, idx, resolution, rng, num_views):
         start_id = self.start_img_ids[idx]
         all_image_ids = self.scene_img_list[self.sceneids[start_id]]
@@ -194,19 +172,12 @@ class Waymo_Multi(BaseMultiViewDataset):
             if osp.exists(flow_path):
                 flowmap = np.load(flow_path)
 
-            # 加载ground掩码（在crop/resize之前加载）
-            ground_mask = None
-            if self.load_ground_masks:
-                ground_mask = self._load_ground_mask(scene_dir, impath)
-
             intrinsics = np.float32(camera_params["intrinsics"])
             camera_pose = np.float32(camera_params["cam2world"])
 
-            # 根据是否有flowmap和ground_mask来调用_crop_resize_if_necessary
-            if flowmap is not None or ground_mask is not None:
-                image, depthmap, intrinsics, flowmap, ground_mask = self._crop_resize_if_necessary(
-                    image, depthmap, intrinsics, resolution, rng, info=(scene_dir, impath),
-                    flowmap=flowmap, ground_mask=ground_mask
+            if flowmap is not None:
+                image, depthmap, intrinsics, flowmap = self._crop_resize_if_necessary(
+                    image, depthmap, intrinsics, resolution, rng, info=(scene_dir, impath), flowmap=flowmap
                 )
             else:
                 image, depthmap, intrinsics = self._crop_resize_if_necessary(
@@ -246,22 +217,6 @@ class Waymo_Multi(BaseMultiViewDataset):
             # 如果加载了SAM掩码，添加到view_dict中
             if sam_masks is not None:
                 view_dict["sam_masks"] = sam_masks
-
-            # 如果加载了ground掩码，添加到view_dict中
-            if ground_mask is not None:
-                view_dict["ground_mask"] = ground_mask
-
-                # 应用ground mask到flowmap，将地面区域的velocity置为0
-                if flowmap is not None:
-                    # flowmap shape: [H, W, C] where C >= 3 (前3维是velocity)
-                    # ground_mask shape: [H, W]
-                    # 将ground_mask扩展到velocity维度
-                    ground_mask_expanded = np.expand_dims(ground_mask, axis=-1)  # [H, W, 1]
-                    ground_mask_velocity = np.tile(ground_mask_expanded, (1, 1, 3))  # [H, W, 3]
-                    # 将地面区域的velocity (前3个通道) 置为0
-                    flowmap[..., :3][ground_mask_velocity] = 0.0
-                    # 更新view_dict中的flowmap
-                    view_dict["flowmap"] = flowmap
 
             views.append(view_dict)
 

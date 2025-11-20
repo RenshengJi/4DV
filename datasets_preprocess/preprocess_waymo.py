@@ -41,47 +41,6 @@ from datasets_preprocess.utils import cropping
 from sam_preprocessing import SAMPreprocessor
 
 
-def get_ground_np(pts):
-    """
-    This function performs ground removal on a point cloud.
-    Modified from https://github.com/tusen-ai/LiDAR_SOT/blob/main/waymo_data/data_preprocessing/ground_removal.py
-
-    Args:
-        pts (numpy.ndarray): The input point cloud.
-
-    Returns:
-        numpy.ndarray: A boolean array indicating whether each point is ground or not.
-    """
-    th_seeds_ = 1.2
-    num_lpr_ = 20
-    n_iter = 10
-    th_dist_ = 0.3
-    pts_sort = pts[pts[:, 2].argsort(), :]
-    lpr = np.mean(pts_sort[:num_lpr_, 2])
-    pts_g = pts_sort[pts_sort[:, 2] < lpr + th_seeds_, :]
-    normal_ = np.zeros(3)
-    for i in range(n_iter):
-        mean = np.mean(pts_g, axis=0)[:3]
-        xx = np.mean((pts_g[:, 0] - mean[0]) * (pts_g[:, 0] - mean[0]))
-        xy = np.mean((pts_g[:, 0] - mean[0]) * (pts_g[:, 1] - mean[1]))
-        xz = np.mean((pts_g[:, 0] - mean[0]) * (pts_g[:, 2] - mean[2]))
-        yy = np.mean((pts_g[:, 1] - mean[1]) * (pts_g[:, 1] - mean[1]))
-        yz = np.mean((pts_g[:, 1] - mean[1]) * (pts_g[:, 2] - mean[2]))
-        zz = np.mean((pts_g[:, 2] - mean[2]) * (pts_g[:, 2] - mean[2]))
-        cov = np.array(
-            [[xx, xy, xz], [xy, yy, yz], [xz, yz, zz]],
-            dtype=np.float32,
-        )
-        U, S, V = np.linalg.svd(cov)
-        normal_ = U[:, 2]
-        d_ = -normal_.dot(mean)
-        th_dist_d_ = th_dist_ - d_
-        result = pts[:, :3] @ normal_[..., np.newaxis]
-        pts_g = pts[result.squeeze(-1) < th_dist_d_]
-    ground_label = result < th_dist_d_
-    return ground_label
-
-
 def project_vehicle_to_image(vehicle_pose, calibration, points):
     """Projects from vehicle coordinate system to image with global shutter.
 
@@ -781,25 +740,6 @@ def crop_one_seq(input_dir, output_dir, seq, enable_sam=False, sam_model_type="s
         valid_mask = (x >= 0) & (x < W) & (y >= 0) & (y < H)
         flowmap[y[valid_mask], x[valid_mask]] = flows[valid_mask]
         np.save(osp.join(out_dir, frame + "npy"), flowmap)
-
-        # Generate ground mask
-        try:
-            # pts3d is in camera coordinate system, need to use it for ground detection
-            # Get original pts3d before transformation for ground detection
-            pts3d_original = data["pts3d"]  # already in car frame from extract stage
-
-            # Apply ground detection on 3D points
-            ground_label = get_ground_np(pts3d_original).reshape(-1)
-
-            # Create ground mask image
-            groundmap = np.zeros((H, W), dtype=np.uint8)
-            groundmap[y[valid_mask], x[valid_mask]] = (ground_label[valid_mask] * 255).astype(np.uint8)
-
-            # Save as PNG
-            ground_output_path = osp.join(out_dir, frame + "ground.png")
-            PIL.Image.fromarray(groundmap, 'L').save(ground_output_path)
-        except Exception as e:
-            print(f"Error generating ground mask for {seq}/{frame}: {e}")
 
         # Generate dynamic mask
         if 'labels_json' in data.files and 'vehicle_pose' in data.files and 'calibration_json' in data.files:
