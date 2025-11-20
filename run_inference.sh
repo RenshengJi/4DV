@@ -8,9 +8,9 @@
 #   Row 4: Dynamic Clustering | (Black)
 
 # 配置参数
-START_IDX=${1:-1400}     # 起始idx，默认150
+START_IDX=${1:-100}     # 起始idx，默认150
 STEP=${2:-100}            # 步长，默认5
-END_IDX=${3:-10000}       # 结束idx，默认200
+END_IDX=${3:-100000}       # 结束idx，默认200
 USE_VELOCITY=${4:-true}  # 是否使用velocity-based方法，默认true
 VELOCITY_TRANSFORM_MODE=${5:-"procrustes"}  # velocity变换模式: "simple"或"procrustes"
 USE_GT_CAMERA=${6:-true}  # 是否使用GT camera参数，默认true
@@ -40,17 +40,21 @@ echo "  Tracking Velocity Threshold: ${TRACKING_VELOCITY_THRESHOLD}"
 echo ""
 
 # 设置环境变量
-export CUDA_VISIBLE_DEVICES=6
+export CUDA_VISIBLE_DEVICES=0
 
 # 模型路径
 # STAGE1_MODEL_PATH="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/fromaggregator_all_lr1e-5_procrustes_area500_velocityconstraint0.05_gtcamera_xyzgrad+fixdbscan+sky+fixepsmetric/checkpoint-epoch_0_22785.pth"
-STAGE1_MODEL_PATH="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/fromaggregator_all_lr1e-5_procrustes_area500_velocityconstraint0.05_gtcamera_xyzgrad+fixdbscan+sky+fixepsmetric+noconf+novelocity!/checkpoint-epoch_0_75960.pth"
+# STAGE1_MODEL_PATH="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/fromaggregator_all_lr1e-5_procrustes_area500_velocityconstraint0.05_gtcamera_xyzgrad+fixdbscan+sky+fixepsmetric+noconf+novelocity!/checkpoint-epoch_0_75960.pth"
+# STAGE1_MODEL_PATH="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow/checkpoint-epoch_7_11392.pth"
+# STAGE1_MODEL_PATH="src/checkpoints/waymo_stage1_online/aggregator_all_resume_procrustes_depthconf0.2+fixcamera+velocityconstrain_detach/checkpoint-epoch_0_39060.pth"
+STAGE1_MODEL_PATH="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_new/ground+fixvelocity_resume/checkpoint-epoch_0_52080.pth"
+    
 
 # 数据路径
-SEQ_DIR="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train_with_flow/segment-15795616688853411272_1245_000_1265_000_with_camera_labels"
+SEQ_DIR="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train_full/"
 
 # 输出目录
-OUTPUT_DIR="./inference_outputs"
+OUTPUT_DIR="./results/inference_outputs_fixvelocity_11.5w"
 
 # 其他参数
 NUM_VIEWS=8

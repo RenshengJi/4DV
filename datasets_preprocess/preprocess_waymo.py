@@ -41,13 +41,93 @@ from datasets_preprocess.utils import cropping
 from sam_preprocessing import SAMPreprocessor
 
 
+def get_ground_np(pts):
+    """
+    This function performs ground removal on a point cloud.
+    Modified from https://github.com/tusen-ai/LiDAR_SOT/blob/main/waymo_data/data_preprocessing/ground_removal.py
+
+    Args:
+        pts (numpy.ndarray): The input point cloud.
+
+    Returns:
+        numpy.ndarray: A boolean array indicating whether each point is ground or not.
+    """
+    th_seeds_ = 1.2
+    num_lpr_ = 20
+    n_iter = 10
+    th_dist_ = 0.3
+    pts_sort = pts[pts[:, 2].argsort(), :]
+    lpr = np.mean(pts_sort[:num_lpr_, 2])
+    pts_g = pts_sort[pts_sort[:, 2] < lpr + th_seeds_, :]
+    normal_ = np.zeros(3)
+    for i in range(n_iter):
+        mean = np.mean(pts_g, axis=0)[:3]
+        xx = np.mean((pts_g[:, 0] - mean[0]) * (pts_g[:, 0] - mean[0]))
+        xy = np.mean((pts_g[:, 0] - mean[0]) * (pts_g[:, 1] - mean[1]))
+        xz = np.mean((pts_g[:, 0] - mean[0]) * (pts_g[:, 2] - mean[2]))
+        yy = np.mean((pts_g[:, 1] - mean[1]) * (pts_g[:, 1] - mean[1]))
+        yz = np.mean((pts_g[:, 1] - mean[1]) * (pts_g[:, 2] - mean[2]))
+        zz = np.mean((pts_g[:, 2] - mean[2]) * (pts_g[:, 2] - mean[2]))
+        cov = np.array(
+            [[xx, xy, xz], [xy, yy, yz], [xz, yz, zz]],
+            dtype=np.float32,
+        )
+        U, S, V = np.linalg.svd(cov)
+        normal_ = U[:, 2]
+        d_ = -normal_.dot(mean)
+        th_dist_d_ = th_dist_ - d_
+        result = pts[:, :3] @ normal_[..., np.newaxis]
+        pts_g = pts[result.squeeze(-1) < th_dist_d_]
+    ground_label = result < th_dist_d_
+    return ground_label
+
+
+def project_vehicle_to_image(vehicle_pose, calibration, points):
+    """Projects from vehicle coordinate system to image with global shutter.
+
+    Arguments:
+      vehicle_pose: Vehicle pose transform from vehicle into world coordinate system.
+      calibration: Camera calibration details (including intrinsics/extrinsics).
+      points: Points to project of shape [N, 3] in vehicle coordinate system.
+
+    Returns:
+      Array of shape [N, 3], with the latter dimension composed of (u, v, ok).
+    """
+    from waymo_open_dataset import dataset_pb2
+    from waymo_open_dataset.wdl_limited.camera.ops import py_camera_model_ops
+
+    # Transform points from vehicle to world coordinate system
+    pose_matrix = np.array(vehicle_pose.transform).reshape(4, 4)
+    world_points = np.zeros_like(points)
+    for i, point in enumerate(points):
+        cx, cy, cz, _ = np.matmul(pose_matrix, [*point, 1])
+        world_points[i] = (cx, cy, cz)
+
+    # Populate camera image metadata
+    extrinsic = tf.reshape(
+        tf.constant(list(calibration.extrinsic.transform), dtype=tf.float32), [4, 4]
+    )
+    intrinsic = tf.constant(list(calibration.intrinsic), dtype=tf.float32)
+    metadata = tf.constant(
+        [calibration.width, calibration.height, dataset_pb2.CameraCalibration.GLOBAL_SHUTTER],
+        dtype=tf.int32,
+    )
+    camera_image_metadata = list(vehicle_pose.transform) + [0.0] * 10
+
+    # Perform projection and return projected image coordinates (u, v, ok)
+    return py_camera_model_ops.world_to_image(
+        extrinsic, intrinsic, metadata, camera_image_metadata, world_points
+    ).numpy()
+
+
 def get_parser():
     import argparse
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--waymo_dir", default="/mnt/raw-datasets/waymo/raw/train")
+    # parser.add_argument("--waymo_dir", default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/test")
     parser.add_argument("--precomputed_pairs")
-    parser.add_argument("--output_dir", default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train_with_flow")
+    parser.add_argument("--output_dir", default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train_full")
     parser.add_argument("--workers", type=int, default=100)
     parser.add_argument("--enable_sam", action="store_true", help="Enable SAM mask generation")
     parser.add_argument("--sam_model_type", default="sam2", choices=["sam2", "sam"], help="SAM model type")
@@ -113,6 +193,13 @@ def process_one_seq(db_root, output_dir, seq):
         for cam_idx, view in views.items():
             img = PIL.Image.fromarray(view.pop("img"))
             img.save(osp.join(out_dir, f"{f:05d}_{cam_idx}.jpg"))
+
+            # Convert complex data to JSON strings for safe npz storage
+            if 'labels' in view:
+                view['labels_json'] = json.dumps(view.pop('labels'))
+            if 'calibration' in view:
+                view['calibration_json'] = json.dumps(view.pop('calibration'))
+
             np.savez(osp.join(out_dir, f"{f:05d}_{cam_idx}.npz"), **view)
 
     with open(calib_path, "w") as f:
@@ -538,8 +625,42 @@ def extract_frames_one_seq(filename):
             pts3d = points_all[mask.numpy()]
             flows = flows_all[mask.numpy()]
 
+            # Extract label data for dynamic mask generation
+            labels_data = []
+            for label in frame.laser_labels:
+                box = label.box
+                meta = label.metadata
+                if not box.ByteSize():
+                    continue
+                # Use num_lidar_points_in_box if num_top_lidar_points_in_box is not available
+                if not label.num_top_lidar_points_in_box and not label.num_lidar_points_in_box:
+                    continue
+                speed = np.linalg.norm([meta.speed_x, meta.speed_y])
+                labels_data.append({
+                    'box': [box.center_x, box.center_y, box.center_z,
+                           box.length, box.width, box.height, box.heading],
+                    'speed': float(speed)
+                })
+
+            # Get camera calibration for this view
+            calibration = next(cc for cc in frame.context.camera_calibrations if cc.name == image.name)
+            calibration_data = {
+                'width': calibration.width,
+                'height': calibration.height,
+                'intrinsic': list(calibration.intrinsic),
+                'extrinsic': list(calibration.extrinsic.transform)
+            }
+
             views[image.name] = dict(
-                img=rgb, pose=pose, pixels=pix, pts3d=pts3d, timestamp=timestamp, flows=flows
+                img=rgb,
+                pose=pose,
+                pixels=pix,
+                pts3d=pts3d,
+                timestamp=timestamp,
+                flows=flows,
+                labels=labels_data,
+                vehicle_pose=frame.pose.transform,
+                calibration=calibration_data
             )
 
         # if not "show full point cloud":
@@ -660,6 +781,115 @@ def crop_one_seq(input_dir, output_dir, seq, enable_sam=False, sam_model_type="s
         valid_mask = (x >= 0) & (x < W) & (y >= 0) & (y < H)
         flowmap[y[valid_mask], x[valid_mask]] = flows[valid_mask]
         np.save(osp.join(out_dir, frame + "npy"), flowmap)
+
+        # Generate ground mask
+        try:
+            # pts3d is in camera coordinate system, need to use it for ground detection
+            # Get original pts3d before transformation for ground detection
+            pts3d_original = data["pts3d"]  # already in car frame from extract stage
+
+            # Apply ground detection on 3D points
+            ground_label = get_ground_np(pts3d_original).reshape(-1)
+
+            # Create ground mask image
+            groundmap = np.zeros((H, W), dtype=np.uint8)
+            groundmap[y[valid_mask], x[valid_mask]] = (ground_label[valid_mask] * 255).astype(np.uint8)
+
+            # Save as PNG
+            ground_output_path = osp.join(out_dir, frame + "ground.png")
+            PIL.Image.fromarray(groundmap, 'L').save(ground_output_path)
+        except Exception as e:
+            print(f"Error generating ground mask for {seq}/{frame}: {e}")
+
+        # Generate dynamic mask
+        if 'labels_json' in data.files and 'vehicle_pose' in data.files and 'calibration_json' in data.files:
+            try:
+                from waymo_open_dataset.utils import box_utils
+                from waymo_open_dataset import dataset_pb2
+
+                # Load saved data from JSON strings
+                labels_list = json.loads(str(data['labels_json']))
+                vehicle_pose_transform = data['vehicle_pose']
+                calib_data = json.loads(str(data['calibration_json']))
+
+                # Create a mock vehicle pose object
+                class MockPose:
+                    def __init__(self, transform):
+                        self.transform = transform
+
+                class MockCalibration:
+                    def __init__(self, calib_dict):
+                        self.width = int(calib_dict['width'])
+                        self.height = int(calib_dict['height'])
+                        self.intrinsic = calib_dict['intrinsic']
+
+                        class MockExtrinsic:
+                            def __init__(self, transform):
+                                self.transform = transform
+
+                        self.extrinsic = MockExtrinsic(calib_dict['extrinsic'])
+
+                vehicle_pose = MockPose(vehicle_pose_transform)
+                calibration = MockCalibration(calib_data)
+
+                # Initialize dynamic mask
+                dynamic_mask = np.zeros((H, W), dtype=np.float32)
+
+                # Process each label
+                for label_info in labels_list:
+                    speed = label_info['speed']
+                    box_coords = np.array([label_info['box']])
+
+                    # Get 3D box corners
+                    corners = box_utils.get_upright_3d_box_corners(box_coords)[0].numpy()
+
+                    # Project to image
+                    projected_corners = project_vehicle_to_image(vehicle_pose, calibration, corners)
+                    u, v, ok = projected_corners.transpose()
+                    ok = ok.astype(bool)
+
+                    # Skip if projection failed
+                    if not all(ok):
+                        continue
+
+                    u = u[ok]
+                    v = v[ok]
+
+                    # Clip to original image bounds (before downscaling)
+                    u = np.clip(u, 0, calib_data['width'])
+                    v = np.clip(v, 0, calib_data['height'])
+
+                    # Scale to downsampled image size
+                    scale_x = W / calib_data['width']
+                    scale_y = H / calib_data['height']
+                    u = u * scale_x
+                    v = v * scale_y
+
+                    if u.max() - u.min() == 0 or v.max() - v.min() == 0:
+                        continue
+
+                    # Get 2D bounding box
+                    xy = (u.min(), v.min())
+                    width = u.max() - u.min()
+                    height = v.max() - v.min()
+
+                    # Fill mask with speed (max pooling for overlaps)
+                    x1, y1 = int(xy[0]), int(xy[1])
+                    x2, y2 = int(xy[0] + width), int(xy[1] + height)
+                    x1, x2 = max(0, x1), min(W, x2)
+                    y1, y2 = max(0, y1), min(H, y2)
+
+                    dynamic_mask[y1:y2, x1:x2] = np.maximum(
+                        dynamic_mask[y1:y2, x1:x2],
+                        speed
+                    )
+
+                # Threshold: objects moving > 1.0 m/s are dynamic
+                dynamic_mask = np.clip((dynamic_mask > 1.0) * 255, 0, 255).astype(np.uint8)
+                dynamic_output_path = osp.join(out_dir, frame + "dynamic.png")
+                PIL.Image.fromarray(dynamic_mask, 'L').save(dynamic_output_path)
+            except Exception as e:
+                print(f"Error generating dynamic mask for {seq}/{frame}: {e}")
 
         # save camera parametes
         cam2world = car_to_world @ cam_to_car[cam_idx] @ inv(axes_transformation)

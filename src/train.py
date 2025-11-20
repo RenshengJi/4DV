@@ -271,12 +271,22 @@ def train(args):
     if not args.pretrained_velocity:
         printer.info(f"Loading pretrained: {args.pretrained}")
         ckpt = torch.load(args.pretrained, map_location=device)
+        # 删除 gaussian_head 的 output_conv2.2 参数（可能因为 sh_degree 不匹配）
+        # keys_to_remove = [k for k in ckpt.keys() if 'gaussian_head.scratch.output_conv2.2' in k]
+        # for key in keys_to_remove:
+        #     printer.info(f"Removing {key} from checkpoint (sh_degree mismatch)")
+        #     del ckpt[key]
         model.load_state_dict(ckpt, strict=False)
         del ckpt
     else:
         printer.info(f"Resume from: {args.pretrained_velocity}")
         checkpoint = torch.load(args.pretrained_velocity, map_location=device)
         ckpt = strip_module(checkpoint.get('model', checkpoint))  # Handle both wrapped and direct state_dict
+        # 删除 gaussian_head 的 output_conv2.2 参数（可能因为 sh_degree 不匹配）
+        # keys_to_remove = [k for k in ckpt.keys() if 'gaussian_head.scratch.output_conv2.2' in k]
+        # for key in keys_to_remove:
+        #     printer.info(f"Removing {key} from checkpoint (sh_degree mismatch)")
+        #     del ckpt[key]
         model.load_state_dict(ckpt, strict=False)
         del ckpt, checkpoint
     
@@ -1986,19 +1996,19 @@ def cut3r_batch_to_vggt(views):
                     sam_masks = torch.from_numpy(v['sam_masks']).float()
                 else:
                     sam_masks = v['sam_masks'].float()
-                
+
                 # 处理形状为 (1, num_mask, h, w) 的情况
                 if sam_masks.dim() == 4 and sam_masks.shape[0] == 1:
                     sam_masks = sam_masks.squeeze(0)  # 移除batch维度，变成 (num_mask, h, w)
-                
+
                 sam_masks_list.append(sam_masks)
             else:
                 # 如果没有SAM掩码，创建空的tensor
                 sam_masks_list.append(torch.zeros(0, v['img'].shape[1], v['img'].shape[2]))
-        
+
         # 找到最大数量的掩码
         max_num_masks = max(masks.shape[0] for masks in sam_masks_list)
-        
+
         # 填充到相同数量的掩码
         padded_sam_masks = []
         for masks in sam_masks_list:
@@ -2007,8 +2017,25 @@ def cut3r_batch_to_vggt(views):
                 padding = torch.zeros(max_num_masks - masks.shape[0], masks.shape[1], masks.shape[2]).to(masks.device)
                 masks = torch.cat([masks, padding], dim=0)
             padded_sam_masks.append(masks)
-        
+
         vggt_batch['sam_masks'] = torch.stack(padded_sam_masks, dim=0)  # [S, num_masks, H, W]
+
+    # 处理ground掩码（如果存在）
+    if 'ground_mask' in views[0]:
+        ground_masks_list = []
+        for v in views:
+            if v['ground_mask'] is not None:
+                # 确保ground掩码是tensor格式
+                if isinstance(v['ground_mask'], np.ndarray):
+                    ground_mask = torch.from_numpy(v['ground_mask']).bool()
+                else:
+                    ground_mask = v['ground_mask'].bool()
+                ground_masks_list.append(ground_mask)
+            else:
+                # 如果没有ground掩码，创建全False的mask (没有地面)
+                ground_masks_list.append(torch.zeros(v['img'].shape[1], v['img'].shape[2], dtype=torch.bool))
+
+        vggt_batch['ground_masks'] = torch.stack(ground_masks_list, dim=0)  # [S, H, W]
 
     with tf32_off(), torch.amp.autocast("cuda", enabled=False):
         # 转换world points的坐标系到第一帧相机坐标系
@@ -2019,7 +2046,7 @@ def cut3r_batch_to_vggt(views):
                                        torch.linalg.inv(vggt_batch['extrinsics'][0])[:, :3, 3:4].transpose(-1, -2)
             vggt_batch['world_points'] = world_points.reshape(B, S, H, W, 3)
 
-            # 处理flowmap
+            # 处理flowmap - 应用scaling (ground mask已经在waymo.py的_get_views中应用)
             if vggt_batch['flowmap'] is not None:
                 vggt_batch['flowmap'][..., :3] *=  0.1
 
@@ -2028,7 +2055,7 @@ def cut3r_batch_to_vggt(views):
                     torch.linalg.inv(vggt_batch['extrinsics']),
                     vggt_batch['extrinsics'][0]
                 )
-            
+
             # 将extrinsics(中的T)以及world_points、depth进行非metric化
             world_points_flatten = vggt_batch['world_points'].reshape(-1, 3)
             world_points_mask_flatten = vggt_batch['point_masks'].reshape(-1) if vggt_batch['point_masks'] is not None else torch.ones_like(world_points_flatten[:, 0], dtype=torch.bool)
@@ -2070,6 +2097,11 @@ def cut3r_batch_to_vggt(views):
     if 'sam_masks' in vggt_batch:
         # 从 [S, num_masks, H, W] 转换为 [B, S, num_masks, H, W]，其中B=1
         vggt_batch['sam_masks'] = vggt_batch['sam_masks'].unsqueeze(0).contiguous()  # [B, S, num_masks, H, W]
+
+    # 处理ground掩码的维度转换
+    if 'ground_masks' in vggt_batch:
+        # 从 [S, H, W] 转换为 [B, S, H, W]，其中B=1
+        vggt_batch['ground_masks'] = vggt_batch['ground_masks'].unsqueeze(0).contiguous()  # [B, S, H, W]
 
     return vggt_batch
 

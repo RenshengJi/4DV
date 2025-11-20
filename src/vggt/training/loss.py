@@ -23,6 +23,42 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '../../dust3r/utils'))
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../vggt/'))
 
 
+def parse_gaussian_params(gaussian_params, sh_degree=0):
+    """
+    Parse gaussian parameters based on sh_degree.
+
+    Args:
+        gaussian_params: [..., output_dim] tensor containing gaussian parameters
+        sh_degree: spherical harmonics degree (0, 1, 2, 3, ...)
+
+    Returns:
+        dict with keys: 'scale', 'sh_coeffs', 'rotations', 'opacity'
+        and their corresponding tensor slices
+        Note: confidence is returned separately by gaussian_head, not in gaussian_params
+    """
+    sh_dim = 3 * ((sh_degree + 1) ** 2)
+
+    # Calculate indices
+    # Channels: [xyz_offset(3), scale(3), sh_coeffs(sh_dim), rotation(4), opacity(1)]
+    scale_start, scale_end = 3, 6
+    sh_start, sh_end = 6, 6 + sh_dim
+    rotation_start, rotation_end = sh_end, sh_end + 4
+    opacity_idx = rotation_end
+
+    return {
+        'scale': gaussian_params[..., scale_start:scale_end],
+        'sh_coeffs': gaussian_params[..., sh_start:sh_end],
+        'rotations': gaussian_params[..., rotation_start:rotation_end],
+        'opacity': gaussian_params[..., opacity_idx:opacity_idx+1],
+        'indices': {
+            'scale': (scale_start, scale_end),
+            'sh': (sh_start, sh_end),
+            'rotation': (rotation_start, rotation_end),
+            'opacity': opacity_idx
+        }
+    }
+
+
 def depth_to_world_points(depth, intrinsic):
     """
     将深度图转换为世界坐标系下的3D点
@@ -134,10 +170,11 @@ def velocity_local_to_global(velocity, extrinsic):
         return global_velocity
 
 
-def cross_render_and_loss(conf, interval, forward_consist_mask, backward_consist_mask, depth, gaussian_params, velocity, pose_enc, extrinsic, intrinsic, gt_rgb, gt_depth, point_masks):
-    # gaussian_params: [N, 10]
+def cross_render_and_loss(conf, interval, forward_consist_mask, backward_consist_mask, depth, gaussian_params, velocity, pose_enc, extrinsic, intrinsic, gt_rgb, gt_depth, point_masks, sh_degree=0):
+    # gaussian_params: [N, output_dim] where output_dim = 11 + 3*(sh_degree+1)^2
     # extrinsic, intrinsic: 当前帧相机参数
     # gt_depth, gt_rgb: ground truth
+    # sh_degree: spherical harmonics degree
 
     with tf32_off():
 
@@ -164,12 +201,18 @@ def cross_render_and_loss(conf, interval, forward_consist_mask, backward_consist
         velocity = velocity_local_to_global(
             velocity.reshape(-1, 3), extrinsic_inv).reshape(S, image_height * image_width, 3)
 
+        # Parse gaussian parameters using helper function
+        output_dim = 11 + 3 * ((sh_degree + 1) ** 2)
         gaussian_params = gaussian_params.reshape(
-            1, -1, image_height * image_width, 14)  # [S, H*W, 14]
-        scale = gaussian_params[0, ..., 3:6]
+            1, -1, image_height * image_width, output_dim)  # [1, S, H*W, output_dim]
+        parsed = parse_gaussian_params(gaussian_params[0], sh_degree)
+
+        scale = parsed['scale']  # [S, H*W, 3]
         scale = (0.05 * torch.exp(scale)).clamp_max(0.3)  # [S, H*W, 3]
-        color = gaussian_params[0, ..., 6:9].unsqueeze(-2)  # [S, H*W, 1, 3]
-        rotations = gaussian_params[0, ..., 9:13]
+        sh_coeffs = parsed['sh_coeffs']  # [S, H*W, sh_dim]
+        # Reshape sh_coeffs to [S, H*W, (sh_degree+1)^2, 3] for gsplat
+        sh_coeffs_reshaped = sh_coeffs.reshape(S, image_height * image_width, (sh_degree + 1) ** 2, 3)
+        rotations = parsed['rotations']  # [S, H*W, 4]
 
         # Add safety checks for rotation normalization to prevent division by zero
         rotation_norms = torch.norm(rotations, dim=-1, keepdim=True)
@@ -177,8 +220,7 @@ def cross_render_and_loss(conf, interval, forward_consist_mask, backward_consist
         rotation_norms = torch.clamp(rotation_norms, min=1e-8)
         rotations = rotations / rotation_norms
 
-        opacity = gaussian_params[0, ...,
-                                  13:14].sigmoid().squeeze(-1)  # [S, H*W]
+        opacity = parsed['opacity'].sigmoid().squeeze(-1)  # [S, H*W]
 
         viewmat = extrinsic.permute(1, 0, 2, 3)
         K = intrinsic.permute(1, 0, 2, 3)
@@ -203,9 +245,9 @@ def cross_render_and_loss(conf, interval, forward_consist_mask, backward_consist
                 continue
             mean_moved = xyz[i] + velocity[i]
             render_color, _, _ = rasterization(
-                mean_moved[mask], rotations[i][mask], scale[i][mask], opacity[i][mask], color[i][mask],
+                mean_moved[mask], rotations[i][mask], scale[i][mask], opacity[i][mask], sh_coeffs_reshaped[i][mask],
                 viewmat[i+interval], K[i+interval], image_width, image_height,
-                sh_degree=0, render_mode="RGB+ED",
+                sh_degree=sh_degree, render_mode="RGB+ED",
                 radius_clip=0, near_plane=0.0001,
                 far_plane=1000.0,
                 eps2d=0.3,
@@ -821,13 +863,13 @@ def sam2_velocity_consistency_loss_impl(images, velocity, sam2_model, device):
     }
 
 
-def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic, gt_rgb, pred_sky_colors=None, sky_masks=None, sampled_frame_indices=None, iteration=0, lpips_start_iter=5000):
+def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic, gt_rgb, pred_sky_colors=None, sky_masks=None, sampled_frame_indices=None, iteration=0, lpips_start_iter=5000, sh_degree=0):
     """
     自渲染损失函数：每一帧自己进行渲染与监督，支持天空区域的mask替代
 
     Args:
         depth: [B, S, H, W] 深度图
-        gaussian_params: [B, S, H*W, 14] 高斯参数 (已激活)
+        gaussian_params: [B, S, H*W, output_dim] 高斯参数 (已激活)
         pose_enc: [B, S, 7] 姿态编码
         extrinsic: [B, S, 4, 4] 外参矩阵
         intrinsic: [B, S, 3, 3] 内参矩阵
@@ -837,6 +879,7 @@ def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic,
         sampled_frame_indices: list 采样的帧索引 (可选，如果为None则渲染所有帧)
         iteration: int 当前训练iteration (用于控制LPIPS loss启动时机)
         lpips_start_iter: int LPIPS loss开始计算的iteration (default: 5000)
+        sh_degree: int spherical harmonics degree
 
     Returns:
         dict: 损失字典
@@ -867,12 +910,17 @@ def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic,
                           image_width, 3)  # [S, H*W, 3]
 
         # 处理高斯参数 (已在forward中激活，直接使用)
+        output_dim = 11 + 3 * ((sh_degree + 1) ** 2)
         gaussian_params = gaussian_params.reshape(
-            1, -1, image_height * image_width, 14)  # [S, H*W, 14]
-        scale = gaussian_params[0, ..., 3:6]  # [S, H*W, 3] (already activated)
-        color = gaussian_params[0, ..., 6:9].unsqueeze(-2)  # [S, H*W, 1, 3] (already activated)
-        rotations = gaussian_params[0, ..., 9:13]  # [S, H*W, 4] (already normalized)
-        opacity = gaussian_params[0, ..., 13]  # [S, H*W] (already activated)
+            1, -1, image_height * image_width, output_dim)  # [1, S, H*W, output_dim]
+
+        # Parse gaussian parameters
+        parsed = parse_gaussian_params(gaussian_params[0], sh_degree)
+        scale = parsed['scale']  # [S, H*W, 3] (already activated)
+        sh_coeffs = parsed['sh_coeffs']  # [S, H*W, sh_dim]
+        sh_coeffs_reshaped = sh_coeffs.reshape(S, image_height * image_width, (sh_degree + 1) ** 2, 3)
+        rotations = parsed['rotations']  # [S, H*W, 4] (already normalized)
+        opacity = parsed['opacity'].squeeze(-1)  # [S, H*W] (already activated)
 
         # 准备渲染参数
         viewmat = extrinsic.permute(1, 0, 2, 3)
@@ -903,9 +951,9 @@ def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic,
                     # 只渲染非天空区域的gaussian点
                     render_color, _, _ = rasterization(
                         mean_current[non_sky_mask], rotations[i][non_sky_mask],
-                        scale[i][non_sky_mask], opacity[i][non_sky_mask], color[i][non_sky_mask],
+                        scale[i][non_sky_mask], opacity[i][non_sky_mask], sh_coeffs_reshaped[i][non_sky_mask],
                         viewmat[i], K[i], image_width, image_height,
-                        sh_degree=0, render_mode="RGB+ED",
+                        sh_degree=sh_degree, render_mode="RGB+ED",
                         radius_clip=0, near_plane=0.0001,
                         far_plane=1000.0,
                         eps2d=0.3,
@@ -917,9 +965,9 @@ def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic,
             else:
                 # 没有天空mask，正常渲染所有点
                 render_color, _, _ = rasterization(
-                    mean_current, rotations[i], scale[i], opacity[i], color[i],
+                    mean_current, rotations[i], scale[i], opacity[i], sh_coeffs_reshaped[i],
                     viewmat[i], K[i], image_width, image_height,
-                    sh_degree=0, render_mode="RGB+ED",
+                    sh_degree=sh_degree, render_mode="RGB+ED",
                     radius_clip=0, near_plane=0.0001,
                     far_plane=1000.0,
                     eps2d=0.3,
@@ -1967,7 +2015,7 @@ def aggregator_render_loss(
     voxel_size=0.05, gt_scale=1.0,
     sky_colors=None, sampled_frame_indices=None,
     use_lpips=True, iteration=0, lpips_start_iter=5000,
-    dynamic_threshold=0.1
+    dynamic_threshold=0.1, sh_degree=0
 ):
     """
     Aggregator Render Loss - 监督gaussian_head, 辅助监督depth和velocity
@@ -1985,7 +2033,7 @@ def aggregator_render_loss(
     7. 计算RGB、LPIPS、depth loss
 
     Args:
-        gaussian_params: [B, S, H, W, 14] - Activated gaussian parameters
+        gaussian_params: [B, S, H, W, output_dim] - Activated gaussian parameters
         depth: [B, S, H, W, 1] - Predicted depth
         velocity: [B, S, H, W, 3] - Predicted velocity
         sky_masks: [B, S, H, W] - Sky segmentation masks (True for sky)
@@ -2000,6 +2048,7 @@ def aggregator_render_loss(
         sampled_frame_indices: list - Pre-sampled frame indices from model forward (optional)
         use_lpips: bool - Whether to compute LPIPS loss
         dynamic_threshold: float - Velocity threshold for dynamic-static separation (m/s, default 0.1)
+        sh_degree: int - Spherical harmonics degree
 
     Returns:
         dict: Loss dictionary with aggregator_render_rgb_loss, aggregator_render_depth_loss, etc.
@@ -2007,7 +2056,7 @@ def aggregator_render_loss(
     with tf32_off():
         from gsplat import rasterization
 
-        B, S, H, W, _ = gaussian_params.shape
+        B, S, H, W, output_dim = gaussian_params.shape
         device = gaussian_params.device
 
         # Use pre-sampled frame indices from model forward if available
@@ -2027,7 +2076,7 @@ def aggregator_render_loss(
         # === Step 1: Prepare data for all frames ===
         # Flatten batch and sequence dimensions
         depth_flat = depth.view(B * S, H, W, 1)  # [BS, H, W, 1]
-        gaussian_params_flat = gaussian_params.view(B * S, H, W, 14)  # [BS, H, W, 14]
+        gaussian_params_flat = gaussian_params.view(B * S, H, W, output_dim)  # [BS, H, W, output_dim]
         velocity_flat = velocity.view(B * S, H, W, 3)  # [BS, H, W, 3]
         sky_masks_flat = sky_masks.view(B * S, H, W) if sky_masks is not None else torch.zeros(B * S, H, W, dtype=torch.bool, device=device)
 
@@ -2206,16 +2255,18 @@ def aggregator_render_loss(
                 continue
 
             # Parse gaussian parameters (already activated in forward)
-            scale = selected_gaussian_params[:, 3:6]  # [M, 3]
-            color = selected_gaussian_params[:, 6:9].unsqueeze(-2)  # [M, 1, 3]
-            rotations = selected_gaussian_params[:, 9:13]  # [M, 4]
-            opacity = selected_gaussian_params[:, 13]  # [M]
+            parsed = parse_gaussian_params(selected_gaussian_params, sh_degree)
+            scale = parsed['scale']  # [M, 3]
+            sh_coeffs = parsed['sh_coeffs']  # [M, sh_dim]
+            sh_coeffs_reshaped = sh_coeffs.reshape(-1, (sh_degree + 1) ** 2, 3)  # [M, (sh_degree+1)^2, 3]
+            rotations = parsed['rotations']  # [M, 4]
+            opacity = parsed['opacity'].squeeze(-1)  # [M]
 
             # Render to target frame
             render_output, _, _ = rasterization(
-                selected_xyz, rotations, scale, opacity, color,
+                selected_xyz, rotations, scale, opacity, sh_coeffs_reshaped,
                 viewmat[:, target_frame], K[:, target_frame], W, H,
-                sh_degree=0, render_mode="RGB+ED",
+                sh_degree=sh_degree, render_mode="RGB+ED",
                 radius_clip=0, near_plane=0.0001,
                 far_plane=1000.0,
                 eps2d=0.3,

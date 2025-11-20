@@ -126,7 +126,8 @@ class Stage2RenderLoss(nn.Module):
         lpips_weight: float = 0.0,  # LPIPS loss权重
         render_only_dynamic: bool = False,  # 是否只渲染动态物体
         supervise_only_dynamic: bool = False,  # 是否只监督动态区域
-        supervise_middle_frame_only: bool = False  # 是否只渲染监督中间帧
+        supervise_middle_frame_only: bool = False,  # 是否只渲染监督中间帧
+        sh_degree: int = 0  # 球谐函数阶数
     ):
         super().__init__()
         self.rgb_weight = rgb_weight
@@ -135,6 +136,7 @@ class Stage2RenderLoss(nn.Module):
         self.render_only_dynamic = render_only_dynamic
         self.supervise_only_dynamic = supervise_only_dynamic
         self.supervise_middle_frame_only = supervise_middle_frame_only
+        self.sh_degree = sh_degree
 
     def forward(
         self,
@@ -562,7 +564,7 @@ class Stage2RenderLoss(nn.Module):
         render_result = rasterization(
             means, rotations, scales, opacities, colors,
             viewmat, K, width, height,
-            sh_degree=0, render_mode="RGB+ED",
+            sh_degree=self.sh_degree, render_mode="RGB+ED",
             radius_clip=0, near_plane=0.0001,
             far_plane=1000.0,
             eps2d=0.3,

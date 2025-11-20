@@ -4,7 +4,7 @@ Complete Stage1 Inference Script
 输出 4x2 布局的可视化结果（参考demo_stage2_inference.py的正确实现）：
 - Row 1: GT RGB | Rendered RGB (with sky)
 - Row 2: GT Depth | Rendered Depth
-- Row 3: GT Velocity | Pred Velocity
+- Row 3: GT Velocity | GT RGB + Pred Velocity 融合 (加权叠加)
 - Row 4: Dynamic Clustering (full width)
 """
 
@@ -73,6 +73,10 @@ def parse_args():
     parser.add_argument("--tracking_velocity_threshold", type=float, default=0.2,
                        help="Velocity threshold for tracking")
 
+    # 可视化参数
+    parser.add_argument("--velocity_alpha", type=float, default=0.5,
+                       help="Weight for pred velocity in fusion (0-1), default 0.5 means 50% each")
+
     return parser.parse_args()
 
 
@@ -84,7 +88,8 @@ def load_model(model_path, device):
         img_size=518,
         patch_size=14,
         embed_dim=1024,
-        use_sky_token=True
+        use_sky_token=True,
+        sh_degree=2
     )
 
     checkpoint = torch.load(model_path, map_location="cpu")
@@ -484,8 +489,12 @@ def create_clustering_visualization(matched_clustering_results, vggt_batch, fusi
 
 
 def create_visualization_grid(gt_rgb, rendered_rgb, gt_depth, rendered_depth,
-                              gt_velocity, pred_velocity, clustering_vis):
-    """创建4x2的可视化网格（Row 4第一列展示Dynamic Clustering）"""
+                              gt_velocity, pred_velocity, clustering_vis, velocity_alpha=0.5):
+    """创建4x2的可视化网格（Row 3右侧展示GT RGB和Pred Velocity的融合）
+
+    Args:
+        velocity_alpha: Pred velocity在融合中的权重 (0-1)，默认0.5表示各占50%
+    """
     S = gt_rgb.shape[0]
     _, H, W = gt_rgb.shape[1:]
 
@@ -501,10 +510,15 @@ def create_visualization_grid(gt_rgb, rendered_rgb, gt_depth, rendered_depth,
         pred_velocity_np = pred_velocity[s].detach().permute(1, 2, 0).cpu().numpy()
         clustering_vis_np = clustering_vis[s].detach().permute(1, 2, 0).cpu().numpy()
 
+        # 创建GT RGB和Pred Velocity的加权融合图像
+        fused_velocity_np = velocity_alpha * pred_velocity_np + (1 - velocity_alpha) * gt_rgb_np
+        fused_velocity_np = np.clip(fused_velocity_np, 0, 1)
+
         # Create grid: 4 rows x 2 columns
         row1 = np.concatenate([gt_rgb_np, rendered_rgb_np], axis=1)
         row2 = np.concatenate([gt_depth_np, rendered_depth_np], axis=1)
-        row3 = np.concatenate([gt_velocity_np, pred_velocity_np], axis=1)
+        # Row 3: GT Velocity | GT RGB + Pred Velocity 融合
+        row3 = np.concatenate([gt_velocity_np, fused_velocity_np], axis=1)
         # Row 4: Dynamic Clustering (left) + Black (right)
         black_placeholder = np.zeros_like(clustering_vis_np)
         row4 = np.concatenate([clustering_vis_np, black_placeholder], axis=1)
@@ -671,7 +685,8 @@ def run_batch_inference(model, dataset, dynamic_processor, args, device):
                 result['gt_rgb'], result['rendered_rgb'],
                 result['gt_depth'], result['rendered_depth'],
                 result['gt_velocity'], result['pred_velocity'],
-                result['clustering']
+                result['clustering'],
+                velocity_alpha=args.velocity_alpha
             )
 
             seq_name = os.path.basename(args.seq_dir)
@@ -708,8 +723,10 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}\n")
 
-    # Add dust3r path
-    # add_path_to_dust3r(args.model_path)
+    # import debugpy
+    # debugpy.listen(5697)
+    # print("Waiting for debugger to attach...")
+    # debugpy.wait_for_client()
 
     # Load model and dataset
     model = load_model(args.model_path, device)
@@ -743,7 +760,8 @@ def main():
                     result['gt_rgb'], result['rendered_rgb'],
                     result['gt_depth'], result['rendered_depth'],
                     result['gt_velocity'], result['pred_velocity'],
-                    result['clustering']
+                    result['clustering'],
+                    velocity_alpha=args.velocity_alpha
                 )
 
                 seq_name = os.path.basename(args.seq_dir)

@@ -1,13 +1,16 @@
 # Stage 1 Online Training Configuration for VGGT
 # 第一阶段在线训练配置 - 包含统一的损失权重管理
 
+# debug: true
+
 # =============== 模型配置 ===============
-model: "VGGT(img_size=518, patch_size=14, embed_dim=1024)"
+model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=2)"
+# sh_degree: 球谐函数的阶数（0=只有DC分量3个参数，1=DC+方向性12个参数，2=27个参数，3=48个参数）
+# Gaussian head的output_dim会根据sh_degree自动计算：11 + 3*(sh_degree+1)^2
 # pretrained: model.pt
 # pretrained_velocity: False
-# pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/aggregator_all/checkpoint-epoch_0_28480.pth"
-pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/fromaggregator_all_lr1e-5_procrustes_area500_velocityconstraint0.05_gtcamera_xyzgrad+fixdbscan+sky+fixepsmetric+noconf/checkpoint-epoch_0_37980.pth"
-# pretrained_velocity: ""
+pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_new/ground+fixvelocity/checkpoint-epoch_0_65100.pth"
+# pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/fromaggregator_all_lr1e-5_procrustes_area500_velocityconstraint0.05_gtcamera_xyzgrad+fixdbscan+sky+fixepsmetric+noconf/checkpoint-epoch_0_37980.pth"
 
 # VGGT冻结策略配置
 # 可选值: "none", "encoder", "encoder_frame", "backbone", "backbone_camera", "backbone_pts",
@@ -75,7 +78,7 @@ grad_flow_loss_weight: 0.0                 # GT flowmap gradient损失权重
 reg_flow_loss_weight: 0.0                  # GT flowmap reg损失权重
 
 # 3b. GT Flow Loss Ours (我们自己实现的版本)
-gt_flow_loss_ours_weight: 0.0              # 自定义GT flowmap损失权重
+gt_flow_loss_ours_weight: 1.0              # 自定义GT flowmap损失权重
 
 # 4. SAM2 Velocity Consistency Loss (辅助velocity head监督)
 sam2_velocity_weight: 0.0                  # SAM2掩码一致性监督
@@ -88,7 +91,7 @@ sky_opacity_weight: 1.0                    # 天空区域opacity约束
 sky_color_weight: 0.0                      # 天空颜色预测监督 (已融合到self_render_loss中)
 
 # 7. Velocity Regularization Loss (约束velocity值)
-velocity_reg_weight: 0.05                 # 速度正则化约束
+velocity_reg_weight: 0.0                 # 速度正则化约束
 
 # 8. VGGT Distillation Loss (蒸馏损失，监督depth head、camera head等)
 vggt_distill_weight: 0.0                  # VGGT teacher蒸馏监督，防止unfreeze backbone时输出漂移
@@ -138,15 +141,15 @@ velocity_transform_mode: "procrustes"          # velocity变换模式: "simple"(
 allow_repeat: False
 
 train_dataset: Waymo_Multi(allow_repeat=${allow_repeat}, split=None,
-  ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train_with_flow",
+  ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train_full",
   img_ray_mask_p=[1.0, 0.0, 0.0], valid_camera_id_list=["1", "2", "3"],
   aug_crop=0, resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], transform=ImgNorm,
-  num_views=${num_views}, n_corres=${n_corres_train}, seq_aug_crop=True, load_sam_masks=False)
+  num_views=${num_views}, n_corres=${n_corres_train}, seq_aug_crop=True, load_sam_masks=False, load_ground_masks=True)
 
 test_dataset: 1000 @ Waymo_Multi(split=None,
-  ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train_with_flow",
+  ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train_full",
   img_ray_mask_p=[1.0, 0.0, 0.0], valid_camera_id_list=["1", "2", "3"],
-  resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], num_views=${num_test_views}, seed=42, n_corres=${n_corres_test})
+  resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], num_views=${num_test_views}, seed=42, n_corres=${n_corres_test}, load_ground_masks=True)
 
 # =============== 优化器配置 ===============
 seed: 0
@@ -156,7 +159,7 @@ gradient_checkpointing: True
 epochs: 2
 start_epoch: 0
 weight_decay: 0.05
-lr: 1e-5
+lr: 5e-5
 min_lr: 1e-8
 warmup_epochs: 0.02
 amp: 1
@@ -179,9 +182,9 @@ print_img_freq: 50000000
 num_imgs_vis: 4
 
 # =============== 输出配置 ===============
-save_dir: 'checkpoints/waymo_stage1_online'
+save_dir: 'checkpoints/waymo_new'
 # exp_name: 'aggregator_from_scratch'
-exp_name: 'fromaggregator_all_lr1e-5_procrustes_area500_velocityconstraint0.05_gtcamera_xyzgrad+fixdbscan+sky+fixepsmetric+noconf+novelocity!'
+exp_name: 'ground+fixvelocity_resume'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/

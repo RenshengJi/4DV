@@ -49,8 +49,18 @@ def freeze_all_params(modules):
 
 
 class VGGT(nn.Module, PyTorchModelHubMixin):
-    def __init__(self, img_size=518, patch_size=14, embed_dim=1024, use_sky_token=True, use_scale_token=True, memory_efficient=True):
+    def __init__(self, img_size=518, patch_size=14, embed_dim=1024, use_sky_token=True, use_scale_token=True, memory_efficient=True, sh_degree=0):
         super().__init__()
+        # Store sh_degree for use in forward and other methods
+        self.sh_degree = sh_degree
+
+        # Calculate gaussian head output dimension based on sh_degree
+        # Gaussian parameters: xyz_offset(3) + scale(3) + sh_coeffs + rotation(4) + opacity(1)
+        # For sh_degree D, we need 3*(D+1)^2 parameters for RGB spherical harmonics
+        # Note: +1 for confidence channel (will be separated by activate_head)
+        sh_dim = 3 * ((sh_degree + 1) ** 2)
+        gaussian_output_dim = 3 + 3 + sh_dim + 4 + 1 + 1  # = 12 + sh_dim (last +1 for confidence)
+
         self.aggregator = Aggregator(
             img_size=img_size,
             patch_size=patch_size,
@@ -63,7 +73,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         self.camera_head = CameraHead(dim_in=2 * embed_dim)
         self.point_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log", conf_activation="expp1")
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1")
-        self.gaussian_head = DPTGSHead(dim_in=2 * embed_dim, output_dim=15, activation="linear", conf_activation="expp1")
+        self.gaussian_head = DPTGSHead(dim_in=2 * embed_dim, output_dim=gaussian_output_dim, activation="linear", conf_activation="expp1")
         self.velocity_head = DPTGSHead(dim_in=2 * embed_dim, output_dim=4, activation="linear", conf_activation="expp1")
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size)
 
@@ -205,25 +215,37 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                     aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
                 )
                 # Apply activation to gaussian parameters (moved from loss functions)
-                # gaussian_params_raw shape: [B, S, H, W, 14]
-                # 14 channels: [xyz_offset(3), scale(3), color(3), rotation(4), opacity(1)]
+                # gaussian_params_raw shape: [B, S, H, W, output_dim]
+                # output_dim = 11 + 3*(sh_degree+1)^2
+                # Channels: [xyz_offset(3), scale(3), sh_coefficients(3*(sh_degree+1)^2), rotation(4), opacity(1)]
+                # Note: confidence is returned separately as gaussian_conf, not in gaussian_params
                 B, S, H, W, _ = gaussian_params_raw.shape
                 gaussian_params_activated = gaussian_params_raw.clone()
 
+                # Calculate sh_dim and indices
+                sh_dim = 3 * ((self.sh_degree + 1) ** 2)
+                scale_end = 6
+                sh_start = 6
+                sh_end = 6 + sh_dim
+                rotation_start = sh_end
+                rotation_end = rotation_start + 4
+                opacity_idx = rotation_end
+
                 # Scale activation: 0.05 * exp(scale), clamped to max 0.3
-                gaussian_params_activated[..., 3:6] = (0.05 * torch.exp(gaussian_params_raw[..., 3:6])).clamp_max(0.3)
+                gaussian_params_activated[..., 3:scale_end] = (0.05 * torch.exp(gaussian_params_raw[..., 3:scale_end])).clamp_max(0.3)
 
                 # Rotation normalization
-                rotations = gaussian_params_raw[..., 9:13]
+                rotations = gaussian_params_raw[..., rotation_start:rotation_end]
                 rotation_norms = torch.norm(rotations, dim=-1, keepdim=True).clamp(min=1e-8)
-                gaussian_params_activated[..., 9:13] = rotations / rotation_norms
+                gaussian_params_activated[..., rotation_start:rotation_end] = rotations / rotation_norms
 
                 # Opacity activation: sigmoid
-                gaussian_params_activated[..., 13:14] = gaussian_params_raw[..., 13:14].sigmoid()
+                gaussian_params_activated[..., opacity_idx:opacity_idx+1] = gaussian_params_raw[..., opacity_idx:opacity_idx+1].sigmoid()
 
                 predictions["gaussian_params"] = gaussian_params_activated  # Activated params
                 predictions["gaussian_params_raw"] = gaussian_params_raw  # Keep raw for backward compatibility
                 predictions["gaussian_conf"] = gaussian_conf
+                predictions["sh_degree"] = self.sh_degree  # Store sh_degree for use in loss functions
 
             if self.velocity_head is not None:
                 velocity, velocity_conf = self.velocity_head(

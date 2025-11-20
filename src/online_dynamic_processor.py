@@ -597,6 +597,12 @@ class OnlineDynamicProcessor:
             preds = self._preprocess_predictions(preds, vggt_batch, images, B, S, H, W)
             velocity = preds.get('velocity')
             gaussian_params = preds.get('gaussian_params')
+
+            # 保存sh_degree和gaussian_output_dim到实例变量，供其他方法使用
+            self.sh_degree = preds.get('sh_degree', 0)
+            self.sh_dim = 3 * ((self.sh_degree + 1) ** 2)
+            self.gaussian_output_dim = 11 + self.sh_dim
+
             stage_times['preprocessing'] = time.time() - preprocessing_start
 
             # ========== Stage 2: 聚类 + 背景分离 ==========
@@ -653,6 +659,11 @@ class OnlineDynamicProcessor:
         """预处理VGGT预测结果：处理velocity和gaussian参数"""
         preds_updated = preds.copy()
 
+        # 获取sh_degree并计算gaussian参数维度
+        sh_degree = preds.get('sh_degree', 0)  # 默认为0
+        sh_dim = 3 * ((sh_degree + 1) ** 2)
+        gaussian_output_dim = 11 + sh_dim  # xyz(3) + scale(3) + sh(sh_dim) + rotation(4) + opacity(1)
+
         # 获取相机参数（一次性获取，避免重复计算）
         extrinsics, intrinsics = None, None
         if 'pose_enc' in preds:
@@ -694,13 +705,13 @@ class OnlineDynamicProcessor:
         # 处理gaussian参数
         gaussian_params = preds.get('gaussian_params')
         if gaussian_params is not None:
-            # 重新整形为 [S, H*W, 14]
+            # 重新整形为 [S, H*W, gaussian_output_dim]
             if gaussian_params.dim() == 3 and gaussian_params.shape[1] == S * H * W:
-                gaussian_params_reshaped = gaussian_params[0].reshape(S, H * W, 14)
+                gaussian_params_reshaped = gaussian_params[0].reshape(S, H * W, gaussian_output_dim)
             elif gaussian_params.dim() == 3 and gaussian_params.shape[0] == S:
                 gaussian_params_reshaped = gaussian_params
             else:
-                gaussian_params_reshaped = gaussian_params.reshape(S, H * W, 14)
+                gaussian_params_reshaped = gaussian_params.reshape(S, H * W, gaussian_output_dim)
 
             # 用depth计算的3D坐标替换前三维
             depth_data = preds.get('depth')
@@ -723,7 +734,7 @@ class OnlineDynamicProcessor:
                 except:
                     pass  # 静默失败
 
-            preds_updated['gaussian_params'] = gaussian_params_reshaped.unsqueeze(0).reshape(B, S * H * W, 14)
+            preds_updated['gaussian_params'] = gaussian_params_reshaped.unsqueeze(0).reshape(B, S * H * W, gaussian_output_dim)
 
         return preds_updated
 
@@ -1420,9 +1431,9 @@ class OnlineDynamicProcessor:
                 return None
 
             N = len(points)
-            # 创建基本的Gaussian参数 [N, 14]: xyz(3) + scale(3) + color(3) + rotation(4) + opacity(1)
+            # 创建基本的Gaussian参数 [N, gaussian_output_dim]: xyz(3) + scale(3) + sh(sh_dim) + rotation(4) + opacity(1)
             gaussian_params = torch.zeros(
-                N, 14, device=self.device, dtype=torch.float32)
+                N, self.gaussian_output_dim, device=self.device, dtype=torch.float32)
 
             # 位置: xyz (positions 0:3)
             gaussian_params[:, :3] = points[:, :3]
@@ -1431,7 +1442,9 @@ class OnlineDynamicProcessor:
             gaussian_params[:, 3:6] = torch.log(torch.tensor(
                 0.01 / 0.05))  # Will become 0.01 after activation
 
-            # 颜色: color (positions 6:9) - 使用基于object_id的一致颜色
+            # SH系数: (positions 6:6+sh_dim) - 使用基于object_id的一致颜色
+            sh_start = 6
+            sh_end = 6 + self.sh_dim
             if object_id is not None:
                 # 基于object_id生成一致的颜色
                 import math
@@ -1459,19 +1472,22 @@ class OnlineDynamicProcessor:
                     r, g, b = c, 0, x
 
                 color = torch.tensor([r + m, g + m, b + m], device=self.device)
-                gaussian_params[:, 6:9] = color.unsqueeze(0).repeat(N, 1)
+                # 只设置DC分量（前3个SH系数）
+                gaussian_params[:, sh_start:sh_start+3] = color.unsqueeze(0).repeat(N, 1)
                 _print_main(
                     f"回退方案：为object_id={object_id}生成一致颜色 RGB=({r+m:.3f}, {g+m:.3f}, {b+m:.3f})")
             else:
-                # 默认中性颜色
-                gaussian_params[:, 6:9] = 0.5
+                # 默认中性颜色（只设置DC分量）
+                gaussian_params[:, sh_start:sh_start+3] = 0.5
 
-            # 旋转: quaternion (positions 9:13) - normalized quaternion
-            gaussian_params[:, 9:13] = torch.tensor(
+            # 旋转: quaternion (positions sh_end:sh_end+4) - normalized quaternion
+            rotation_start = sh_end
+            gaussian_params[:, rotation_start:rotation_start+4] = torch.tensor(
                 [1.0, 0.0, 0.0, 0.0], device=points.device)  # w, x, y, z
 
-            # 不透明度: opacity (position 13) - raw value before sigmoid
-            gaussian_params[:, 13] = torch.logit(torch.tensor(
+            # 不透明度: opacity (position sh_end+4) - raw value before sigmoid
+            opacity_idx = sh_end + 4
+            gaussian_params[:, opacity_idx] = torch.logit(torch.tensor(
                 0.8, device=points.device))  # Will become 0.8 after sigmoid
 
             # Apply activation functions to get final parameters
@@ -1488,10 +1504,10 @@ class OnlineDynamicProcessor:
         Following the same post-processing as in src/vggt/training/loss.py self_render_and_loss
 
         Args:
-            gaussian_params: [*, 14] tensor with raw gaussian parameters
+            gaussian_params: [*, gaussian_output_dim] tensor with raw gaussian parameters
 
         Returns:
-            gaussian_params: [*, 14] tensor with activated parameters
+            gaussian_params: [*, gaussian_output_dim] tensor with activated parameters
         """
         if gaussian_params is None:
             return None
@@ -1504,18 +1520,20 @@ class OnlineDynamicProcessor:
         scale_activated = (0.05 * torch.exp(scale_raw)).clamp_max(0.3)
         processed_params[..., 3:6] = scale_activated
 
-        # Color: positions 6:9 - no activation needed (kept as is)
+        # SH coefficients: positions 6:6+sh_dim - no activation needed (kept as is)
 
-        # Rotation quaternion normalization: positions 9:13
-        rotations = processed_params[..., 9:13]
+        # Rotation quaternion normalization: positions 6+sh_dim:6+sh_dim+4
+        sh_end = 6 + self.sh_dim
+        rotations = processed_params[..., sh_end:sh_end+4]
         rotation_norms = torch.norm(rotations, dim=-1, keepdim=True)
         rotation_norms = torch.clamp(rotation_norms, min=1e-8)
-        processed_params[..., 9:13] = rotations / rotation_norms
+        processed_params[..., sh_end:sh_end+4] = rotations / rotation_norms
 
-        # Opacity activation: sigmoid for position 13
-        opacity_raw = processed_params[..., 13:14]
+        # Opacity activation: sigmoid for position 6+sh_dim+4
+        opacity_idx = sh_end + 4
+        opacity_raw = processed_params[..., opacity_idx:opacity_idx+1]
         opacities = torch.sigmoid(opacity_raw)
-        processed_params[..., 13:14] = opacities
+        processed_params[..., opacity_idx:opacity_idx+1] = opacities
 
         return processed_params
 
@@ -1579,16 +1597,16 @@ class OnlineDynamicProcessor:
             if gaussian_params is None:
                 return self._create_default_static_background(H, W)
 
-            # 重新整形Gaussian参数为 [S, H*W, 14]
+            # 重新整形Gaussian参数为 [S, H*W, gaussian_output_dim]
             if gaussian_params.dim() == 3 and gaussian_params.shape[1] == S * H * W:
-                # [B, S*H*W, 14] -> [S, H*W, 14]
-                gaussian_params = gaussian_params[0].reshape(S, H * W, 14)
+                # [B, S*H*W, gaussian_output_dim] -> [S, H*W, gaussian_output_dim]
+                gaussian_params = gaussian_params[0].reshape(S, H * W, self.gaussian_output_dim)
             elif gaussian_params.dim() == 3 and gaussian_params.shape[0] == S:
-                # [S, H*W, 14] -> 已经是正确形状
+                # [S, H*W, gaussian_output_dim] -> 已经是正确形状
                 pass
             else:
                 # 其他情况，尝试重新整形
-                gaussian_params = gaussian_params.reshape(S, H * W, 14)
+                gaussian_params = gaussian_params.reshape(S, H * W, self.gaussian_output_dim)
 
             static_gaussians = []
 
@@ -1614,10 +1632,10 @@ class OnlineDynamicProcessor:
                     static_mask = static_mask & (~sky_mask_frame)  # [H*W]
 
                 # 获取当前帧的gaussian参数
-                frame_gaussians = gaussian_params[s]  # [H*W, 14]
+                frame_gaussians = gaussian_params[s]  # [H*W, gaussian_output_dim]
 
                 # 提取静态gaussian
-                static_frame_gaussians = frame_gaussians[static_mask]  # [N_static, 14]
+                static_frame_gaussians = frame_gaussians[static_mask]  # [N_static, gaussian_output_dim]
 
                 static_gaussians.append(static_frame_gaussians)
 
@@ -1625,7 +1643,7 @@ class OnlineDynamicProcessor:
             if static_gaussians:
                 static_gaussians = torch.cat(static_gaussians, dim=0)
             else:
-                static_gaussians = torch.empty(0, 14, device=self.device)
+                static_gaussians = torch.empty(0, self.gaussian_output_dim, device=self.device)
 
             return static_gaussians
 
@@ -1641,29 +1659,32 @@ class OnlineDynamicProcessor:
         try:
             num_background_points = min(1000, H * W // 100)
             background_gaussians = torch.zeros(
-                num_background_points, 14, device=self.device)
+                num_background_points, self.gaussian_output_dim, device=self.device)
 
-            # 随机分布在3D空间中
+            # xyz位置: 随机分布在3D空间中 (0:3)
             background_gaussians[:, :3] = torch.randn(
                 num_background_points, 3, device=self.device) * 2.0
 
-            # 旋转（单位四元数）
-            background_gaussians[:, 3:7] = torch.tensor(
+            # scale尺度 (3:6)
+            background_gaussians[:, 3:6] = 0.1
+
+            # SH系数 (6:6+sh_dim) - 设置DC分量为灰色
+            sh_start = 6
+            background_gaussians[:, sh_start:sh_start+3] = 0.3
+
+            # rotation旋转（单位四元数） (6+sh_dim:6+sh_dim+4)
+            rotation_start = 6 + self.sh_dim
+            background_gaussians[:, rotation_start:rotation_start+4] = torch.tensor(
                 [1.0, 0.0, 0.0, 0.0], device=self.device)
 
-            # 尺度
-            background_gaussians[:, 7:10] = 0.1
-
-            # 不透明度
-            background_gaussians[:, 10] = 0.1
-
-            # 颜色（灰色）
-            background_gaussians[:, 11:14] = 0.3
+            # opacity不透明度 (6+sh_dim+4)
+            opacity_idx = 6 + self.sh_dim + 4
+            background_gaussians[:, opacity_idx] = 0.1
 
             return background_gaussians
 
         except Exception as e:
-            return torch.zeros(100, 14, device=self.device)
+            return torch.zeros(100, self.gaussian_output_dim, device=self.device)
 
     def get_statistics(self) -> Dict[str, Any]:
         """获取处理统计信息"""
