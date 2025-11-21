@@ -93,14 +93,17 @@ def get_parser():
     parser.add_argument("--sam_device", default="cuda", help="Device for SAM model")
     parser.add_argument("--sam_config_file", help="SAM2 config file")
     parser.add_argument("--sam_ckpt_path", help="SAM model checkpoint path")
+    parser.add_argument("--start", type=int, default=0, help="Start index of sequences to process (inclusive)")
+    parser.add_argument("--end", type=int, default=None, help="End index of sequences to process (exclusive)")
     return parser
 
 
-def main(waymo_root, pairs_path, output_dir, workers=1, enable_sam=False, sam_model_type="sam2", 
-         sam_device="cuda", sam_config_file=None, sam_ckpt_path=None):
-    extract_frames(waymo_root, output_dir, workers=workers)
+def main(waymo_root, pairs_path, output_dir, workers=1, enable_sam=False, sam_model_type="sam2",
+         sam_device="cuda", sam_config_file=None, sam_ckpt_path=None, start=0, end=None):
+    extract_frames(waymo_root, output_dir, workers=workers, start=start, end=end)
     make_crops(output_dir, workers=args.workers, enable_sam=enable_sam, sam_model_type=sam_model_type,
-               sam_device=sam_device, sam_config_file=sam_config_file, sam_ckpt_path=sam_ckpt_path)
+               sam_device=sam_device, sam_config_file=sam_config_file, sam_ckpt_path=sam_ckpt_path,
+               start=start, end=end)
 
     # # make sure all pairs are there
     # with np.load(pairs_path) as data:
@@ -126,8 +129,13 @@ def _list_sequences(db_root):
     return res
 
 
-def extract_frames(db_root, output_dir, workers=8):
+def extract_frames(db_root, output_dir, workers=8, start=0, end=None):
     sequences = _list_sequences(db_root)
+    # Select sequences based on start and end indices
+    if end is None:
+        end = len(sequences)
+    sequences = sequences[start:end]
+    print(f">> Processing sequences {start} to {end} ({len(sequences)} sequences)")
     output_dir = osp.join(output_dir, "tmp")
     print(">> outputing result to", output_dir)
     args = [(db_root, output_dir, seq) for seq in sequences]
@@ -630,10 +638,14 @@ def extract_frames_one_seq(filename):
     return calib, frames
 
 
-def make_crops(output_dir, workers=16, enable_sam=False, sam_model_type="sam2", 
-               sam_device="cuda", sam_config_file=None, sam_ckpt_path=None, **kw):
+def make_crops(output_dir, workers=16, enable_sam=False, sam_model_type="sam2",
+               sam_device="cuda", sam_config_file=None, sam_ckpt_path=None, start=0, end=None, **kw):
     tmp_dir = osp.join(output_dir, "tmp")
     sequences = _list_sequences(tmp_dir)
+    # Select sequences based on start and end indices
+    if end is None:
+        end = len(sequences)
+    sequences = sequences[start:end]
     args = [(tmp_dir, output_dir, seq, enable_sam, sam_model_type, sam_device, sam_config_file, sam_ckpt_path) for seq in sequences]
     parallel_map(crop_one_seq, args, star_args=True, workers=workers, front_num=0)
 
@@ -865,4 +877,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     main(args.waymo_dir, args.precomputed_pairs, args.output_dir, workers=args.workers,
          enable_sam=args.enable_sam, sam_model_type=args.sam_model_type, sam_device=args.sam_device,
-         sam_config_file=args.sam_config_file, sam_ckpt_path=args.sam_ckpt_path)
+         sam_config_file=args.sam_config_file, sam_ckpt_path=args.sam_ckpt_path,
+         start=args.start, end=args.end)
