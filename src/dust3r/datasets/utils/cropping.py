@@ -202,7 +202,7 @@ def rescale_image_depthmap_flowmap_segmask(
     return image.to_pil(), depthmap, flowmap, seg_mask, camera_intrinsics
 
 
-def bbox_from_intrinsics_in_out(
+def camera_matrix_of_crop(
     input_camera_matrix,
     input_resolution,
     output_resolution,
@@ -223,6 +223,15 @@ def bbox_from_intrinsics_in_out(
     output_camera_matrix = colmap_to_opencv_intrinsics(output_camera_matrix_colmap)
 
     return output_camera_matrix
+
+
+def bbox_from_intrinsics_in_out(
+    input_camera_matrix, output_camera_matrix, output_resolution
+):
+    out_width, out_height = output_resolution
+    l, t = np.int32(np.round(input_camera_matrix[:2, 2] - output_camera_matrix[:2, 2]))
+    crop_bbox = (l, t, l + out_width, t + out_height)
+    return crop_bbox
 
 
 def crop_image_depthmap(image, depthmap, camera_intrinsics, crop_bbox):
@@ -282,12 +291,3 @@ def crop_image_depthmap_flowmap_segmask(image, depthmap, flowmap, seg_mask, came
     camera_intrinsics[1, 2] -= t
 
     return image.to_pil(), depthmap, flowmap, seg_mask, camera_intrinsics
-
-
-def bbox_from_intrinsics_in_out(
-    input_camera_matrix, output_camera_matrix, output_resolution
-):
-    out_width, out_height = output_resolution
-    l, t = np.int32(np.round(input_camera_matrix[:2, 2] - output_camera_matrix[:2, 2]))
-    crop_bbox = (l, t, l + out_width, t + out_height)
-    return crop_bbox
