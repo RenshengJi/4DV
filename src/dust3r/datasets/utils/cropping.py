@@ -152,6 +152,56 @@ def rescale_image_depthmap_flowmap(
     return image.to_pil(), depthmap, flowmap, camera_intrinsics
 
 
+def rescale_image_depthmap_flowmap_segmask(
+    image, depthmap, flowmap, seg_mask, camera_intrinsics, output_resolution, force=True
+):
+    """Jointly rescale a (image, depthmap, flowmap, seg_mask)
+    so that (out_width, out_height) >= output_res
+    """
+    image = ImageList(image)
+    input_resolution = np.array(image.size)  # (W,H)
+    output_resolution = np.array(output_resolution)
+    if depthmap is not None:
+        assert tuple(depthmap.shape[:2]) == image.size[::-1]
+    if flowmap is not None:
+        assert tuple(flowmap.shape[:2]) == image.size[::-1]
+    if seg_mask is not None:
+        assert tuple(seg_mask.shape[:2]) == image.size[::-1]
+
+    # define output resolution
+    assert output_resolution.shape == (2,)
+    scale_final = max(output_resolution / image.size) + 1e-8
+    if scale_final >= 1 and not force:
+        return (image.to_pil(), depthmap, flowmap, seg_mask, camera_intrinsics)
+    output_resolution = np.floor(input_resolution * scale_final).astype(int)
+
+    # first rescale the image so that it contains the crop
+    image = image.resize(
+        output_resolution, resample=lanczos if scale_final < 1 else bicubic
+    )
+    if depthmap is not None:
+        depthmap = cv2.resize(
+            depthmap, output_resolution, fx=scale_final, fy=scale_final,
+            interpolation=cv2.INTER_NEAREST,
+        )
+    if flowmap is not None:
+        flowmap = cv2.resize(
+            flowmap, output_resolution, fx=scale_final, fy=scale_final,
+            interpolation=cv2.INTER_NEAREST,
+        )
+    if seg_mask is not None:
+        seg_mask = cv2.resize(
+            seg_mask, output_resolution, fx=scale_final, fy=scale_final,
+            interpolation=cv2.INTER_NEAREST,
+        )
+
+    camera_intrinsics = camera_matrix_of_crop(
+        camera_intrinsics, input_resolution, output_resolution, scaling=scale_final
+    )
+
+    return image.to_pil(), depthmap, flowmap, seg_mask, camera_intrinsics
+
+
 def bbox_from_intrinsics_in_out(
     input_camera_matrix,
     input_resolution,
@@ -210,6 +260,28 @@ def crop_image_depthmap_flowmap(image, depthmap, flowmap, camera_intrinsics, cro
     camera_intrinsics[1, 2] -= t
 
     return image.to_pil(), depthmap, flowmap, camera_intrinsics
+
+
+def crop_image_depthmap_flowmap_segmask(image, depthmap, flowmap, seg_mask, camera_intrinsics, crop_bbox):
+    """
+    Return a crop of the input view including flowmap and seg_mask.
+    """
+    image = ImageList(image)
+    l, t, r, b = crop_bbox
+
+    image = image.crop((l, t, r, b))
+    if depthmap is not None:
+        depthmap = depthmap[t:b, l:r]
+    if flowmap is not None:
+        flowmap = flowmap[t:b, l:r]
+    if seg_mask is not None:
+        seg_mask = seg_mask[t:b, l:r]
+
+    camera_intrinsics = camera_intrinsics.copy()
+    camera_intrinsics[0, 2] -= l
+    camera_intrinsics[1, 2] -= t
+
+    return image.to_pil(), depthmap, flowmap, seg_mask, camera_intrinsics
 
 
 def bbox_from_intrinsics_in_out(

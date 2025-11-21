@@ -172,17 +172,44 @@ class Waymo_Multi(BaseMultiViewDataset):
             if osp.exists(flow_path):
                 flowmap = np.load(flow_path)
 
+            # Load semantic segmentation mask (_seg.png)
+            seg_path = osp.join(scene_dir, impath + "_seg.png")
+            seg_mask = None
+            if osp.exists(seg_path):
+                seg_mask = imread_cv2(seg_path)  # RGB image with Cityscapes color encoding
+
             intrinsics = np.float32(camera_params["intrinsics"])
             camera_pose = np.float32(camera_params["cam2world"])
 
-            if flowmap is not None:
-                image, depthmap, intrinsics, flowmap = self._crop_resize_if_necessary(
-                    image, depthmap, intrinsics, resolution, rng, info=(scene_dir, impath), flowmap=flowmap
+            # Pass seg_mask through crop/resize pipeline like flowmap
+            if flowmap is not None or seg_mask is not None:
+                image, depthmap, intrinsics, flowmap, seg_mask = self._crop_resize_if_necessary(
+                    image, depthmap, intrinsics, resolution, rng, info=(scene_dir, impath),
+                    flowmap=flowmap, seg_mask=seg_mask
                 )
             else:
                 image, depthmap, intrinsics = self._crop_resize_if_necessary(
                     image, depthmap, intrinsics, resolution, rng, info=(scene_dir, impath)
                 )
+
+            # Apply semantic segmentation to zero out velocity on road and sidewalk
+            if seg_mask is not None and flowmap is not None:
+                # Cityscapes color palette: road=[128,64,128], sidewalk=[244,35,232]
+                road_color = np.array([128, 64, 128])
+                sidewalk_color = np.array([244, 35, 232])
+
+                # Create masks for road and sidewalk (BGR format from imread_cv2)
+                road_mask = np.all(seg_mask == road_color[::-1], axis=-1)  # BGR
+                sidewalk_mask = np.all(seg_mask == sidewalk_color[::-1], axis=-1)  # BGR
+
+                # Combine road and sidewalk masks
+                static_ground_mask = road_mask | sidewalk_mask
+
+                # Zero out velocity (first 3 channels) on static ground regions
+                if static_ground_mask.any():
+                    static_ground_mask_expanded = np.expand_dims(static_ground_mask, axis=-1)
+                    static_ground_mask_velocity = np.tile(static_ground_mask_expanded, (1, 1, 3))
+                    flowmap[..., :3][static_ground_mask_velocity] = 0.0
 
             # generate img mask and raymap mask
             img_mask, ray_mask = self.get_img_and_ray_masks(

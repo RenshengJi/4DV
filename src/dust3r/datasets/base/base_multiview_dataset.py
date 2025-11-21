@@ -448,7 +448,7 @@ class BaseMultiViewDataset(EasyDataset):
             self._resolutions.append((width, height))
 
     def _crop_resize_if_necessary(
-        self, image, depthmap, intrinsics, resolution, rng=None, info=None, flowmap=None
+        self, image, depthmap, intrinsics, resolution, rng=None, info=None, flowmap=None, seg_mask=None
     ):
         """This function:
         - first downsizes the image with LANCZOS inteprolation,
@@ -470,9 +470,9 @@ class BaseMultiViewDataset(EasyDataset):
         r, b = cx + min_margin_x, cy + min_margin_y
         crop_bbox = (l, t, r, b)
 
-        if flowmap is not None:
-            image, depthmap, flowmap, intrinsics = cropping.crop_image_depthmap_flowmap(
-                image, depthmap, flowmap, intrinsics, crop_bbox
+        if flowmap is not None or seg_mask is not None:
+            image, depthmap, flowmap, seg_mask, intrinsics = cropping.crop_image_depthmap_flowmap_segmask(
+                image, depthmap, flowmap, seg_mask, intrinsics, crop_bbox
             )
         else:
             image, depthmap, intrinsics = cropping.crop_image_depthmap(
@@ -491,9 +491,9 @@ class BaseMultiViewDataset(EasyDataset):
                 else self.delta_target_resolution
             )
 
-        if flowmap is not None:
-            image, depthmap, flowmap, intrinsics = cropping.rescale_image_depthmap_flowmap(
-                image, depthmap, flowmap, intrinsics, target_resolution
+        if flowmap is not None or seg_mask is not None:
+            image, depthmap, flowmap, seg_mask, intrinsics = cropping.rescale_image_depthmap_flowmap_segmask(
+                image, depthmap, flowmap, seg_mask, intrinsics, target_resolution
             )
         else:
             image, depthmap, intrinsics = cropping.rescale_image_depthmap(
@@ -508,11 +508,11 @@ class BaseMultiViewDataset(EasyDataset):
             intrinsics, intrinsics2, resolution
         )
 
-        if flowmap is not None:
-            image, depthmap, flowmap, intrinsics2 = cropping.crop_image_depthmap_flowmap(
-                image, depthmap, flowmap, intrinsics, crop_bbox
+        if flowmap is not None or seg_mask is not None:
+            image, depthmap, flowmap, seg_mask, intrinsics2 = cropping.crop_image_depthmap_flowmap_segmask(
+                image, depthmap, flowmap, seg_mask, intrinsics, crop_bbox
             )
-            return image, depthmap, intrinsics2, flowmap
+            return image, depthmap, intrinsics2, flowmap, seg_mask
         else:
             image, depthmap, intrinsics2 = cropping.crop_image_depthmap(
                 image, depthmap, intrinsics, crop_bbox
