@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-Complete Stage1 Inference Script
-输出 4x2 布局的可视化结果（参考demo_stage2_inference.py的正确实现）：
-- Row 1: GT RGB | Rendered RGB (with sky)
-- Row 2: GT Depth | Rendered Depth
-- Row 3: GT Velocity | GT RGB + Pred Velocity 融合 (加权叠加)
-- Row 4: Dynamic Clustering (full width)
+Novel View Synthesis Inference Script
+生成3x3视频布局,展示不同视角的渲染结果:
+- 中间(第2排第2列): 原视角
+- 上方(第1排第2列): 视角向上移动
+- 下方(第3排第2列): 视角向下移动
+- 左侧(第2排第1列): 视角向左移动
+- 右侧(第2排第3列): 视角向右移动
+- 其他位置(对角线): 组合视角移动
+
+只输出RGB,不输出depth
 """
 
 import os
@@ -24,7 +28,6 @@ from copy import deepcopy
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src/vggt'))
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
-# from add_ckpt_path import add_path_to_dust3r
 from vggt.models.vggt import VGGT
 from dust3r.utils.misc import tf32_off
 from src.dust3r.inference import inference
@@ -34,12 +37,12 @@ from src.online_dynamic_processor import OnlineDynamicProcessor
 
 def parse_args():
     """解析命令行参数"""
-    parser = argparse.ArgumentParser(description="Complete Stage1 Inference with Visualization")
+    parser = argparse.ArgumentParser(description="Novel View Synthesis Inference")
 
     # 基础参数
     parser.add_argument("--model_path", type=str, required=True, help="Path to Stage1 model checkpoint")
     parser.add_argument("--seq_dir", type=str, required=True, help="Path to sequence directory")
-    parser.add_argument("--output_dir", type=str, default="./inference_outputs", help="Output directory")
+    parser.add_argument("--output_dir", type=str, default="./inference_nvs_outputs", help="Output directory")
     parser.add_argument("--idx", type=int, default=0, help="Sequence index (single mode)")
     parser.add_argument("--device", type=str, default="cuda", help="Device (cuda/cpu)")
     parser.add_argument("--num_views", type=int, default=8, help="Number of views")
@@ -51,6 +54,10 @@ def parse_args():
     parser.add_argument("--end_idx", type=int, default=200, help="End index for batch mode")
     parser.add_argument("--step", type=int, default=5, help="Step size for batch mode")
     parser.add_argument("--continue_on_error", action="store_true", help="Continue on error in batch mode")
+
+    # Novel View Synthesis参数
+    parser.add_argument("--translation_offset", type=float, default=1.0,
+                       help="Translation offset in meters for NVS")
 
     # Dynamic processor参数
     parser.add_argument("--use_velocity_based_transform", action="store_true",
@@ -73,15 +80,11 @@ def parse_args():
     parser.add_argument("--tracking_velocity_threshold", type=float, default=0.2,
                        help="Velocity threshold for tracking")
 
-    # 可视化参数
-    parser.add_argument("--velocity_alpha", type=float, default=1.0,
-                       help="Weight for pred velocity in fusion (0-1), default 0.5 means 50% each")
-
     return parser.parse_args()
 
 
 def load_model(model_path, device):
-    """加载Stage1模型（参考demo_stage2_inference.py）"""
+    """加载Stage1模型"""
     print(f"Loading model from: {model_path}")
 
     model = VGGT(
@@ -119,7 +122,7 @@ def load_dataset(seq_dir, num_views):
         valid_camera_id_list=["1", "2", "3"],
         resolution=[(518, 378), (518, 336), (518, 294), (518, 252), (518, 210),
                     (518, 140), (378, 518), (336, 518), (294, 518), (252, 518)],
-        num_views=num_views,  # 使用函数参数而不是args.num_views
+        num_views=num_views,
         seed=42,
         n_corres=0,
         seq_aug_crop=True
@@ -138,32 +141,72 @@ def ensure_tensor(data, device):
         return data
 
 
-def fix_views_data_types(views, device):
-    """修复views中的数据类型，确保所有数组都是tensor（参考demo_stage1_inference.py）"""
-    fixed_views = []
+def modify_camera_extrinsics(extrinsics, offset_x=0.0, offset_y=0.0, offset_z=0.0):
+    """
+    修改相机外参,实现视角平移
 
-    for i, view in enumerate(views):
-        fixed_view = {}
-        for key, value in view.items():
-            if key in ['img', 'depthmap', 'camera_intrinsics', 'camera_pose', 'valid_mask', 'pts3d']:
-                # 这些字段需要是tensor
-                if value is not None:
-                    tensor_value = ensure_tensor(value, device)
-                    fixed_view[key] = tensor_value
-                else:
-                    fixed_view[key] = value
-            else:
-                # 其他字段保持原样
-                fixed_view[key] = value
+    Args:
+        extrinsics: [S, 4, 4] 相机外参矩阵 (world-to-camera变换)
+        offset_x: 相机在世界坐标系X方向的偏移 (米)
+        offset_y: 相机在世界坐标系Y方向的偏移 (米)
+        offset_z: 相机在世界坐标系Z方向的偏移 (米)
 
-        fixed_views.append(fixed_view)
+    Returns:
+        modified_extrinsics: [S, 4, 4] 修改后的相机外参
 
-    return fixed_views
+    相机坐标系(OpenCV):
+        - X: 右
+        - Y: 下
+        - Z: 前
+
+    世界坐标系(OpenCV标准 - VGGT使用):
+        - X: 右 (Right)
+        - Y: 下 (Down)
+        - Z: 前 (Forward)
+
+    视角移动映射:
+        - 视角向上: offset_y < 0 (Y负方向)
+        - 视角向下: offset_y > 0 (Y正方向)
+        - 视角向左: offset_x < 0 (X负方向)
+        - 视角向右: offset_x > 0 (X正方向)
+    """
+    S = extrinsics.shape[0]
+    device = extrinsics.device
+
+    modified_extrinsics = extrinsics.clone()
+
+    # 创建平移向量 (世界坐标系)
+    translation_world = torch.tensor([offset_x, offset_y, offset_z],
+                                     device=device, dtype=extrinsics.dtype)
+
+    for s in range(S):
+        # extrinsics[s] 是 4x4 矩阵: [R | t]
+        #                           [0 | 1]
+        # 其中:
+        #   R 是旋转矩阵(world to camera)
+        #   t = -R @ C_world，其中C_world是相机中心在世界坐标系的位置
+
+        # 提取旋转矩阵和平移向量
+        R = modified_extrinsics[s, :3, :3]  # [3, 3]
+        t = modified_extrinsics[s, :3, 3]   # [3]
+
+        # 移动相机:
+        # C_world_new = C_world + offset
+        # t_new = -R @ C_world_new = -R @ (C_world + offset)
+        #       = -R @ C_world - R @ offset
+        #       = t - R @ offset
+        # 注意: 这里是减号，因为我们移动相机，而不是移动世界
+        t_offset_camera = R @ translation_world
+        t_new = t - t_offset_camera  # 注意符号是负号
+
+        modified_extrinsics[s, :3, 3] = t_new
+
+    return modified_extrinsics
 
 
 def render_gaussians_with_sky(scene, intrinsics, extrinsics, sky_colors, sampled_frame_indices, H, W, device):
     """
-    渲染gaussian场景（与train.py的Stage2RenderLoss相同逻辑）
+    渲染gaussian场景 (与inference.py相同的实现)
     包括sky_color的alpha blending合成
     逐帧渲染以正确处理动态物体的变换
     """
@@ -172,9 +215,8 @@ def render_gaussians_with_sky(scene, intrinsics, extrinsics, sky_colors, sampled
 
     S = intrinsics.shape[0]
     rendered_images = []
-    rendered_depths = []
 
-    # 逐帧渲染（参考stage2_loss.py的_render_frame逻辑）
+    # 逐帧渲染
     for frame_idx in range(S):
         # 每帧收集gaussians
         all_means = []
@@ -183,7 +225,7 @@ def render_gaussians_with_sky(scene, intrinsics, extrinsics, sky_colors, sampled
         all_rotations = []
         all_opacities = []
 
-        # Static gaussians (参考stage2_loss.py line 493-499)
+        # Static gaussians
         if scene.get('static_gaussians') is not None:
             static_gaussians = scene['static_gaussians']  # [N, 14]
             if static_gaussians.shape[0] > 0:
@@ -193,7 +235,7 @@ def render_gaussians_with_sky(scene, intrinsics, extrinsics, sky_colors, sampled
                 all_rotations.append(static_gaussians[:, 9:13])
                 all_opacities.append(static_gaussians[:, 13])
 
-        # Dynamic objects (参考stage2_loss.py line 502-532)
+        # Dynamic objects
         dynamic_objects_data = scene.get('dynamic_objects', [])
         for obj_data in dynamic_objects_data:
             # 检查物体是否在当前帧存在
@@ -208,10 +250,8 @@ def render_gaussians_with_sky(scene, intrinsics, extrinsics, sky_colors, sampled
             # 获取从canonical空间到当前帧的变换
             frame_transform = _get_object_transform_to_frame(obj_data, frame_idx)
             if frame_transform is None:
-                # 如果没有变换信息，直接使用原始Gaussians（假设当前帧就是参考帧）
                 transformed_gaussians = canonical_gaussians
             else:
-                # 应用变换：将canonical空间的Gaussians变换到当前帧
                 transformed_gaussians = _apply_transform_to_gaussians(
                     canonical_gaussians, frame_transform
                 )
@@ -227,7 +267,6 @@ def render_gaussians_with_sky(scene, intrinsics, extrinsics, sky_colors, sampled
         if len(all_means) == 0:
             # 如果没有Gaussian，返回空图像
             rendered_images.append(torch.zeros(3, H, W, device=device))
-            rendered_depths.append(torch.zeros(H, W, device=device))
             continue
 
         # Concatenate
@@ -237,7 +276,7 @@ def render_gaussians_with_sky(scene, intrinsics, extrinsics, sky_colors, sampled
         rotations = torch.cat(all_rotations, dim=0)  # [N, 4]
         opacities = torch.cat(all_opacities, dim=0)  # [N]
 
-        # Fix NaN/Inf (参考stage2_loss.py line 550-555)
+        # Fix NaN/Inf
         means = torch.nan_to_num(means, nan=0.0, posinf=0.0, neginf=0.0)
         scales = torch.nan_to_num(scales, nan=0.01, posinf=1.0, neginf=0.01)
         colors = torch.nan_to_num(colors, nan=0.5, posinf=1.0, neginf=0.0)
@@ -248,7 +287,6 @@ def render_gaussians_with_sky(scene, intrinsics, extrinsics, sky_colors, sampled
         w2c = extrinsics[frame_idx]
 
         try:
-            # 参考stage2_loss.py line 562-569
             render_result = rasterization(
                 means, rotations, scales, opacities, colors,
                 w2c.unsqueeze(0), K.unsqueeze(0), W, H,
@@ -259,7 +297,6 @@ def render_gaussians_with_sky(scene, intrinsics, extrinsics, sky_colors, sampled
             )
 
             rendered_image = render_result[0][0, :, :, :3].permute(2, 0, 1)
-            rendered_depth = render_result[0][0, :, :, -1]
             rendered_alpha = render_result[1][0, :, :, 0] if len(render_result) > 1 and render_result[1] is not None else torch.ones(H, W, device=device)
 
             rendered_image = torch.clamp(rendered_image, min=0, max=1)
@@ -278,18 +315,16 @@ def render_gaussians_with_sky(scene, intrinsics, extrinsics, sky_colors, sampled
                     rendered_image = torch.clamp(rendered_image, min=0, max=1)
 
             rendered_images.append(rendered_image)
-            rendered_depths.append(rendered_depth)
 
         except Exception as e:
             print(f"Error rendering frame {frame_idx}: {e}")
             rendered_images.append(torch.zeros(3, H, W, device=device))
-            rendered_depths.append(torch.zeros(H, W, device=device))
 
-    return torch.stack(rendered_images, dim=0), torch.stack(rendered_depths, dim=0)
+    return torch.stack(rendered_images, dim=0)
 
 
 def _object_exists_in_frame(obj_data, frame_idx):
-    """检查动态物体是否在指定帧中存在（参考stage2_loss.py line 650-655）"""
+    """检查动态物体是否在指定帧中存在"""
     if 'frame_transforms' in obj_data:
         frame_transforms = obj_data['frame_transforms']
         if frame_idx in frame_transforms:
@@ -298,21 +333,15 @@ def _object_exists_in_frame(obj_data, frame_idx):
 
 
 def _get_object_transform_to_frame(obj_data, frame_idx):
-    """获取从canonical空间到指定帧的变换矩阵（参考stage2_loss.py line 657-680）"""
-    # 检查参考帧
+    """获取从canonical空间到指定帧的变换矩阵"""
     reference_frame = obj_data.get('reference_frame', 0)
     if frame_idx == reference_frame:
-        # 如果要渲染的就是参考帧（canonical帧），不需要变换
         return None
 
-    # 获取变换：frame_transforms存储的是从各帧到reference_frame的变换
-    # 但我们需要从reference_frame到frame_idx的变换，所以需要求逆
     if 'frame_transforms' in obj_data:
         frame_transforms = obj_data['frame_transforms']
         if frame_idx in frame_transforms:
-            # 存储的变换：frame_idx -> reference_frame
-            # 我们需要的变换：reference_frame -> frame_idx（即逆变换）
-            frame_to_canonical = frame_transforms[frame_idx]  # [4, 4] 变换矩阵
+            frame_to_canonical = frame_transforms[frame_idx]
             canonical_to_frame = torch.inverse(frame_to_canonical)
             return canonical_to_frame
 
@@ -320,23 +349,18 @@ def _get_object_transform_to_frame(obj_data, frame_idx):
 
 
 def _apply_transform_to_gaussians(gaussians, transform):
-    """将变换应用到Gaussian参数（参考stage2_loss.py line 768-802）"""
-    # gaussians: [N, 14] - [xyz(3), scale(3), color(3), quat(4), opacity(1)]
-    # transform: [4, 4] 变换矩阵
-
-    # 检查变换矩阵是否异常
+    """将变换应用到Gaussian参数"""
     if torch.allclose(transform, torch.zeros_like(transform), atol=1e-6):
         print(f"⚠️  检测到零变换矩阵！使用单位矩阵替代")
         transform = torch.eye(4, dtype=transform.dtype, device=transform.device)
     else:
-        # 转换为float32以支持torch.det
         det_val = torch.det(transform[:3, :3].float()).abs()
         if det_val < 1e-8:
             print(f"⚠️  变换矩阵奇异(det={det_val:.2e})！")
 
     transformed_gaussians = gaussians.clone()
 
-    # 变换位置（参考stage2_loss.py line 794-800）
+    # 变换位置
     positions = gaussians[:, :3]  # [N, 3]
     positions_homo = torch.cat([positions, torch.ones(
         positions.shape[0], 1, device=positions.device)], dim=1)  # [N, 4]
@@ -344,187 +368,49 @@ def _apply_transform_to_gaussians(gaussians, transform):
         transform, positions_homo.T).T[:, :3]  # [N, 3]
     transformed_gaussians[:, :3] = transformed_positions
 
-    # 注意：stage2_loss.py 中只变换了位置，没有变换旋转和尺度
-    # 这是简化处理，完整实现需要变换quaternion和scale
-
     return transformed_gaussians
 
 
-def visualize_velocity(velocity, scale=0.2):
-    """可视化velocity为RGB图像"""
-    from dust3r.utils.image import scene_flow_to_rgb
-
-    S, H, W, _ = velocity.shape
-    velocity_rgb = scene_flow_to_rgb(velocity.detach(), scale).permute(0, 3, 1, 2)
-    return velocity_rgb
-
-
-def visualize_depth(depth):
-    """可视化depth为RGB图像（viridis colormap）"""
-    S, H, W = depth.shape
-    depth_vis = []
-
-    for s in range(S):
-        d = depth[s].detach().cpu().numpy()
-        d_min, d_max = d.min(), d.max()
-        if d_max > d_min:
-            d_norm = (d - d_min) / (d_max - d_min)
-        else:
-            d_norm = d * 0
-
-        colored = cm.viridis(d_norm)[:, :, :3]
-        depth_vis.append(torch.from_numpy(colored).permute(2, 0, 1))
-
-    return torch.stack(depth_vis, dim=0)
-
-
-def visualize_clustering_results(clustering_results, num_colors=20):
+def create_nvs_grid(rendered_views, translation_offset):
     """
-    为聚类结果生成可视化颜色（参考demo_stage2_inference.py line 612-662）
-    """
-    import matplotlib.pyplot as plt
-
-    # 生成颜色映射
-    colors = plt.cm.tab20(np.linspace(0, 1, num_colors))  # 使用tab20颜色映射
-    colors = (colors[:, :3] * 255).astype(np.uint8)  # 转换为0-255范围
-
-    colored_results = []
-
-    for frame_result in clustering_results:
-        points = frame_result['points']  # [H*W, 3]
-        labels = frame_result['labels']  # [H*W]
-        global_ids = frame_result.get('global_ids', [])
-
-        # 初始化颜色数组（默认黑色背景）
-        point_colors = np.zeros((len(points), 3), dtype=np.uint8)
-
-        # 为每个聚类分配颜色（基于全局ID）
-        unique_labels = torch.unique(labels)
-        colors_assigned = 0
-        for label in unique_labels:
-            if label == -1:
-                continue  # 跳过噪声点
-
-            label_val = label.item()
-            if label_val < len(global_ids):
-                global_id = global_ids[label_val]
-                if global_id != -1:
-                    color_idx = global_id % num_colors
-                    color = colors[color_idx]
-
-                    mask = labels == label
-                    point_colors[mask] = color
-                    colors_assigned += 1
-
-        colored_results.append({
-            'points': points,
-            'colors': point_colors,
-            'num_clusters': colors_assigned
-        })
-
-    return colored_results
-
-
-def create_clustering_visualization(matched_clustering_results, vggt_batch, fusion_alpha=0.7):
-    """
-    从matched_clustering_results创建可视化图像（参考demo_stage2_inference.py line 663-735）
-    """
-    import cv2
-
-    try:
-        if not matched_clustering_results or len(matched_clustering_results) == 0:
-            # 返回源RGB图像
-            B, S, C, H, W = vggt_batch["images"].shape
-            return vggt_batch["images"][0]  # [S, 3, H, W]
-
-        # 生成可视化颜色
-        colored_results = visualize_clustering_results(matched_clustering_results, num_colors=20)
-
-        B, S, C, image_height, image_width = vggt_batch["images"].shape
-
-        # 将聚类结果与源RGB图像融合
-        clustering_images = []
-        for frame_idx, colored_result in enumerate(colored_results):
-            # 获取源RGB图像
-            source_rgb = vggt_batch["images"][0, frame_idx].permute(1, 2, 0)  # [H, W, 3]
-            source_rgb = (source_rgb * 255).cpu().numpy().astype(np.uint8)  # 转换为0-255范围
-
-            # 检查是否有动态物体
-            if colored_result['num_clusters'] > 0:
-                # 将点云颜色重塑为图像格式
-                point_colors = colored_result['colors']  # [H*W, 3]
-                clustering_image = point_colors.reshape(image_height, image_width, 3)  # [H, W, 3]
-
-                # 融合：将动态聚类结果叠加到源RGB图像上
-                # 只有非黑色（非静态）的点才覆盖源图像
-                mask = np.any(clustering_image > 0, axis=2)  # [H, W] 布尔掩码，True表示动态点
-                mask = mask[:, :, np.newaxis]  # [H, W, 1] 扩展维度
-
-                # 透明度混合：动态点使用聚类颜色与源RGB混合，静态点使用源RGB
-                fused_image = np.where(mask,
-                                     (fusion_alpha * clustering_image + (1 - fusion_alpha) * source_rgb).astype(np.uint8),
-                                     source_rgb)
-            else:
-                # 没有动态物体时，显示源RGB图像并添加文本提示
-                fused_image = source_rgb.copy()
-                # 在图像上添加文本提示
-                cv2.putText(fused_image, "No Dynamic Objects", (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
-
-            clustering_images.append(fused_image)
-
-        # 转换为tensor格式，并归一化到0-1范围（与其他可视化数据一致）
-        clustering_tensor = torch.stack([torch.from_numpy(img) for img in clustering_images], dim=0)  # [S, H, W, 3]
-        clustering_tensor = clustering_tensor.float() / 255.0  # 归一化到0-1范围
-        clustering_tensor = clustering_tensor.permute(0, 3, 1, 2)  # [S, 3, H, W]
-
-        return clustering_tensor
-
-    except Exception as e:
-        print(f"Error creating clustering visualization: {e}")
-        import traceback
-        traceback.print_exc()
-        # 返回源RGB图像作为备用
-        B, S, C, H, W = vggt_batch["images"].shape
-        return vggt_batch["images"][0]  # [S, 3, H, W]
-
-
-def create_visualization_grid(gt_rgb, rendered_rgb, gt_depth, rendered_depth,
-                              gt_velocity, pred_velocity, clustering_vis, velocity_alpha=0.5):
-    """创建4x2的可视化网格（Row 3右侧展示GT RGB和Pred Velocity的融合）
+    创建3x3的NVS可视化网格
 
     Args:
-        velocity_alpha: Pred velocity在融合中的权重 (0-1)，默认0.5表示各占50%
+        rendered_views: dict包含9个视角的渲染结果，每个是[S, 3, H, W]
+        translation_offset: 平移偏移量(用于显示)
+
+    Returns:
+        grid_frames: list of [H_grid, W_grid, 3] numpy arrays
     """
-    S = gt_rgb.shape[0]
-    _, H, W = gt_rgb.shape[1:]
+    # 获取视频参数
+    center_view = rendered_views['center']  # [S, 3, H, W]
+    S, C, H, W = center_view.shape
 
     grid_frames = []
 
     for s in range(S):
-        # Convert to numpy [H, W, 3] (添加 detach 避免梯度错误)
-        gt_rgb_np = gt_rgb[s].detach().permute(1, 2, 0).cpu().numpy()
-        rendered_rgb_np = rendered_rgb[s].detach().permute(1, 2, 0).cpu().numpy()
-        gt_depth_np = gt_depth[s].detach().permute(1, 2, 0).cpu().numpy()
-        rendered_depth_np = rendered_depth[s].detach().permute(1, 2, 0).cpu().numpy()
-        gt_velocity_np = gt_velocity[s].detach().permute(1, 2, 0).cpu().numpy()
-        pred_velocity_np = pred_velocity[s].detach().permute(1, 2, 0).cpu().numpy()
-        clustering_vis_np = clustering_vis[s].detach().permute(1, 2, 0).cpu().numpy()
+        # 提取每个视角的当前帧
+        # Row 1: up-left, up, up-right
+        up_left = rendered_views['up_left'][s].permute(1, 2, 0).cpu().numpy()
+        up = rendered_views['up'][s].permute(1, 2, 0).cpu().numpy()
+        up_right = rendered_views['up_right'][s].permute(1, 2, 0).cpu().numpy()
 
-        # 创建GT RGB和Pred Velocity的加权融合图像
-        fused_velocity_np = velocity_alpha * pred_velocity_np + (1 - velocity_alpha) * gt_rgb_np
-        fused_velocity_np = np.clip(fused_velocity_np, 0, 1)
+        # Row 2: left, center, right
+        left = rendered_views['left'][s].permute(1, 2, 0).cpu().numpy()
+        center = rendered_views['center'][s].permute(1, 2, 0).cpu().numpy()
+        right = rendered_views['right'][s].permute(1, 2, 0).cpu().numpy()
 
-        # Create grid: 4 rows x 2 columns
-        row1 = np.concatenate([gt_rgb_np, rendered_rgb_np], axis=1)
-        row2 = np.concatenate([gt_depth_np, rendered_depth_np], axis=1)
-        # Row 3: GT Velocity | GT RGB + Pred Velocity 融合
-        row3 = np.concatenate([gt_velocity_np, fused_velocity_np], axis=1)
-        # Row 4: Dynamic Clustering | Black placeholder
-        black_placeholder = np.zeros_like(clustering_vis_np)
-        row4 = np.concatenate([clustering_vis_np, black_placeholder], axis=1)
+        # Row 3: down-left, down, down-right
+        down_left = rendered_views['down_left'][s].permute(1, 2, 0).cpu().numpy()
+        down = rendered_views['down'][s].permute(1, 2, 0).cpu().numpy()
+        down_right = rendered_views['down_right'][s].permute(1, 2, 0).cpu().numpy()
 
-        grid = np.concatenate([row1, row2, row3, row4], axis=0)
+        # 创建网格: 3 rows x 3 columns
+        row1 = np.concatenate([up_left, up, up_right], axis=1)
+        row2 = np.concatenate([left, center, right], axis=1)
+        row3 = np.concatenate([down_left, down, down_right], axis=1)
+
+        grid = np.concatenate([row1, row2, row3], axis=0)
         grid = (np.clip(grid, 0, 1) * 255).astype(np.uint8)
 
         grid_frames.append(grid)
@@ -532,26 +418,25 @@ def create_visualization_grid(gt_rgb, rendered_rgb, gt_depth, rendered_depth,
     return grid_frames
 
 
-def run_single_inference(model, dataset, dynamic_processor, idx, num_views, device, args=None):
-    """运行单次推理"""
+def run_single_inference(model, dataset, dynamic_processor, idx, num_views, device, args):
+    """运行单次推理并生成NVS视频"""
     print(f"\n{'='*60}")
     print(f"Processing sequence index: {idx}")
+    print(f"Translation offset: {args.translation_offset}m")
     print(f"{'='*60}\n")
 
     try:
-        # Load data（参考demo_stage2_inference.py）
+        # Load data
         views = dataset.__getitem__((idx, 2, num_views))
 
-        # 运行Stage1推理（参考demo_stage2_inference.py）
+        # 运行Stage1推理
         with torch.no_grad():
             outputs, batch = inference(views, model, device)
 
-        # 转换为vggt batch（参考demo_stage2_inference.py）
+        # 转换为vggt batch
         vggt_batch = cut3r_batch_to_vggt(views)
 
-        # Vggt forward（参考demo_stage2_inference.py）
-        # 为了获取sky_colors，需要传入gt_extrinsics和gt_intrinsics
-        # 同时设置frame_sample_ratio=1确保所有帧都被采样
+        # Vggt forward
         with torch.no_grad():
             preds = model(
                 vggt_batch['images'],
@@ -560,57 +445,32 @@ def run_single_inference(model, dataset, dynamic_processor, idx, num_views, devi
                 frame_sample_ratio=1.0
             )
 
-        # 处理use_gt_camera参数（参考demo_stage2_inference.py）
+        # 处理use_gt_camera参数
         preds_for_dynamic = preds.copy() if isinstance(preds, dict) else preds
         if hasattr(args, 'use_gt_camera') and args.use_gt_camera and 'pose_enc' in preds_for_dynamic:
-            # 使用GT相机参数替换预测的pose_enc
             from vggt.utils.pose_enc import extri_intri_to_pose_encoding
-            gt_extrinsics = vggt_batch['extrinsics']  # [B, S, 4, 4]
-            gt_intrinsics = vggt_batch['intrinsics']  # [B, S, 3, 3]
+            gt_extrinsics = vggt_batch['extrinsics']
+            gt_intrinsics = vggt_batch['intrinsics']
             image_size_hw = vggt_batch['images'].shape[-2:]
 
             gt_pose_enc = extri_intri_to_pose_encoding(
                 gt_extrinsics, gt_intrinsics, image_size_hw, pose_encoding_type="absT_quaR_FoV"
             )
             preds_for_dynamic['pose_enc'] = gt_pose_enc
-            print(f"[INFO] Using GT camera parameters for dynamic object processing")
+            print(f"[INFO] Using GT camera parameters")
         else:
-            print(f"[INFO] Using predicted camera parameters for dynamic object processing")
+            print(f"[INFO] Using predicted camera parameters")
 
-        # 创建空的辅助模型字典（参考demo_stage2_inference.py）
+        # 创建空的辅助模型字典
         auxiliary_models = {}
 
-        # Process dynamic objects（参考demo_stage2_inference.py）
+        # Process dynamic objects
         dynamic_objects_data = dynamic_processor.process_dynamic_objects(
             preds_for_dynamic, vggt_batch, auxiliary_models
         )
 
         # Extract data
         B, S, C, H, W = vggt_batch['images'].shape
-
-        gt_rgb = vggt_batch['images'][0]  # [S, 3, H, W]
-        # gt_depth should be [S, H, W]
-        if 'depths' in vggt_batch and vggt_batch['depths'] is not None:
-            gt_depth = vggt_batch['depths'][0]  # [S, H, W]
-        else:
-            gt_depth = torch.ones(S, H, W, device=device) * 5.0
-
-        gt_velocity = vggt_batch.get('flowmap', None)
-
-        if gt_velocity is not None:
-            gt_velocity = gt_velocity[0, :, :, :, :3]
-            # Apply same coordinate transformation as pred_velocity
-            gt_velocity = gt_velocity[:, :, :, [2, 0, 1]]
-            gt_velocity[:, :, :, 2] = -gt_velocity[:, :, :, 2]
-        else:
-            gt_velocity = torch.zeros(S, H, W, 3, device=device)
-
-        pred_velocity = preds.get('velocity', torch.zeros(1, S, H, W, 3, device=device))[0]
-
-        # Apply velocity activation
-        pred_velocity = torch.sign(pred_velocity) * (torch.exp(torch.abs(pred_velocity)) - 1)
-        pred_velocity = pred_velocity[:, :, :, [2, 0, 1]]
-        pred_velocity[:, :, :, 2] = -pred_velocity[:, :, :, 2]
 
         # Build scene
         dynamic_objects = dynamic_objects_data.get('dynamic_objects', []) if dynamic_objects_data is not None else []
@@ -622,8 +482,8 @@ def run_single_inference(model, dataset, dynamic_processor, idx, num_views, devi
         }
 
         # Get camera parameters
-        intrinsics = vggt_batch['intrinsics'][0]
-        extrinsics = vggt_batch['extrinsics'][0]
+        intrinsics = vggt_batch['intrinsics'][0]  # [S, 3, 3]
+        extrinsics_original = vggt_batch['extrinsics'][0]  # [S, 4, 4]
 
         # Get sky colors
         sky_colors = preds.get('sky_colors', None)
@@ -632,31 +492,42 @@ def run_single_inference(model, dataset, dynamic_processor, idx, num_views, devi
         if sky_colors is not None:
             sky_colors = sky_colors[0]  # [num_sampled, 3, H, W]
 
-        # Render
-        print("Rendering gaussians with sky...")
-        rendered_rgb, rendered_depth = render_gaussians_with_sky(
-            scene, intrinsics, extrinsics, sky_colors, sampled_frame_indices, H, W, device
-        )
+        # 定义9个视角的相机偏移 (使用OpenCV坐标系: X=右, Y=下, Z=前)
+        offset = args.translation_offset
+        camera_offsets = {
+            'up_left':    (-offset, -offset, 0.0),   # 左上 (X负=左, Y负=上)
+            'up':         (0.0, -offset, 0.0),       # 上 (Y负=上)
+            'up_right':   (offset, -offset, 0.0),    # 右上 (X正=右, Y负=上)
+            'left':       (-offset, 0.0, 0.0),       # 左 (X负=左)
+            'center':     (0.0, 0.0, 0.0),           # 中心(原视角)
+            'right':      (offset, 0.0, 0.0),        # 右 (X正=右)
+            'down_left':  (-offset, offset, 0.0),    # 左下 (X负=左, Y正=下)
+            'down':       (0.0, offset, 0.0),        # 下 (Y正=下)
+            'down_right': (offset, offset, 0.0),     # 右下 (X正=右, Y正=下)
+        }
 
-        # Visualize
-        print("Creating visualizations...")
-        gt_velocity_vis = visualize_velocity(gt_velocity, scale=0.1)
-        pred_velocity_vis = visualize_velocity(pred_velocity, scale=0.1)
-        gt_depth_vis = visualize_depth(gt_depth)  # gt_depth is already [S, H, W]
-        rendered_depth_vis = visualize_depth(rendered_depth)
+        # 渲染9个视角
+        print("Rendering 9 novel views...")
+        rendered_views = {}
 
-        # Create Dynamic Clustering visualization（参考demo_stage2_inference.py）
-        matched_clustering_results = dynamic_objects_data.get('matched_clustering_results', []) if dynamic_objects_data is not None else []
-        clustering_vis = create_clustering_visualization(matched_clustering_results, vggt_batch)
+        for view_name, (offset_x, offset_y, offset_z) in camera_offsets.items():
+            print(f"  Rendering {view_name} view (offset: x={offset_x:.2f}, y={offset_y:.2f}, z={offset_z:.2f})...")
+
+            # 修改相机外参
+            extrinsics_modified = modify_camera_extrinsics(
+                extrinsics_original, offset_x, offset_y, offset_z
+            )
+
+            # 渲染
+            rendered_rgb = render_gaussians_with_sky(
+                scene, intrinsics, extrinsics_modified,
+                sky_colors, sampled_frame_indices, H, W, device
+            )
+
+            rendered_views[view_name] = rendered_rgb
 
         return {
-            'gt_rgb': gt_rgb,
-            'rendered_rgb': rendered_rgb,
-            'gt_depth': gt_depth_vis,
-            'rendered_depth': rendered_depth_vis,
-            'gt_velocity': gt_velocity_vis,
-            'pred_velocity': pred_velocity_vis,
-            'clustering': clustering_vis,
+            'rendered_views': rendered_views,
             'num_objects': len(dynamic_objects),
             'success': True
         }
@@ -671,7 +542,7 @@ def run_single_inference(model, dataset, dynamic_processor, idx, num_views, devi
 def run_batch_inference(model, dataset, dynamic_processor, args, device):
     """运行批量推理"""
     print(f"\n{'='*60}")
-    print(f"Batch Inference Mode")
+    print(f"Batch Inference Mode (NVS)")
     print(f"Range: {args.start_idx} to {args.end_idx}, step {args.step}")
     print(f"{'='*60}\n")
 
@@ -685,16 +556,13 @@ def run_batch_inference(model, dataset, dynamic_processor, args, device):
 
         if result['success']:
             # Save video
-            grid_frames = create_visualization_grid(
-                result['gt_rgb'], result['rendered_rgb'],
-                result['gt_depth'], result['rendered_depth'],
-                result['gt_velocity'], result['pred_velocity'],
-                result['clustering'],
-                velocity_alpha=args.velocity_alpha
+            grid_frames = create_nvs_grid(
+                result['rendered_views'],
+                args.translation_offset
             )
 
             seq_name = os.path.basename(args.seq_dir)
-            output_path = os.path.join(args.output_dir, f"{seq_name}_idx{idx}.mp4")
+            output_path = os.path.join(args.output_dir, f"{seq_name}_nvs_idx{idx}.mp4")
 
             save_video(grid_frames, output_path, fps=args.fps)
             successful.append(idx)
@@ -727,16 +595,11 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}\n")
 
-    # import debugpy
-    # debugpy.listen(5697)
-    # print("Waiting for debugger to attach...")
-    # debugpy.wait_for_client()
-
     # Load model and dataset
     model = load_model(args.model_path, device)
     dataset = load_dataset(args.seq_dir, args.num_views)
 
-    # Create dynamic processor (不传use_gt_camera参数)
+    # Create dynamic processor
     dynamic_processor = OnlineDynamicProcessor(
         device=device,
         use_velocity_based_transform=args.use_velocity_based_transform,
@@ -760,16 +623,13 @@ def main():
             result = run_single_inference(model, dataset, dynamic_processor, args.idx, args.num_views, device, args)
 
             if result['success']:
-                grid_frames = create_visualization_grid(
-                    result['gt_rgb'], result['rendered_rgb'],
-                    result['gt_depth'], result['rendered_depth'],
-                    result['gt_velocity'], result['pred_velocity'],
-                    result['clustering'],
-                    velocity_alpha=args.velocity_alpha
+                grid_frames = create_nvs_grid(
+                    result['rendered_views'],
+                    args.translation_offset
                 )
 
                 seq_name = os.path.basename(args.seq_dir)
-                output_path = os.path.join(args.output_dir, f"{seq_name}_idx{args.idx}.mp4")
+                output_path = os.path.join(args.output_dir, f"{seq_name}_nvs_idx{args.idx}.mp4")
 
                 save_video(grid_frames, output_path, fps=args.fps)
 

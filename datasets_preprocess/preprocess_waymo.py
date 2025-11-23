@@ -28,6 +28,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '../src/'))
 import cv2
 
 import tensorflow.compat.v1 as tf
+import gc
 
 tf.enable_eager_execution()
 
@@ -84,7 +85,6 @@ def get_parser():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--waymo_dir", default="/mnt/raw-datasets/waymo/raw/train")
-    # parser.add_argument("--waymo_dir", default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/test")
     parser.add_argument("--precomputed_pairs")
     parser.add_argument("--output_dir", default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train_full_test")
     parser.add_argument("--workers", type=int, default=1)
@@ -151,29 +151,53 @@ def process_one_seq(db_root, output_dir, seq):
 
     try:
         with tf.device("/CPU:0"):
-            calib, frames = extract_frames_one_seq(osp.join(db_root, seq))
+            # Use generator to process frames one by one, avoiding memory accumulation
+            calib = None
+            for f, (frame_name, views) in enumerate(extract_frames_one_seq_generator(osp.join(db_root, seq))):
+                if calib is None:
+                    # First yield returns calibration
+                    if isinstance(frame_name, list):
+                        calib = frame_name
+                        continue
+
+                for cam_idx, view in views.items():
+                    img = PIL.Image.fromarray(view.pop("img"))
+                    img.save(osp.join(out_dir, f"{f:05d}_{cam_idx}.jpg"))
+
+                    # Convert complex data to JSON strings for safe npz storage
+                    if 'labels' in view:
+                        view['labels_json'] = json.dumps(view.pop('labels'))
+                    if 'calibration' in view:
+                        view['calibration_json'] = json.dumps(view.pop('calibration'))
+
+                    np.savez(osp.join(out_dir, f"{f:05d}_{cam_idx}.npz"), **view)
+
+                # Clear memory after each frame
+                del views
+                gc.collect()
+
     except RuntimeError:
         print(f"/!\\ Error with sequence {seq} /!\\", file=sys.stderr)
         return  # nothing is saved
-
-    for f, (frame_name, views) in enumerate(tqdm(frames, leave=False)):
-        for cam_idx, view in views.items():
-            img = PIL.Image.fromarray(view.pop("img"))
-            img.save(osp.join(out_dir, f"{f:05d}_{cam_idx}.jpg"))
-
-            # Convert complex data to JSON strings for safe npz storage
-            if 'labels' in view:
-                view['labels_json'] = json.dumps(view.pop('labels'))
-            if 'calibration' in view:
-                view['calibration_json'] = json.dumps(view.pop('calibration'))
-
-            np.savez(osp.join(out_dir, f"{f:05d}_{cam_idx}.npz"), **view)
 
     with open(calib_path, "w") as f:
         json.dump(calib, f)
 
 
 def extract_frames_one_seq(filename):
+    """Original function kept for compatibility - uses generator internally"""
+    calib = None
+    frames = []
+    for item in extract_frames_one_seq_generator(filename):
+        if calib is None and isinstance(item[0], list):
+            calib = item[0]
+        else:
+            frames.append(item)
+    return calib, frames
+
+
+def extract_frames_one_seq_generator(filename):
+    """Generator version that yields frames one by one to avoid memory accumulation"""
 
     from waymo_open_dataset import dataset_pb2 as open_dataset
     from waymo_open_dataset.utils import frame_utils, transform_utils, range_image_utils
@@ -516,7 +540,6 @@ def extract_frames_one_seq(filename):
     dataset = tf.data.TFRecordDataset(filename, compression_type="")
 
     calib = None
-    frames = []
 
     for data in tqdm(dataset, leave=False):
         frame = open_dataset.Frame()
@@ -528,7 +551,6 @@ def extract_frames_one_seq(filename):
         range_images_flow, _, _ = parse_range_image_flow_and_camera_projection(frame)
 
         views = {}
-        frames.append((frame.context.name, views))
 
         # once in a sequence, read camera calibration info
         if calib is None:
@@ -545,6 +567,8 @@ def extract_frames_one_seq(filename):
                         ),
                     )
                 )
+            # Yield calibration first
+            yield (calib, {})
 
         # convert LIDAR to pointcloud
         points, cp_points = frame_utils.convert_range_image_to_point_cloud(
@@ -590,7 +614,7 @@ def extract_frames_one_seq(filename):
 
             pix = cp_points_msk_tensor[..., 1:3].numpy().round().astype(np.int16)
             pts3d = points_all[mask.numpy()]
-            flows = flows_all[mask.numpy()]
+            flows_view = flows_all[mask.numpy()]
 
             # Extract label data for dynamic mask generation
             labels_data = []
@@ -624,18 +648,24 @@ def extract_frames_one_seq(filename):
                 pixels=pix,
                 pts3d=pts3d,
                 timestamp=timestamp,
-                flows=flows,
+                flows=flows_view,
                 labels=labels_data,
                 vehicle_pose=frame.pose.transform,
                 calibration=calibration_data
             )
 
-        # if not "show full point cloud":
-        #     show_raw_pointcloud(
-        #         [v["pts3d"] for v in views.values()], [v["img"] for v in views.values()]
-        #     )
+        # Yield frame data immediately instead of accumulating
+        yield (frame.context.name, views)
 
-    return calib, frames
+        # Clear memory after each frame
+        del frame, content, range_images, camera_projections, range_image_top_pose
+        del range_images_flow, points, cp_points, origins, points_new, flows
+        del cp_points_new, intensity, elongation, laser_ids
+        del points_all, flows_all, cp_points_all, cp_points_all_tensor
+
+        # Clear TensorFlow memory
+        tf.keras.backend.clear_session()
+        gc.collect()
 
 
 def make_crops(output_dir, workers=16, enable_sam=False, sam_model_type="sam2",

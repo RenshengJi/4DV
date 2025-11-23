@@ -47,14 +47,14 @@ export CUDA_VISIBLE_DEVICES=0
 # STAGE1_MODEL_PATH="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/fromaggregator_all_lr1e-5_procrustes_area500_velocityconstraint0.05_gtcamera_xyzgrad+fixdbscan+sky+fixepsmetric+noconf+novelocity!/checkpoint-epoch_0_75960.pth"
 # STAGE1_MODEL_PATH="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/stage1_gtflow/checkpoint-epoch_7_11392.pth"
 # STAGE1_MODEL_PATH="src/checkpoints/waymo_stage1_online/aggregator_all_resume_procrustes_depthconf0.2+fixcamera+velocityconstrain_detach/checkpoint-epoch_0_39060.pth"
-STAGE1_MODEL_PATH="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_new/ground+fixvelocity_resume/checkpoint-epoch_0_52080.pth"
+STAGE1_MODEL_PATH="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_new/segmetation/checkpoint-epoch_0_58590.pth"
     
 
 # 数据路径
 SEQ_DIR="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train_full/"
 
 # 输出目录
-OUTPUT_DIR="./results/inference_outputs_fixvelocity_11.5w"
+OUTPUT_DIR="./results/seg_5.5w"
 
 # 其他参数
 NUM_VIEWS=8
