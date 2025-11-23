@@ -47,10 +47,10 @@ echo ""
 export CUDA_VISIBLE_DEVICES=0
 
 # 模型路径 (使用与inference.py相同的模型)
-STAGE1_MODEL_PATH="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_new/segmetation/checkpoint-epoch_0_55335.pth"
+STAGE1_MODEL_PATH="src/checkpoints/waymo_new/segmetation/checkpoint-epoch_0_55335.pth"
 
 # 数据路径
-SEQ_DIR="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train_full/"
+SEQ_DIR="data/waymo/train_full/"
 
 # 输出目录
 OUTPUT_DIR="./results/nvs_5.5w"

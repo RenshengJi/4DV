@@ -272,10 +272,10 @@ def train(args):
         printer.info(f"Loading pretrained: {args.pretrained}")
         ckpt = torch.load(args.pretrained, map_location=device)
         # 删除 gaussian_head 的 output_conv2.2 参数（可能因为 sh_degree 不匹配）
-        # keys_to_remove = [k for k in ckpt.keys() if 'gaussian_head.scratch.output_conv2.2' in k]
-        # for key in keys_to_remove:
-        #     printer.info(f"Removing {key} from checkpoint (sh_degree mismatch)")
-        #     del ckpt[key]
+        keys_to_remove = [k for k in ckpt.keys() if 'gaussian_head.scratch.output_conv2.2' in k]
+        for key in keys_to_remove:
+            printer.info(f"Removing {key} from checkpoint (sh_degree mismatch)")
+            del ckpt[key]
         model.load_state_dict(ckpt, strict=False)
         del ckpt
     else:
@@ -283,10 +283,10 @@ def train(args):
         checkpoint = torch.load(args.pretrained_velocity, map_location=device)
         ckpt = strip_module(checkpoint.get('model', checkpoint))  # Handle both wrapped and direct state_dict
         # 删除 gaussian_head 的 output_conv2.2 参数（可能因为 sh_degree 不匹配）
-        # keys_to_remove = [k for k in ckpt.keys() if 'gaussian_head.scratch.output_conv2.2' in k]
-        # for key in keys_to_remove:
-        #     printer.info(f"Removing {key} from checkpoint (sh_degree mismatch)")
-        #     del ckpt[key]
+        keys_to_remove = [k for k in ckpt.keys() if 'gaussian_head.scratch.output_conv2.2' in k]
+        for key in keys_to_remove:
+            printer.info(f"Removing {key} from checkpoint (sh_degree mismatch)")
+            del ckpt[key]
         model.load_state_dict(ckpt, strict=False)
         del ckpt, checkpoint
     

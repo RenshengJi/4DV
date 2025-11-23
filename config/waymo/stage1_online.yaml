@@ -4,12 +4,12 @@
 # debug: true
 
 # =============== 模型配置 ===============
-model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=2)"
+model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=0)"
 # sh_degree: 球谐函数的阶数（0=只有DC分量3个参数，1=DC+方向性12个参数，2=27个参数，3=48个参数）
 # Gaussian head的output_dim会根据sh_degree自动计算：11 + 3*(sh_degree+1)^2
 # pretrained: model.pt
 # pretrained_velocity: False
-pretrained_velocity: "/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_new/ground+fixvelocity_resume/checkpoint-epoch_0_52080.pth"
+pretrained_velocity: "src/checkpoints/waymo_new/segmetation/checkpoint-epoch_0_65100.pth"
 
 # VGGT冻结策略配置
 # 可选值: "none", "encoder", "encoder_frame", "backbone", "backbone_camera", "backbone_pts",
@@ -34,7 +34,7 @@ auxiliary_models:
   dam2: DepthAnythingV2(encoder="vitb", offload=${offload_auxiliary})
 
   # # VGGT teacher模型 (用于渲染损失)
-  # vggt_teacher: VGGT(path="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/model.pt", offload=${offload_auxiliary})
+  # vggt_teacher: VGGT(path="src/model.pt", offload=${offload_auxiliary})
 
 offload_auxiliary: False
 
@@ -140,13 +140,13 @@ velocity_transform_mode: "procrustes"          # velocity变换模式: "simple"(
 allow_repeat: False
 
 train_dataset: Waymo_Multi(allow_repeat=${allow_repeat}, split=None,
-  ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train_full",
+  ROOT="data/waymo/train_full",
   img_ray_mask_p=[1.0, 0.0, 0.0], valid_camera_id_list=["1", "2", "3"],
   aug_crop=0, resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], transform=ImgNorm,
   num_views=${num_views}, n_corres=${n_corres_train}, seq_aug_crop=True, load_sam_masks=False)
 
 test_dataset: 1000 @ Waymo_Multi(split=None,
-  ROOT="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train_full",
+  ROOT="data/waymo/train_full",
   img_ray_mask_p=[1.0, 0.0, 0.0], valid_camera_id_list=["1", "2", "3"],
   resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], num_views=${num_test_views}, seed=42, n_corres=${n_corres_test})
 
@@ -158,7 +158,7 @@ gradient_checkpointing: True
 epochs: 2
 start_epoch: 0
 weight_decay: 0.05
-lr: 1e-4
+lr: 5e-5
 min_lr: 1e-8
 warmup_epochs: 0.02
 amp: 1
@@ -183,7 +183,7 @@ num_imgs_vis: 4
 # =============== 输出配置 ===============
 save_dir: 'checkpoints/waymo_new'
 # exp_name: 'aggregator_from_scratch'
-exp_name: 'segmetation'
+exp_name: 'segmetation+degree0+lr5e-5forreusme'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/

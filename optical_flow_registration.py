@@ -2246,7 +2246,7 @@ def main():
     parser.add_argument("--use_complex_correspondence", action="store_true",
                         help="使用复杂对应点查找方法（更精确但更慢）")
     parser.add_argument("--raft_model_path", type=str,
-                        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/Tartan-C-T-TSKH-kitti432x960-M.pth",
+                        default="src/Tartan-C-T-TSKH-kitti432x960-M.pth",
                         help="RAFT模型权重文件路径")
 
     args = parser.parse_args()

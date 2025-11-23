@@ -40,8 +40,8 @@ from sam_preprocessing import SAMPreprocessor
 
 def get_parser():
     parser = argparse.ArgumentParser(description="SAM preprocessing for WayMo dataset")
-    parser.add_argument("--waymo_dir", default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train", help="Path to WayMo dataset directory")
-    parser.add_argument("--output_dir", default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train", help="Output directory for processed data")
+    parser.add_argument("--waymo_dir", default="data/waymo/train", help="Path to WayMo dataset directory")
+    parser.add_argument("--output_dir", default="data/waymo/train", help="Output directory for processed data")
     parser.add_argument("--workers", type=int, default=40, help="Number of parallel workers")
     parser.add_argument("--resolution", type=int, default=512, help="Output image resolution")
     
@@ -50,7 +50,7 @@ def get_parser():
                        help="SAM model type")
     parser.add_argument("--sam_device", default="cuda", help="Device for SAM model")
     parser.add_argument("--sam_config_file", default="configs/sam2.1/sam2.1_hiera_t.yaml", help="SAM2 config file path")
-    parser.add_argument("--sam_ckpt_path", default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/sam2.1_hiera_tiny.pt", help="SAM model checkpoint path")
+    parser.add_argument("--sam_ckpt_path", default="src/sam2.1_hiera_tiny.pt", help="SAM model checkpoint path")
     
     # 处理选项
     parser.add_argument("--skip_existing", action="store_true", 

@@ -33,10 +33,10 @@ def parse_args():
 
     # 基础参数
     parser.add_argument("--model_path", type=str,
-                       default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/ziqi/4DVideo/src/checkpoints/waymo_stage1_online/fromaggregator_all_lr1e-5_procrustes_area500_velocityconstraint0.05_gtcamera_xyzgrad+fixdbscan+sky+fixepsmetric+noconf/checkpoint-epoch_0_37980.pth",
+                       default="src/checkpoints/waymo_stage1_online/fromaggregator_all_lr1e-5_procrustes_area500_velocityconstraint0.05_gtcamera_xyzgrad+fixdbscan+sky+fixepsmetric+noconf/checkpoint-epoch_0_37980.pth",
                        help="Path to Stage1 model checkpoint")
     parser.add_argument("--seq_dir", type=str,
-                       default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train_full/",
+                       default="data/waymo/train_full/",
                        help="Path to sequence directory")
     parser.add_argument("--idx", type=int, default=0, help="Sequence index")
     parser.add_argument("--device", type=str, default="cuda", help="Device (cuda/cpu)")

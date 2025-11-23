@@ -86,7 +86,7 @@ def get_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--waymo_dir", default="/mnt/raw-datasets/waymo/raw/train")
     parser.add_argument("--precomputed_pairs")
-    parser.add_argument("--output_dir", default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train_full_test")
+    parser.add_argument("--output_dir", default="data/waymo/train_full_test")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--enable_sam", action="store_true", help="Enable SAM mask generation")
     parser.add_argument("--sam_model_type", default="sam2", choices=["sam2", "sam"], help="SAM model type")

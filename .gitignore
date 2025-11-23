@@ -1,3 +1,11 @@
+# Ignore data and ckpts
+*.pth
+*.pt
+data/   
+src/checkpoints
+config/debug
+results/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -50,15 +58,4 @@ coverage.xml
 # Sphinx documentation
 docs/_build/
 
-# Ignore data and ckpts
-*.pth
-*.pt
-data/
-src/checkpoints
-/tmp
-/examples
-/config/debug
-debug_*.png
-demo_tmp/
-results/
-saved_pointclouds/
+

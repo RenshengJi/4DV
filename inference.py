@@ -89,7 +89,7 @@ def load_model(model_path, device):
         patch_size=14,
         embed_dim=1024,
         use_sky_token=True,
-        sh_degree=2
+        sh_degree=0
     )
 
     checkpoint = torch.load(model_path, map_location="cpu")
