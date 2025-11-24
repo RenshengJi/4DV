@@ -43,13 +43,13 @@ echo ""
 export CUDA_VISIBLE_DEVICES=0
 
 # 模型路径
-STAGE1_MODEL_PATH="src/checkpoints/waymo_new/segmetation+degree0+lr5e-5forreusme/checkpoint-epoch_0_6510.pth"
+STAGE1_MODEL_PATH="src/checkpoints/waymo_new/segmetation+degree0+lr5e-5forreusme/checkpoint-epoch_0_26040.pth"
     
 # 数据路径
 SEQ_DIR="data/waymo/train_full/"
 
 # 输出目录
-OUTPUT_DIR="./results/seg_degree0"
+OUTPUT_DIR="./results/test_npz"
 
 # 其他参数
 NUM_VIEWS=8

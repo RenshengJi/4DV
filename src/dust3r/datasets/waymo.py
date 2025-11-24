@@ -166,11 +166,17 @@ class Waymo_Multi(BaseMultiViewDataset):
             image = imread_cv2(osp.join(scene_dir, impath + ".jpg"))
             depthmap = imread_cv2(osp.join(scene_dir, impath + ".exr"))
             camera_params = np.load(osp.join(scene_dir, impath + ".npz"))
-            # Load flow data
-            flow_path = osp.join(scene_dir, impath + ".npy")
+            # Load flow data (support both .npz and legacy .npy format)
+            flow_path_npz = osp.join(scene_dir, impath + "_flow.npz")
+            flow_path_npy = osp.join(scene_dir, impath + ".npy")
             flowmap = None
-            if osp.exists(flow_path):
-                flowmap = np.load(flow_path)
+            if osp.exists(flow_path_npz):
+                # Load compressed .npz format
+                flow_data = np.load(flow_path_npz)
+                flowmap = flow_data['data']
+            elif osp.exists(flow_path_npy):
+                # Fallback to legacy .npy format
+                flowmap = np.load(flow_path_npy)
 
             # Load semantic segmentation mask (_seg.png)
             seg_path = osp.join(scene_dir, impath + "_seg.png")
