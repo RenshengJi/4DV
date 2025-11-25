@@ -30,8 +30,9 @@ from vggt.training.loss import camera_loss, depth_loss, point_loss, cross_render
 from vggt.utils.auxiliary import RAFTCfg, calc_flow
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri, extri_intri_to_pose_encoding
 
-# ===== 在线第二阶段训练器 =====
-from online_stage2_trainer import OnlineStage2Trainer
+# ===== 在线动态处理器和Stage2 Loss =====
+from online_dynamic_processor import OnlineDynamicProcessor
+from vggt.training.stage2_loss import Stage2CompleteLoss
 
 
 sys.path.append(os.path.join(os.path.dirname(__file__), 'sam2'))
@@ -48,19 +49,7 @@ from raft import RAFT
 
 torch.backends.cuda.matmul.allow_tf32 = True  # for gpu >= Ampere and pytorch >= 1.12
 
-from dust3r.model import (
-    PreTrainedModel,
-    ARCroco3DStereo,
-    ARCroco3DStereoConfig,
-    inf,
-    strip_module,
-)  # noqa: F401, needed when loading the model
 from dust3r.datasets import get_data_loader
-from dust3r.losses import *  # noqa: F401, needed when loading the model
-from dust3r.inference import loss_of_one_batch, loss_of_one_batch_tbptt  # noqa
-from dust3r.viz import colorize
-from dust3r.utils.render import get_render_results
-from dust3r.gaussians import GaussianAdapterCfg, DecoderSplattingCUDACfg
 from dust3r.utils.misc import tf32_off
 import dust3r.utils.path_to_croco  # noqa: F401
 import croco.utils.misc as misc  # noqa
@@ -80,10 +69,25 @@ from accelerate import DistributedDataParallelKwargs, InitProcessGroupKwargs
 from accelerate.logging import get_logger
 from datetime import timedelta
 import torch.multiprocessing
+from collections import OrderedDict
 
 torch.multiprocessing.set_sharing_strategy("file_system")
 
 printer = get_logger(__name__, log_level="DEBUG")
+
+def strip_module(state_dict):
+    """
+    Removes the 'module.' prefix from the keys of a state_dict.
+    Args:
+        state_dict (dict): The original state_dict with possible 'module.' prefixes.
+    Returns:
+        OrderedDict: A new state_dict with 'module.' prefixes removed.
+    """
+    new_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        name = k[7:] if k.startswith("module.") else k
+        new_state_dict[name] = v
+    return new_state_dict
 
 
 def setup_for_distributed(accelerator: Accelerator):
@@ -148,57 +152,39 @@ def train(args):
     device = accelerator.device
 
     setup_for_distributed(accelerator)
-    
-    # 初始化在线第二阶段训练器
-    stage2_config = {
-        # Gaussian细化网络配置（稀疏卷积）
-        'input_gaussian_dim': getattr(args, 'input_gaussian_dim', 14),
-        'output_gaussian_dim': getattr(args, 'output_gaussian_dim', 14),
-        'gaussian_feature_dim': getattr(args, 'gaussian_feature_dim', 128),
-        'gaussian_num_conv_layers': getattr(args, 'gaussian_num_conv_layers', 2),
-        'gaussian_voxel_size': getattr(args, 'gaussian_voxel_size', 0.05),
 
-        # 位姿细化网络配置（稀疏卷积）
-        'pose_input_dim': getattr(args, 'pose_input_dim', 3),
-        'pose_feature_dim': getattr(args, 'pose_feature_dim', 128),
-        'pose_num_conv_layers': getattr(args, 'pose_num_conv_layers', 2),
-        'pose_voxel_size': getattr(args, 'pose_voxel_size', 0.1),
-        'pose_max_points': getattr(args, 'pose_max_points', 4096),
-
-        # 训练模式
-        'stage2_training_mode': getattr(args, 'stage2_training_mode', 'joint'),
-
-        # 损失配置 - 使用stage2_前缀的键名以匹配online_stage2_trainer.py
-        'stage2_rgb_loss_weight': getattr(args, 'stage2_rgb_loss_weight', 0.5),
-        'stage2_depth_loss_weight': getattr(args, 'stage2_depth_loss_weight', 0.05),
-        'stage2_render_only_dynamic': getattr(args, 'stage2_render_only_dynamic', False),
-        'stage2_supervise_only_dynamic': getattr(args, 'stage2_supervise_only_dynamic', False),
-        'aggregator_all_render_lpips_weight': getattr(args, 'aggregator_all_render_lpips_weight', 0.0),
-
-        # 动态处理器配置
-        'dynamic_processor': {
-            'min_object_size': getattr(args, 'min_object_size', 100),
-            'max_objects_per_frame': getattr(args, 'max_objects_per_frame', 10),
-            'velocity_threshold': getattr(args, 'velocity_threshold', 0.1),
-            'clustering_eps': getattr(args, 'clustering_eps', 0.02),
-            'clustering_min_samples': getattr(args, 'clustering_min_samples', 10),
-            'tracking_position_threshold': getattr(args, 'tracking_position_threshold', 2.0),
-            'tracking_velocity_threshold': getattr(args, 'tracking_velocity_threshold', 0.2),
-            'use_optical_flow_aggregation': getattr(args, 'enable_optical_flow_aggregation', True),
-            'use_velocity_based_transform': getattr(args, 'use_velocity_based_transform', False),
-            'velocity_transform_mode': getattr(args, 'velocity_transform_mode', 'simple')
-        }
+    # 初始化动态处理器和Stage2损失函数（用于aggregator_all loss）
+    dynamic_processor_config = {
+        'min_object_size': getattr(args, 'min_object_size', 100),
+        'max_objects_per_frame': getattr(args, 'max_objects_per_frame', 10),
+        'velocity_threshold': getattr(args, 'velocity_threshold', 0.1),
+        'clustering_eps': getattr(args, 'clustering_eps', 0.02),
+        'clustering_min_samples': getattr(args, 'clustering_min_samples', 10),
+        'tracking_position_threshold': getattr(args, 'tracking_position_threshold', 2.0),
+        'tracking_velocity_threshold': getattr(args, 'tracking_velocity_threshold', 0.2),
+        'use_optical_flow_aggregation': getattr(args, 'enable_optical_flow_aggregation', True),
+        'use_velocity_based_transform': getattr(args, 'use_velocity_based_transform', False),
+        'velocity_transform_mode': getattr(args, 'velocity_transform_mode', 'simple')
     }
-    
-    # Stage2 trainer必须在所有进程中初始化（DDP要求所有进程有相同的模型参数）
-    online_stage2_trainer = OnlineStage2Trainer(
-        stage2_config=stage2_config,
+
+    # 初始化动态处理器
+    dynamic_processor = OnlineDynamicProcessor(
         device=device,
-        enable_stage2=getattr(args, 'enable_stage2', True),
-        stage2_start_epoch=getattr(args, 'stage2_start_epoch', 5),
-        stage2_frequency=getattr(args, 'stage2_frequency', 10),
-        memory_efficient=getattr(args, 'stage2_memory_efficient', True)
+        memory_efficient=getattr(args, 'stage2_memory_efficient', True),
+        **dynamic_processor_config
     )
+
+    # 初始化Stage2损失函数（用于aggregator_all）
+    stage2_loss_config = {
+        'rgb_weight': getattr(args, 'stage2_rgb_loss_weight', 0.5),
+        'depth_weight': getattr(args, 'stage2_depth_loss_weight', 0.0),
+        'lpips_weight': getattr(args, 'aggregator_all_render_lpips_weight', 0.0),
+        'render_only_dynamic': getattr(args, 'stage2_render_only_dynamic', False),
+        'supervise_only_dynamic': getattr(args, 'stage2_supervise_only_dynamic', False),
+        'supervise_middle_frame_only': getattr(args, 'stage2_supervise_middle_frame_only', False),
+    }
+    stage2_criterion = Stage2CompleteLoss(render_loss_config=stage2_loss_config)
+    stage2_criterion.to(device)
 
     printer.info("output_dir: " + args.output_dir)
     if args.output_dir:
@@ -458,29 +444,12 @@ def train(args):
     # # following timm: set wd as 0 for bias and norm layers
     param_groups = misc.get_parameter_groups(model, args.weight_decay)
 
-    # 添加第二阶段参数到优化器
-    if online_stage2_trainer is not None and online_stage2_trainer.enable_stage2:
-        stage2_params = online_stage2_trainer.get_stage2_parameters()
-        if stage2_params:
-            # 为第二阶段参数创建参数组（使用全局学习率，并设置较小的权重衰减）
-            stage2_param_groups = [{
-                'params': stage2_params,
-                'name': 'stage2_params',
-                # 'weight_decay': 5e-5  #TODO: 可调整权重衰减，但是实验表明没有用
-            }]
-
-            param_groups.extend(stage2_param_groups)
-            printer.info(f"Added {len(stage2_params)} Stage2 parameters to optimizer")
-
-    # 如果主模型参数组为空（例如全部冻结），但有stage2参数，仍可创建优化器
+    # 检查是否有可训练参数
     if not param_groups:
         raise ValueError(
             "No trainable parameters found! "
-            "Please check:\n"
-            "1. vggt_freeze_strategy is not freezing all parameters without stage2\n"
-            "2. Stage2 model is properly initialized with trainable parameters\n"
-            f"Stage1 trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad)}\n"
-            f"Stage2 enabled: {online_stage2_trainer is not None and online_stage2_trainer.enable_stage2}"
+            "Please check vggt_freeze_strategy is not freezing all parameters\n"
+            f"Stage1 trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad)}"
         )
 
     printer.info(f"Total parameter groups for optimizer: {len(param_groups)}")
@@ -492,10 +461,6 @@ def train(args):
 
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
     loss_scaler = NativeScaler(accelerator=accelerator)
-    
-    # 设置第二阶段优化器
-    if online_stage2_trainer is not None:
-        online_stage2_trainer.set_optimizer(optimizer)
 
     accelerator.even_batches = True
     optimizer, model, data_loader_train = accelerator.prepare(
@@ -515,35 +480,11 @@ def train(args):
             fname=fname,
             best_so_far=best_so_far,
         )
-        
-        # 保存第二阶段模型状态
-        if online_stage2_trainer is not None and online_stage2_trainer.enable_stage2:
-            if accelerator.is_main_process:
-                output_dir = Path(args.output_dir)
-                if fname is None:
-                    fname = str(epoch)
-                stage2_checkpoint_path = output_dir / ("stage2-checkpoint-%s.pth" % fname)
-                stage2_state = online_stage2_trainer.save_state_dict()
-                misc.save_on_master(accelerator, stage2_state, stage2_checkpoint_path)
-                print(f">> Saving Stage2 model to {stage2_checkpoint_path} ...")
 
     # 加载主模型
     best_so_far = misc.load_model(
         args=args, model_without_ddp=model, optimizer=optimizer, loss_scaler=loss_scaler
     )
-    
-    # 加载第二阶段模型状态
-    if online_stage2_trainer is not None and online_stage2_trainer.enable_stage2 and args.resume is not None:
-        # 构建stage2检查点路径
-        if args.resume.endswith('.pth'):
-            stage2_resume_path = args.resume.replace('checkpoint-', 'stage2-checkpoint-')
-            if os.path.exists(stage2_resume_path):
-                print(f">> Loading Stage2 model from {stage2_resume_path} ...")
-                stage2_checkpoint = torch.load(stage2_resume_path, map_location="cpu")
-                online_stage2_trainer.load_state_dict(stage2_checkpoint)
-                print("Stage2 model loaded successfully")
-            else:
-                print(f"Stage2 checkpoint not found at {stage2_resume_path}, starting Stage2 from scratch")
     if best_so_far is None:
         best_so_far = float("inf")
     log_writer = (
@@ -989,10 +930,7 @@ def train(args):
 
                 if (aggregator_all_rgb_weight > 0 or
                     aggregator_all_depth_weight > 0 or
-                    aggregator_all_lpips_weight > 0) and \
-                   online_stage2_trainer is not None and \
-                   hasattr(online_stage2_trainer, 'dynamic_processor') and \
-                   hasattr(online_stage2_trainer, 'stage2_criterion'):
+                    aggregator_all_lpips_weight > 0):
                     try:
                         # 修复velocity前三行异常 (与Stage2训练逻辑一致). FIXME:
                         # if 'velocity' in preds and preds['velocity'] is not None:
@@ -1014,15 +952,15 @@ def train(args):
                                 gt_extrinsics, gt_intrinsics, image_size_hw, pose_encoding_type="absT_quaR_FoV"
                             )
                             preds_for_dynamic['pose_enc'] = gt_pose_enc
-                            # preds_for_dynamic['velocity'] = preds_for_dynamic['velocity'].detach() 
+                            # preds_for_dynamic['velocity'] = preds_for_dynamic['velocity'].detach()
 
-                        dynamic_objects_data = online_stage2_trainer.dynamic_processor.process_dynamic_objects(
+                        dynamic_objects_data = dynamic_processor.process_dynamic_objects(
                             preds_for_dynamic, vggt_batch, auxiliary_models
                         )
 
                         # 检查是否有有效的动态物体（注意：即使没有动态物体，也要计算静态物体的loss）
                         num_objects = len(dynamic_objects_data['dynamic_objects']) if dynamic_objects_data else 0
-                        has_valid_dynamic = num_objects > 0 and online_stage2_trainer._validate_dynamic_objects(dynamic_objects_data)
+                        has_valid_dynamic = num_objects > 0
 
                         # 无论是否有动态物体，都需要计算loss（因为有静态物体）
                         if dynamic_objects_data is not None:
@@ -1053,7 +991,7 @@ def train(args):
                             sampled_frame_indices = preds.get('sampled_frame_indices', None)  # [num_frames]
 
                             # 使用Stage2的criterion计算loss
-                            aggregator_all_loss_dict = online_stage2_trainer.stage2_criterion(
+                            aggregator_all_loss_dict = stage2_criterion(
                                 refinement_results={'refined_dynamic_objects': dynamic_objects},  # 无refine结果
                                 refined_scene=aggregator_all_scene,
                                 gt_images=gt_images,
@@ -1130,161 +1068,18 @@ def train(args):
                             continue
                         log_writer.add_scalar("train_" + name, val, step)
 
-                # =============== STAGE 2 TRAINING LOGIC ===============
-                # 第二阶段：仅包含渲染损失，用于动态对象精细化
-                stage2_loss = None
-                stage2_loss_dict = {}
-
-                if (online_stage2_trainer is not None and
-                    getattr(args, 'enable_stage2', False) and
-                    epoch >= getattr(args, 'stage2_start_epoch', 10)):
-                    # 【打补丁】修复velocity map前三行的异常高速度问题
-                    # Stage1的VGGT输出的velocity前三行容易出现异常，直接置零
-                    if 'velocity' in preds and preds['velocity'] is not None:
-                        velocity = preds['velocity']  # [B, S, H, W, 3]
-                        if velocity.dim() == 5 and velocity.shape[2] >= 3:
-                            # 将前三行的速度向量置为0 (所有3个分量: vx, vy, vz)
-                            velocity[:, :, :5, :, :] = 0.0  # TODO: 解决丑陋的补丁
-                            # 更新preds（如果velocity不是inplace修改）
-                            preds['velocity'] = velocity
-
-                    # Stage2处理（已内置DDP同步，不会导致卡住）
-                    stage2_loss, stage2_loss_dict = online_stage2_trainer.process_stage1_outputs(
-                        preds=preds,
-                        vggt_batch=vggt_batch,
-                        auxiliary_models=auxiliary_models,
-                        epoch=epoch,
-                        iteration=data_iter_step
-                    )
-
-                    if stage2_loss is not None:
-                        # 第二阶段只包含渲染损失，权重配置
-                        stage2_weight = getattr(args, 'stage2_loss_weight', 0.1)
-
-                        # 注意：第二阶段的损失不加入第一阶段的总损失中
-                        # 因为第二阶段有独立的参数和优化器
-
-                        # 【关键修复】过滤掉skipped的stage2损失，避免零损失影响tensorboard曲线
-                        stage2_skipped = stage2_loss_dict.get('stage2_skipped', False)
-
-                        if not stage2_skipped:
-                            # 只记录有效的（非跳过的）stage2损失
-                            stage2_loss_dict_for_log = {k: v for k, v in stage2_loss_dict.items()
-                                                        if k.startswith('stage2_') and k != 'stage2_skipped'}
-
-                            # 记录到metric_logger和tensorboard
-                            metric_logger.update(**stage2_loss_dict_for_log)
-
-                            if log_writer is not None and accelerator.is_main_process:
-                                step = epoch * len(data_loader_train) + data_iter_step
-                                log_writer.add_scalar("stage2_total_loss", float(stage2_loss), step)
-                                for name, val in stage2_loss_dict_for_log.items():
-                                    if isinstance(val, torch.Tensor) and val.ndim == 0:
-                                        log_writer.add_scalar("train_" + name, val, step)
-                                    elif isinstance(val, (int, float)):
-                                        log_writer.add_scalar("train_" + name, val, step)
-                        else:
-                            # 跳过的stage2损失不记录到tensorboard
-                            if accelerator.is_main_process and data_iter_step % 100 == 0:
-                                printer.info(f"[Iter {data_iter_step}] Stage2 skipped (no dynamic objects or validation failed)")
-
                 # =============== 梯度更新逻辑 ===============
                 loss_value = float(loss)
 
-                # 获取当前训练阶段配置
-                training_stage = getattr(args, 'training_stage', 'stage1')  # 默认第一阶段
-
-                if training_stage == 'stage1':
-                    # ============ 第一阶段训练 ============
-                    # 只更新第一阶段的参数（VGGT主模型）
-                    loss_scaler(
-                        loss,
-                        optimizer,
-                        parameters=model.parameters(),  # 第一阶段使用完整模型参数
-                        update_grad=True,
-                        clip_grad=1.0,
-                    )
-                    optimizer.zero_grad()
-
-                elif training_stage == 'stage2':
-                    # ============ 第二阶段训练 ============
-                    # 只更新第二阶段的参数（refine模型），不更新第一阶段参数
-                    # 【关键修复】DDP同步问题：所有进程都必须调用backward，即使loss为0
-                    if (stage2_loss is not None and
-                        online_stage2_trainer is not None and
-                        online_stage2_trainer.enable_stage2):
-                        stage2_params = online_stage2_trainer.get_stage2_parameters()
-                        if stage2_params:
-                            # 【关键补丁】确保stage2_loss有梯度连接，否则backward会报错
-                            # 检查stage2_loss是否有grad_fn（是否连接到计算图）
-                            if stage2_loss.grad_fn is None and stage2_loss.requires_grad == False:
-                                # 如果没有grad_fn也不需要梯度，说明这是一个detached tensor或常量
-                                # 通过stage2模型参数创建一个有梯度连接的零损失
-                                print(f"[WARNING] stage2_loss has no grad_fn! Creating a gradient-connected version.")
-                                if len(stage2_params) > 0:
-                                    # 使用所有参数的和来建立梯度连接，确保所有参数都能收到梯度
-                                    dummy_loss = sum((p * 0.0).sum() for p in stage2_params)
-                                    stage2_loss = stage2_loss + dummy_loss
-                                else:
-                                    print(f"[ERROR] No stage2_params available to fix gradient!")
-
-                            # 第二阶段使用独立的损失和参数
-                            # 即使stage2_skipped=True（零损失），也必须调用backward保持DDP同步
-                            loss_scaler(
-                                stage2_loss,
-                                optimizer,
-                                parameters=stage2_params,  # 只更新第二阶段refine模型参数
-                                update_grad=True,
-                                clip_grad=1.0,
-                            )
-                            optimizer.zero_grad()
-                        else:
-                            print("Warning: Stage2 enabled but no parameters found for update")
-                    else:
-                        print("Warning: Stage2 training requested but stage2_loss is None")
-
-                elif training_stage == 'joint':
-                    # ============ 联合训练模式 ============
-                    # 同时更新第一阶段和第二阶段参数（如果第二阶段启用）
-                    # 第一阶段参数更新
-                    loss_scaler(
-                        loss,
-                        optimizer,
-                        parameters=model.parameters(),
-                        update_grad=True,
-                        clip_grad=1.0,
-                    )
-                    optimizer.zero_grad()
-
-                    # 第二阶段参数更新（如果启用）
-                    if (stage2_loss is not None and
-                        online_stage2_trainer is not None and
-                        online_stage2_trainer.enable_stage2):
-                        stage2_params = online_stage2_trainer.get_stage2_parameters()
-                        if stage2_params:
-                            loss_scaler(
-                                stage2_loss,
-                                optimizer,
-                                parameters=stage2_params,
-                                update_grad=True,
-                                clip_grad=1.0,
-                            )
-                            optimizer.zero_grad()
-                else:
-                    raise ValueError(f"Unknown training_stage: {training_stage}. Must be 'stage1', 'stage2', or 'joint'")
-
-
-                # 更新最终的损失记录
-                # Stage2模式下使用stage2_loss，否则使用stage1的loss_value
-                if training_stage == 'stage2' and stage2_loss is not None:
-                    final_loss_value = float(stage2_loss)
-                else:
-                    final_loss_value = loss_value
-
-                metric_logger.meters["loss"].update(final_loss_value)
-                if log_writer is not None:
-                    step = epoch * len(data_loader_train) + data_iter_step
-                    log_writer.add_scalar("train_loss_final", final_loss_value, step)
+                # 只有Stage1训练
+                loss_scaler(
+                    loss,
+                    optimizer,
+                    parameters=model.parameters(),
+                    update_grad=True,
+                    clip_grad=1.0,
+                )
+                optimizer.zero_grad()
 
                 # 按照save_freq保存模型
                 if (
@@ -1303,10 +1098,10 @@ def train(args):
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     printer.info("Training time {}".format(total_time_str))
 
-    save_final_model(accelerator, args, args.epochs, model, online_stage2_trainer, best_so_far=best_so_far)
+    save_final_model(accelerator, args, args.epochs, model, best_so_far=best_so_far)
 
 
-def save_final_model(accelerator, args, epoch, model_without_ddp, stage2_trainer=None, best_so_far=None):
+def save_final_model(accelerator, args, epoch, model_without_ddp, best_so_far=None):
     output_dir = Path(args.output_dir)
     checkpoint_path = output_dir / "checkpoint-final.pth"
     to_save = {
@@ -1322,14 +1117,6 @@ def save_final_model(accelerator, args, epoch, model_without_ddp, stage2_trainer
         to_save["best_so_far"] = best_so_far
     printer.info(f">> Saving model to {checkpoint_path} ...")
     misc.save_on_master(accelerator, to_save, checkpoint_path)
-    
-    # 保存第二阶段模型最终状态
-    if stage2_trainer is not None and stage2_trainer.enable_stage2:
-        if accelerator.is_main_process:
-            stage2_final_path = output_dir / "stage2-checkpoint-final.pth"
-            stage2_state = stage2_trainer.save_state_dict()
-            misc.save_on_master(accelerator, stage2_state, stage2_final_path)
-            printer.info(f">> Saving Stage2 final model to {stage2_final_path} ...")
 
 
 def build_dataset(dataset, batch_size, num_workers, accelerator, test=False, fixed_length=False):

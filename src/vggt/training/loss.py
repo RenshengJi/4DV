@@ -999,7 +999,7 @@ def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic,
         pred_depth = render_colors_tensor[..., -1]  # [num_frames_to_render, H, W]
 
         # 计算损失 (only on sampled frames)
-        # 对于depth loss，如果有天空mask��需要排除天空区域
+        # 对于depth loss，如果有天空mask需要排除天空区域
         if sky_masks is not None:
             # 创建非天空区域的mask (only for sampled frames)
             non_sky_mask = ~sky_masks[0, sampled_frame_indices].bool()  # [num_frames_to_render, H, W]

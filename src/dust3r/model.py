@@ -57,19 +57,7 @@ class ARCroco3DStereoOutput(ModelOutput):
     views: Optional[List[Any]] = None
 
 
-def strip_module(state_dict):
-    """
-    Removes the 'module.' prefix from the keys of a state_dict.
-    Args:
-        state_dict (dict): The original state_dict with possible 'module.' prefixes.
-    Returns:
-        OrderedDict: A new state_dict with 'module.' prefixes removed.
-    """
-    new_state_dict = OrderedDict()
-    for k, v in state_dict.items():
-        name = k[7:] if k.startswith("module.") else k
-        new_state_dict[name] = v
-    return new_state_dict
+
 
 
 def load_model(model_path, device, verbose=True):

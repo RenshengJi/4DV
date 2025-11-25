@@ -1,0 +1,20 @@
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.3.1+cu121 
+torchvision==0.18.1+cu121 
+torch_scatter
+cuml-cu12
+numpy
+Pillow
+huggingface_hub
+einops
+safetensors
+accelerate
+opencv-python
+matplotlib
+lpips
+scikit-image
+scikit-learn
+tensorboard
+h5py
+viser
+hydra-core

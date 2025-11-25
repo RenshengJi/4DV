@@ -61,10 +61,10 @@ training_stage: 'stage1'
 lpips_start_iter: 5000                     # LPIPS loss开始计算的iteration
 
 # 1. Self Render Loss (训练gaussian head)
-self_render_weight: 0.0                    # Gaussian参数学习的主要损失 (已弃用，使用下面的分项权重)
+self_render_weight: 0.0                    # Gaussian参数学习的主要损失
 self_render_rgb_weight: 1.0                # RGB损失权重
-self_render_lpips_weight: 0.1              # LPIPS感知损失权重
-self_render_depth_weight: 1.0              # 深度损失权重
+self_render_lpips_weight: 0.0              # LPIPS感知损失权重
+self_render_depth_weight: 0.0              # 深度损失权重
 
 # 2. Flow Loss (训练velocity head)
 flow_loss_weight: 0.0                      # 光流监督velocity学习
@@ -197,6 +197,6 @@ stage2_frequency: 999
 
 # =============== Hydra配置 ===============
 hydra:
-  verbose: True
+  verbose: False
   run:
     dir: ./${save_dir}/${exp_name}
