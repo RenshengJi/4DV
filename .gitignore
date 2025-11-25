@@ -1,7 +1,7 @@
 # Ignore data and ckpts
 *.pth
 *.pt
-data/   
+data   
 src/checkpoints
 config/debug
 results/
