@@ -9,7 +9,7 @@ model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=0)"
 # Gaussian head的output_dim会根据sh_degree自动计算：11 + 3*(sh_degree+1)^2
 # pretrained: model.pt
 # pretrained_velocity: False
-pretrained_velocity: "checkpoints/waymo_stage1_online/fromaggregator_all_lr1e-5_procrustes_area500_velocityconstraint0.05_gtcamera_xyzgrad+fixdbscan+sky+fixepsmetric+noconf/checkpoint-epoch_0_37980.pth"
+pretrained_velocity: "checkpoints/waymo_new/segmetation+degree0+lr5e-5forreusme_resumefrombefore/checkpoint-epoch_0_13020.pth"
 
 # VGGT冻结策略配置
 # 可选值: "none", "encoder", "encoder_frame", "backbone", "backbone_camera", "backbone_pts",
@@ -183,7 +183,7 @@ num_imgs_vis: 4
 # =============== 输出配置 ===============
 save_dir: 'checkpoints/waymo_new'
 # exp_name: 'aggregator_from_scratch'
-exp_name: 'segmetation+degree0+lr5e-5forreusme_resumefrombefore'
+exp_name: 'segmetation+degree0+lr5e-5forreusme_resumefrombefore+fixdepth'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/

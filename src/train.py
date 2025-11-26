@@ -35,7 +35,6 @@ from online_dynamic_processor import OnlineDynamicProcessor
 from vggt.training.stage2_loss import Stage2CompleteLoss
 
 
-sys.path.append(os.path.join(os.path.dirname(__file__), 'sam2'))
 sys.path.append(os.path.join(os.path.dirname(__file__), 'dam2'))
 
 import torch
@@ -176,9 +175,9 @@ def train(args):
 
     # 初始化Stage2损失函数（用于aggregator_all）
     stage2_loss_config = {
-        'rgb_weight': getattr(args, 'stage2_rgb_loss_weight', 0.5),
-        'depth_weight': getattr(args, 'stage2_depth_loss_weight', 0.0),
-        'lpips_weight': getattr(args, 'aggregator_all_render_lpips_weight', 0.0),
+        'rgb_weight': getattr(args, 'aggregator_all_render_rgb_weight', 1.0),
+        'depth_weight': getattr(args, 'aggregator_all_render_depth_weight', 1.0),
+        'lpips_weight': getattr(args, 'aggregator_all_render_lpips_weight', 0.1),
         'render_only_dynamic': getattr(args, 'stage2_render_only_dynamic', False),
         'supervise_only_dynamic': getattr(args, 'stage2_supervise_only_dynamic', False),
         'supervise_middle_frame_only': getattr(args, 'stage2_supervise_middle_frame_only', False),
@@ -222,18 +221,18 @@ def train(args):
         test=False,
         fixed_length=args.fixed_length
     )
-    printer.info("Building test dataset %s", args.test_dataset)
-    data_loader_test = {
-        dataset.split("(")[0]: build_dataset(
-            dataset,
-            args.batch_size,
-            args.num_workers,
-            accelerator=accelerator,
-            test=True,
-            fixed_length=True
-        )
-        for dataset in args.test_dataset.split("+")
-    }
+    # printer.info("Building test dataset %s", args.test_dataset)
+    # data_loader_test = {
+    #     dataset.split("(")[0]: build_dataset(
+    #         dataset,
+    #         args.batch_size,
+    #         args.num_workers,
+    #         accelerator=accelerator,
+    #         test=True,
+    #         fixed_length=True
+    #     )
+    #     for dataset in args.test_dataset.split("+")
+    # }
 
 
     # model
@@ -277,64 +276,13 @@ def train(args):
         del ckpt, checkpoint
     
 
-    # 检查是否使用预处理的SAM掩码
+    # 加载辅助模型
     auxiliary_model_configs = getattr(args, "auxiliary_models", None)
     auxiliary_models = dict()
     if auxiliary_model_configs is not None:
         for model_name, model_config in auxiliary_model_configs.items():
-            # 检查是否是SAM2模型
-            if "SAM2Base" in model_config:
-                # 延迟导入SAM2，避免Hydra冲突
-                try:
-                    from sam2.build_sam import build_sam2
-                    from sam2.modeling.sam2_base import SAM2Base
-                    from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
-                    
-                    # 解析SAM2配置
-                    config_match = re.search(r"config_file\s*=\s*\"([^\"]+)\"", model_config)
-                    path_match = re.search(r"path\s*=\s*\"([^\"]+)\"", model_config)
-                    offload_match = re.search(r"offload\s*=\s*(\"True\"|False)\b", model_config, re.IGNORECASE)
-                    
-                    if config_match and path_match:
-                        config_file = config_match.group(1)
-                        ckpt_path = path_match.group(1)
-                        offload = offload_match.group(1).lower() == "true" if offload_match else False
-                        
-                        # 构建SAM2模型
-                        sam2_model = build_sam2(
-                            config_file=config_file,
-                            ckpt_path=ckpt_path,
-                            device="cpu" if offload else device,
-                            mode="eval"
-                        )
-                        
-                        if not offload:
-                            sam2_model.to(device)
-                        
-                        sam2_model.eval()
-                        sam2_model.requires_grad_(False)
-                        
-                        # 创建SAM2AutomaticMaskGenerator
-                        auxiliary_model = SAM2AutomaticMaskGenerator(
-                            model=sam2_model,
-                            points_per_side=16,
-                            pred_iou_thresh=0.3,
-                            stability_score_thresh=0.95,
-                            mask_threshold=0.0,
-                            box_nms_thresh=0.7,
-                            min_mask_region_area=100,
-                            output_mode="binary_mask"
-                        )
-                        
-                        auxiliary_models[model_name] = auxiliary_model
-                        printer.info(f"successfully load SAM2 automatic mask generator: {model_name}")
-                    else:
-                        printer.warning(f"Missing config_file or path for SAM2 model: {model_name}")
-                except Exception as e:
-                    printer.warning(f"Failed to load SAM2 model {model_name}: {e}")
-                    printer.info("Skipping SAM2 model loading due to error")
             # 检查是否是DAM2模型
-            elif "DepthAnythingV2" in model_config:
+            if "DepthAnythingV2" in model_config:
                 # 延迟导入DAM2，避免Hydra冲突
                 try:
                     # 添加dam2目录到Python路径
@@ -451,7 +399,6 @@ def train(args):
             "Please check vggt_freeze_strategy is not freezing all parameters\n"
             f"Stage1 trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad)}"
         )
-
     printer.info(f"Total parameter groups for optimizer: {len(param_groups)}")
     for i, group in enumerate(param_groups):
         group_name = group.get('name', f'group_{i}')
@@ -461,7 +408,6 @@ def train(args):
 
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
     loss_scaler = NativeScaler(accelerator=accelerator)
-
     accelerator.even_batches = True
     optimizer, model, data_loader_train = accelerator.prepare(
         optimizer, model, data_loader_train
@@ -522,23 +468,17 @@ def train(args):
                         auxiliary_models["dam2"],
                         device=device
                     )
-                
                 # 将sky masks添加到vggt_batch中，供后续使用
                 vggt_batch["sky_masks"] = sky_masks
 
-                # For VGGT model, extract images from vggt_batch
-                if vggt_batch.get("images") is not None:
-                    # Get frame sample ratio from config for aggregator_render_loss
-                    frame_sample_ratio = getattr(args, 'aggregator_frame_sample_ratio', 1.0)
-                    preds = model(
-                        vggt_batch["images"],
-                        gt_extrinsics=vggt_batch.get("extrinsics"),
-                        gt_intrinsics=vggt_batch.get("intrinsics"),
-                        frame_sample_ratio=frame_sample_ratio
-                    )
-                else:
-                    # Fallback for other models
-                    preds = model(batch)
+                # For VGGT model
+                frame_sample_ratio = getattr(args, 'aggregator_frame_sample_ratio', 1.0)
+                preds = model(
+                    vggt_batch["images"],
+                    gt_extrinsics=vggt_batch.get("extrinsics"),
+                    gt_intrinsics=vggt_batch.get("intrinsics"),
+                    frame_sample_ratio=frame_sample_ratio
+                )
 
                 # =============== STAGE 1 TRAINING LOGIC ===============
                 loss = 0.0
@@ -552,7 +492,6 @@ def train(args):
                     'grad_flow_loss_weight': getattr(args, 'grad_flow_loss_weight', 1.0),  # GT flowmap grad损失
                     'reg_flow_loss_weight': getattr(args, 'reg_flow_loss_weight', 1.0),   # GT flowmap reg损失
                     'gt_flow_loss_ours_weight': getattr(args, 'gt_flow_loss_ours_weight', 0.0),  # GT flowmap ours损失
-                    'sam2_velocity_weight': getattr(args, 'sam2_velocity_weight', 1.0),
                     'sky_opacity_weight': getattr(args, 'sky_opacity_weight', 1.0),
                     'sky_color_weight': getattr(args, 'sky_color_weight', 1.0),
                     'velocity_reg_weight': getattr(args, 'velocity_reg_weight', 0.001),
@@ -708,7 +647,7 @@ def train(args):
                         import traceback
                         traceback.print_exc()
 
-                # 3b. GT Flow Loss Ours (我们自己实现的版本)
+                # 3b. GT Flow Loss Ours
                 if loss_weights['gt_flow_loss_ours_weight'] > 0 and \
                    preds.get("velocity") is not None and \
                    vggt_batch.get("flowmap") is not None:
@@ -717,7 +656,6 @@ def train(args):
                             preds["velocity"],
                             vggt_batch
                         )
-
                         gt_flow_ours = gt_flow_loss_ours_dict.get("gt_flow_loss", 0.0)
                         loss += loss_weights['gt_flow_loss_ours_weight'] * gt_flow_ours
 
@@ -730,37 +668,7 @@ def train(args):
                         import traceback
                         traceback.print_exc()
 
-                # 4. SAM2 Velocity Consistency Loss (辅助velocity head监督)
-                if loss_weights['sam2_velocity_weight'] > 0 and vggt_batch.get("images") is not None:
-                    use_preprocessed_sam = getattr(args, "use_preprocessed_sam", False)
-                    try:
-                        if use_preprocessed_sam and vggt_batch.get("sam_masks") is not None:
-                            # 离线模式：使用预处理的SAM掩码
-                            sam2_loss_dict = sam2_velocity_consistency_loss_with_preprocessed_masks(
-                                vggt_batch["images"],
-                                preds["velocity"],
-                                vggt_batch["sam_masks"],
-                                device=device
-                            )
-                        elif "sam2" in auxiliary_models:
-                            # 在线模式：边训练边推理SAM2
-                            sam2_loss_dict = sam2_velocity_consistency_loss(
-                                vggt_batch["images"],
-                                preds["velocity"],
-                                auxiliary_models["sam2"],
-                                device=device
-                            )
-                        else:
-                            sam2_loss_dict = {}
-
-                        sam2_loss_value = sam2_loss_dict.get("sam2_velocity_consistency_loss", 0.0)
-                        if sam2_loss_value > 0:
-                            loss += loss_weights['sam2_velocity_weight'] * sam2_loss_value
-                            loss_dict.update(sam2_loss_dict)
-                    except Exception as e:
-                        print(f"Error in SAM2 velocity loss computation: {e}")
-
-                # 5. Sky Opacity Loss (监督gaussian head的opacity参数)
+                # 4. Sky Opacity Loss (监督gaussian head的opacity参数)
                 if loss_weights['sky_opacity_weight'] > 0 and preds.get("gaussian_params") is not None and sky_masks is not None:
                     try:
                         sky_opacity_loss_dict = sky_opacity_loss(
@@ -774,7 +682,7 @@ def train(args):
                     except Exception as e:
                         print(f"Error in sky opacity loss computation: {e}")
 
-                # 6. Sky Color Loss (监督sky token以及sky head学习)
+                # 5. Sky Color Loss (监督sky token以及sky head学习)
                 if loss_weights['sky_color_weight'] > 0 and preds.get("pred_sky_colors") is not None and sky_masks is not None:
                     try:
                         sky_color_loss_dict = sky_color_loss(
@@ -932,13 +840,6 @@ def train(args):
                     aggregator_all_depth_weight > 0 or
                     aggregator_all_lpips_weight > 0):
                     try:
-                        # 修复velocity前三行异常 (与Stage2训练逻辑一致). FIXME:
-                        # if 'velocity' in preds and preds['velocity'] is not None:
-                        #     velocity = preds['velocity']  # [B, S, H, W, 3]
-                        #     if velocity.dim() == 5 and velocity.shape[2] >= 5:
-                        #         velocity[:, :, :5, :, :] = 0.0
-                        #         preds['velocity'] = velocity
-
                         # Step 1: 处理动态物体 (使用OnlineDynamicProcessor)
                         # 使用GT camera而不是预测的pose_enc
                         preds_for_dynamic = preds.copy()
@@ -1135,575 +1036,6 @@ def build_dataset(dataset, batch_size, num_workers, accelerator, test=False, fix
     return loader
 
 
-def train_one_epoch(
-    model: torch.nn.Module,
-    criterion: torch.nn.Module,
-    data_loader: Sized,
-    optimizer: torch.optim.Optimizer,
-    accelerator: Accelerator,
-    epoch: int,
-    loss_scaler,
-    args,
-    log_writer=None,
-):
-    assert torch.backends.cuda.matmul.allow_tf32 == True
-
-    model.train(True)
-    metric_logger = misc.MetricLogger(delimiter="  ")
-    metric_logger.add_meter("lr", misc.SmoothedValue(window_size=1, fmt="{value:.6f}"))
-    header = "Epoch: [{}]".format(epoch)
-    accum_iter = args.accum_iter
-
-    def save_model(epoch, fname, best_so_far):
-        misc.save_model(
-            accelerator=accelerator,
-            args=args,
-            model_without_ddp=model,
-            optimizer=optimizer,
-            loss_scaler=loss_scaler,
-            epoch=epoch,
-            fname=fname,
-            best_so_far=best_so_far,
-        )
-
-    if log_writer is not None:
-        printer.info("log_dir: {}".format(log_writer.log_dir))
-
-    if hasattr(data_loader, "dataset") and hasattr(data_loader.dataset, "set_epoch"):
-        data_loader.dataset.set_epoch(epoch)
-    if (
-        hasattr(data_loader, "batch_sampler")
-        and hasattr(data_loader.batch_sampler, "batch_sampler")
-        and hasattr(data_loader.batch_sampler.batch_sampler, "set_epoch")
-    ):
-        data_loader.batch_sampler.batch_sampler.set_epoch(epoch)
-
-    optimizer.zero_grad()
-
-    for data_iter_step, batch in enumerate(
-        metric_logger.log_every(data_loader, args.print_freq, accelerator, header)
-    ):
-        with accelerator.accumulate(model):
-            epoch_f = epoch + data_iter_step / len(data_loader)
-            step = int(epoch_f * len(data_loader))
-            # we use a per iteration (instead of per epoch) lr scheduler
-            if data_iter_step % accum_iter == 0:
-                misc.adjust_learning_rate(optimizer, epoch_f, args)
-            if not args.long_context:
-                result = loss_of_one_batch(
-                    batch,
-                    model,
-                    criterion,
-                    accelerator,
-                    symmetrize_batch=False,
-                    use_amp=bool(args.amp),
-                )
-            else:
-                result = loss_of_one_batch_tbptt(
-                    batch,
-                    model,
-                    criterion,
-                    chunk_size=4,
-                    loss_scaler=loss_scaler,
-                    optimizer=optimizer,
-                    accelerator=accelerator,
-                    symmetrize_batch=False,
-                    use_amp=bool(args.amp),
-                )
-            loss, loss_details = result["loss"]  # criterion returns two values
-
-            loss_value = float(loss)
-
-            if not math.isfinite(loss_value):
-                print(
-                    f"Loss is {loss_value}, stopping training, loss details: {loss_details}"
-                )
-                sys.exit(1)
-            if not result.get("already_backprop", False):
-                loss_scaler(
-                    loss,
-                    optimizer,
-                    parameters=model.parameters(),
-                    update_grad=True,
-                    clip_grad=1.0,
-                )
-                optimizer.zero_grad()
-
-            is_metric = batch[0]["is_metric"]
-            curr_num_view = len(batch)
-
-            del loss
-            tb_vis_img = (data_iter_step + 1) % accum_iter == 0 and (
-                (step + 1) % (args.print_img_freq)
-            ) == 0
-            if not tb_vis_img:
-                del batch
-            else:
-                torch.cuda.empty_cache()
-
-            lr = optimizer.param_groups[0]["lr"]
-            metric_logger.update(epoch=epoch_f)
-            metric_logger.update(lr=lr)
-            metric_logger.update(step=step)
-
-            metric_logger.update(loss=loss_value, **loss_details)
-
-            if (data_iter_step + 1) % accum_iter == 0 and (
-                (data_iter_step + 1) % (accum_iter * args.print_freq)
-            ) == 0:
-                loss_value_reduce = accelerator.gather(
-                    torch.tensor(loss_value).to(accelerator.device)
-                ).mean()  # MUST BE EXECUTED BY ALL NODES
-
-                if log_writer is None:
-                    continue
-                """ We use epoch_1000x as the x-axis in tensorboard.
-                This calibrates different curves when batch size changes.
-                """
-                epoch_1000x = int(epoch_f * 1000)
-                log_writer.add_scalar("train_loss", loss_value_reduce, step)
-                log_writer.add_scalar("train_lr", lr, step)
-                log_writer.add_scalar("train_iter", epoch_1000x, step)
-                for name, val in loss_details.items():
-                    if isinstance(val, torch.Tensor):
-                        if val.ndim > 0:
-                            continue
-                    if isinstance(val, dict):
-                        continue
-                    log_writer.add_scalar("train_" + name, val, step)
-
-            if tb_vis_img:
-                if log_writer is None:
-                    continue
-                # with torch.no_grad():
-                #     depths_self, gt_depths_self = get_render_results(
-                #         batch, result["pred"], self_view=True
-                #     )
-                #     depths_cross, gt_depths_cross = get_render_results(
-                #         batch, result["pred"], self_view=False
-                #     )
-                #     for k in range(len(batch)):
-                #         loss_details[f"self_pred_depth_{k+1}"] = (
-                #             depths_self[k].detach().cpu()
-                #         )
-                #         loss_details[f"self_gt_depth_{k+1}"] = (
-                #             gt_depths_self[k].detach().cpu()
-                #         )
-                #         loss_details[f"pred_depth_{k+1}"] = (
-                #             depths_cross[k].detach().cpu()
-                #         )
-                #         loss_details[f"gt_depth_{k+1}"] = (
-                #             gt_depths_cross[k].detach().cpu()
-                #         )
-
-                # imgs_stacked_dict = get_vis_imgs_new(
-                #     loss_details, args.num_imgs_vis, curr_num_view, is_metric=is_metric
-                # )
-                # for name, imgs_stacked in imgs_stacked_dict.items():
-                #     log_writer.add_images(
-                #         "train" + "/" + name, imgs_stacked, step, dataformats="HWC"
-                # )
-                # del batch
-
-        if (
-            data_iter_step % int(args.save_freq * len(data_loader)) == 0
-            and data_iter_step != 0
-            and data_iter_step != len(data_loader) - 1
-        ):
-            print("saving at step", data_iter_step)
-            save_model(epoch - 1, f"epoch_{epoch}_{data_iter_step}", float("inf"))
-
-    # gather the stats from all processes
-    metric_logger.synchronize_between_processes(accelerator)
-    printer.info("Averaged stats: %s", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-
-
-@torch.no_grad()
-def test_one_epoch(
-    model: torch.nn.Module,
-    criterion: torch.nn.Module,
-    data_loader: Sized,
-    accelerator: Accelerator,
-    device: torch.device,
-    epoch: int,
-    args,
-    log_writer=None,
-    prefix="test",
-):
-
-    model.eval()
-    metric_logger = misc.MetricLogger(delimiter="  ")
-    metric_logger.meters = defaultdict(lambda: misc.SmoothedValue(window_size=9**9))
-    header = "Test Epoch: [{}]".format(epoch)
-
-    if log_writer is not None:
-        printer.info("log_dir: {}".format(log_writer.log_dir))
-
-    if hasattr(data_loader, "dataset") and hasattr(data_loader.dataset, "set_epoch"):
-        data_loader.dataset.set_epoch(0)
-    if (
-        hasattr(data_loader, "batch_sampler")
-        and hasattr(data_loader.batch_sampler, "batch_sampler")
-        and hasattr(data_loader.batch_sampler.batch_sampler, "set_epoch")
-    ):
-        data_loader.batch_sampler.batch_sampler.set_epoch(0)
-
-    for _, batch in enumerate(
-        metric_logger.log_every(data_loader, args.print_freq, accelerator, header)
-    ):
-        result = loss_of_one_batch(
-            batch,
-            model,
-            criterion,
-            accelerator,
-            symmetrize_batch=False,
-            use_amp=bool(args.amp),
-        )
-
-        loss_value, loss_details = result["loss"]  # criterion returns two values
-        metric_logger.update(loss=float(loss_value), **loss_details)
-
-    printer.info("Averaged stats: %s", metric_logger)
-
-    aggs = [("avg", "global_avg"), ("med", "median")]
-    results = {
-        f"{k}_{tag}": getattr(meter, attr)
-        for k, meter in metric_logger.meters.items()
-        for tag, attr in aggs
-    }
-
-    if log_writer is not None:
-        for name, val in results.items():
-            if isinstance(val, torch.Tensor):
-                if val.ndim > 0:
-                    continue
-            if isinstance(val, dict):
-                continue
-            log_writer.add_scalar(prefix + "_" + name, val, 1000 * epoch)
-
-        depths_self, gt_depths_self = get_render_results(
-            batch, result["pred"], self_view=True
-        )
-        depths_cross, gt_depths_cross = get_render_results(
-            batch, result["pred"], self_view=False
-        )
-        for k in range(len(batch)):
-            loss_details[f"self_pred_depth_{k+1}"] = depths_self[k].detach().cpu()
-            loss_details[f"self_gt_depth_{k+1}"] = gt_depths_self[k].detach().cpu()
-            loss_details[f"pred_depth_{k+1}"] = depths_cross[k].detach().cpu()
-            loss_details[f"gt_depth_{k+1}"] = gt_depths_cross[k].detach().cpu()
-
-        imgs_stacked_dict = get_vis_imgs_new(
-            loss_details,
-            args.num_imgs_vis,
-            args.num_test_views,
-            is_metric=batch[0]["is_metric"],
-        )
-        for name, imgs_stacked in imgs_stacked_dict.items():
-            log_writer.add_images(
-                prefix + "/" + name, imgs_stacked, 1000 * epoch, dataformats="HWC"
-            )
-
-    del loss_details, loss_value, batch
-    torch.cuda.empty_cache()
-
-    return results
-
-
-def batch_append(original_list, new_list):
-    for sublist, new_item in zip(original_list, new_list):
-        sublist.append(new_item)
-    return original_list
-
-
-def gen_mask_indicator(img_mask_list, ray_mask_list, num_views, h, w):
-    output = []
-    for img_mask, ray_mask in zip(img_mask_list, ray_mask_list):
-        out = torch.zeros((h, w * num_views, 3))
-        for i in range(num_views):
-            if img_mask[i] and not ray_mask[i]:
-                offset = 0
-            elif not img_mask[i] and ray_mask[i]:
-                offset = 1
-            else:
-                offset = 0.5
-            out[:, i * w : (i + 1) * w] += offset
-        output.append(out)
-    return output
-
-
-def vis_and_cat(
-    gt_imgs,
-    pred_imgs,
-    cross_gt_depths,
-    cross_pred_depths,
-    self_gt_depths,
-    self_pred_depths,
-    cross_conf,
-    self_conf,
-    ray_indicator,
-    is_metric,
-):
-    cross_depth_gt_min = torch.quantile(cross_gt_depths, 0.01).item()
-    cross_depth_gt_max = torch.quantile(cross_gt_depths, 0.99).item()
-    cross_depth_pred_min = torch.quantile(cross_pred_depths, 0.01).item()
-    cross_depth_pred_max = torch.quantile(cross_pred_depths, 0.99).item()
-    cross_depth_min = min(cross_depth_gt_min, cross_depth_pred_min)
-    cross_depth_max = max(cross_depth_gt_max, cross_depth_pred_max)
-
-    cross_gt_depths_vis = colorize(
-        cross_gt_depths,
-        range=(
-            (cross_depth_min, cross_depth_max)
-            if is_metric
-            else (cross_depth_gt_min, cross_depth_gt_max)
-        ),
-        append_cbar=True,
-    )
-    cross_pred_depths_vis = colorize(
-        cross_pred_depths,
-        range=(
-            (cross_depth_min, cross_depth_max)
-            if is_metric
-            else (cross_depth_pred_min, cross_depth_pred_max)
-        ),
-        append_cbar=True,
-    )
-
-    self_depth_gt_min = torch.quantile(self_gt_depths, 0.01).item()
-    self_depth_gt_max = torch.quantile(self_gt_depths, 0.99).item()
-    self_depth_pred_min = torch.quantile(self_pred_depths, 0.01).item()
-    self_depth_pred_max = torch.quantile(self_pred_depths, 0.99).item()
-    self_depth_min = min(self_depth_gt_min, self_depth_pred_min)
-    self_depth_max = max(self_depth_gt_max, self_depth_pred_max)
-
-    self_gt_depths_vis = colorize(
-        self_gt_depths,
-        range=(
-            (self_depth_min, self_depth_max)
-            if is_metric
-            else (self_depth_gt_min, self_depth_gt_max)
-        ),
-        append_cbar=True,
-    )
-    self_pred_depths_vis = colorize(
-        self_pred_depths,
-        range=(
-            (self_depth_min, self_depth_max)
-            if is_metric
-            else (self_depth_pred_min, self_depth_pred_max)
-        ),
-        append_cbar=True,
-    )
-    if len(cross_conf) > 0:
-        cross_conf_vis = colorize(cross_conf, append_cbar=True)
-    if len(self_conf) > 0:
-        self_conf_vis = colorize(self_conf, append_cbar=True)
-    gt_imgs_vis = torch.zeros_like(cross_gt_depths_vis)
-    gt_imgs_vis[: gt_imgs.shape[0], : gt_imgs.shape[1]] = gt_imgs
-    pred_imgs_vis = torch.zeros_like(cross_gt_depths_vis)
-    pred_imgs_vis[: pred_imgs.shape[0], : pred_imgs.shape[1]] = pred_imgs
-    ray_indicator_vis = torch.cat(
-        [
-            ray_indicator,
-            torch.zeros(
-                ray_indicator.shape[0],
-                cross_pred_depths_vis.shape[1] - ray_indicator.shape[1],
-                3,
-            ),
-        ],
-        dim=1,
-    )
-    out = torch.cat(
-        [
-            ray_indicator_vis,
-            gt_imgs_vis,
-            pred_imgs_vis,
-            self_gt_depths_vis,
-            self_pred_depths_vis,
-            self_conf_vis,
-            cross_gt_depths_vis,
-            cross_pred_depths_vis,
-            cross_conf_vis,
-        ],
-        dim=0,
-    )
-    return out
-
-
-def get_vis_imgs_new(loss_details, num_imgs_vis, num_views, is_metric):
-    ret_dict = {}
-    gt_img_list = [[] for _ in range(num_imgs_vis)]
-    pred_img_list = [[] for _ in range(num_imgs_vis)]
-
-    cross_gt_depth_list = [[] for _ in range(num_imgs_vis)]
-    cross_pred_depth_list = [[] for _ in range(num_imgs_vis)]
-
-    self_gt_depth_list = [[] for _ in range(num_imgs_vis)]
-    self_pred_depth_list = [[] for _ in range(num_imgs_vis)]
-
-    cross_view_conf_list = [[] for _ in range(num_imgs_vis)]
-    self_view_conf_list = [[] for _ in range(num_imgs_vis)]
-    cross_view_conf_exits = False
-    self_view_conf_exits = False
-
-    img_mask_list = [[] for _ in range(num_imgs_vis)]
-    ray_mask_list = [[] for _ in range(num_imgs_vis)]
-
-    if num_views > 30:
-        stride = 5
-    elif num_views > 20:
-        stride = 3
-    elif num_views > 10:
-        stride = 2
-    else:
-        stride = 1
-    for i in range(0, num_views, stride):
-        gt_imgs = 0.5 * (loss_details[f"gt_img{i+1}"] + 1)[:num_imgs_vis].detach().cpu()
-        width = gt_imgs.shape[2]
-        pred_imgs = (
-            0.5 * (loss_details[f"pred_rgb_{i+1}"] + 1)[:num_imgs_vis].detach().cpu()
-        )
-        gt_img_list = batch_append(gt_img_list, gt_imgs.unbind(dim=0))
-        pred_img_list = batch_append(pred_img_list, pred_imgs.unbind(dim=0))
-
-        cross_pred_depths = (
-            loss_details[f"pred_depth_{i+1}"][:num_imgs_vis].detach().cpu()
-        )
-        cross_gt_depths = (
-            loss_details[f"gt_depth_{i+1}"]
-            .to(gt_imgs.device)[:num_imgs_vis]
-            .detach()
-            .cpu()
-        )
-        cross_pred_depth_list = batch_append(
-            cross_pred_depth_list, cross_pred_depths.unbind(dim=0)
-        )
-        cross_gt_depth_list = batch_append(
-            cross_gt_depth_list, cross_gt_depths.unbind(dim=0)
-        )
-
-        self_gt_depths = (
-            loss_details[f"self_gt_depth_{i+1}"][:num_imgs_vis].detach().cpu()
-        )
-        self_pred_depths = (
-            loss_details[f"self_pred_depth_{i+1}"][:num_imgs_vis].detach().cpu()
-        )
-        self_gt_depth_list = batch_append(
-            self_gt_depth_list, self_gt_depths.unbind(dim=0)
-        )
-        self_pred_depth_list = batch_append(
-            self_pred_depth_list, self_pred_depths.unbind(dim=0)
-        )
-
-        if f"conf_{i+1}" in loss_details:
-            cross_view_conf = loss_details[f"conf_{i+1}"][:num_imgs_vis].detach().cpu()
-            cross_view_conf_list = batch_append(
-                cross_view_conf_list, cross_view_conf.unbind(dim=0)
-            )
-            cross_view_conf_exits = True
-
-        if f"self_conf_{i+1}" in loss_details:
-            self_view_conf = (
-                loss_details[f"self_conf_{i+1}"][:num_imgs_vis].detach().cpu()
-            )
-            self_view_conf_list = batch_append(
-                self_view_conf_list, self_view_conf.unbind(dim=0)
-            )
-            self_view_conf_exits = True
-
-        img_mask_list = batch_append(
-            img_mask_list,
-            loss_details[f"img_mask_{i+1}"][:num_imgs_vis].detach().cpu().unbind(dim=0),
-        )
-        ray_mask_list = batch_append(
-            ray_mask_list,
-            loss_details[f"ray_mask_{i+1}"][:num_imgs_vis].detach().cpu().unbind(dim=0),
-        )
-
-    # each element in the list is [H, num_views * W, (3)], the size of the list is num_imgs_vis
-    gt_img_list = [torch.cat(sublist, dim=1) for sublist in gt_img_list]
-    pred_img_list = [torch.cat(sublist, dim=1) for sublist in pred_img_list]
-    cross_pred_depth_list = [
-        torch.cat(sublist, dim=1) for sublist in cross_pred_depth_list
-    ]
-    cross_gt_depth_list = [torch.cat(sublist, dim=1) for sublist in cross_gt_depth_list]
-    self_gt_depth_list = [torch.cat(sublist, dim=1) for sublist in self_gt_depth_list]
-    self_pred_depth_list = [
-        torch.cat(sublist, dim=1) for sublist in self_pred_depth_list
-    ]
-    cross_view_conf_list = (
-        [torch.cat(sublist, dim=1) for sublist in cross_view_conf_list]
-        if cross_view_conf_exits
-        else []
-    )
-    self_view_conf_list = (
-        [torch.cat(sublist, dim=1) for sublist in self_view_conf_list]
-        if self_view_conf_exits
-        else []
-    )
-    # each elment in the list is [num_views,], the size of the list is num_imgs_vis
-    img_mask_list = [torch.stack(sublist, dim=0) for sublist in img_mask_list]
-    ray_mask_list = [torch.stack(sublist, dim=0) for sublist in ray_mask_list]
-
-    ray_indicator = gen_mask_indicator(
-        img_mask_list, ray_mask_list, len(img_mask_list[0]), 30, width
-    )
-
-    for i in range(num_imgs_vis):
-        out = vis_and_cat(
-            gt_img_list[i],
-            pred_img_list[i],
-            cross_gt_depth_list[i],
-            cross_pred_depth_list[i],
-            self_gt_depth_list[i],
-            self_pred_depth_list[i],
-            cross_view_conf_list[i],
-            self_view_conf_list[i],
-            ray_indicator[i],
-            is_metric[i],
-        )
-        ret_dict[f"imgs_{i}"] = out
-    return ret_dict
-
-
-def sam2_velocity_consistency_loss(images, velocity, sam2_model, device):
-    """
-    Compute velocity consistency loss using SAM2 masks.
-    
-    Args:
-        images: [B, S, 3, H, W] - input images
-        velocity: [B, S, H, W, 3] - predicted velocity
-        sam2_model: SAM2AutomaticMaskGenerator instance
-        device: torch device
-    
-    Returns:
-        dict: loss dictionary containing sam2_velocity_consistency_loss
-    """
-    from vggt.training.loss import sam2_velocity_consistency_loss_impl
-    
-    return sam2_velocity_consistency_loss_impl(images, velocity, sam2_model, device)
-
-
-def sam2_velocity_consistency_loss_with_preprocessed_masks(images, velocity, sam_masks, device):
-    """
-    Compute velocity consistency loss using preprocessed SAM masks.
-    
-    Args:
-        images: [B, S, 3, H, W] - input images
-        velocity: [B, S, H, W, 3] - predicted velocity
-        sam_masks: [B, S, num_masks, H, W] - preprocessed SAM masks
-        device: torch device
-    
-    Returns:
-        dict: loss dictionary containing sam2_velocity_consistency_loss
-    """
-    from vggt.training.loss import sam2_velocity_consistency_loss_with_masks_impl
-    
-    return sam2_velocity_consistency_loss_with_masks_impl(images, velocity, sam_masks, device)
-
-
 def dam2_sky_mask_generation(images, dam2_model, device):
     """
     Generate sky masks using DAM2 depth predictions.
@@ -1773,57 +1105,6 @@ def cut3r_batch_to_vggt(views):
         'flowmap': torch.stack([torch.from_numpy(v['flowmap']).float() if isinstance(v['flowmap'], np.ndarray) else v['flowmap'].float() for v in views], dim=0) if 'flowmap' in views[0] and views[0]['flowmap'] is not None else None,
     }
 
-    # 处理SAM掩码（如果存在）
-    if 'sam_masks' in views[0]:
-        sam_masks_list = []
-        for v in views:
-            if v['sam_masks'] is not None:
-                # 确保SAM掩码是tensor格式
-                if isinstance(v['sam_masks'], np.ndarray):
-                    sam_masks = torch.from_numpy(v['sam_masks']).float()
-                else:
-                    sam_masks = v['sam_masks'].float()
-
-                # 处理形状为 (1, num_mask, h, w) 的情况
-                if sam_masks.dim() == 4 and sam_masks.shape[0] == 1:
-                    sam_masks = sam_masks.squeeze(0)  # 移除batch维度，变成 (num_mask, h, w)
-
-                sam_masks_list.append(sam_masks)
-            else:
-                # 如果没有SAM掩码，创建空的tensor
-                sam_masks_list.append(torch.zeros(0, v['img'].shape[1], v['img'].shape[2]))
-
-        # 找到最大数量的掩码
-        max_num_masks = max(masks.shape[0] for masks in sam_masks_list)
-
-        # 填充到相同数量的掩码
-        padded_sam_masks = []
-        for masks in sam_masks_list:
-            if masks.shape[0] < max_num_masks:
-                # 用零填充
-                padding = torch.zeros(max_num_masks - masks.shape[0], masks.shape[1], masks.shape[2]).to(masks.device)
-                masks = torch.cat([masks, padding], dim=0)
-            padded_sam_masks.append(masks)
-
-        vggt_batch['sam_masks'] = torch.stack(padded_sam_masks, dim=0)  # [S, num_masks, H, W]
-
-    # 处理ground掩码（如果存在）
-    if 'ground_mask' in views[0]:
-        ground_masks_list = []
-        for v in views:
-            if v['ground_mask'] is not None:
-                # 确保ground掩码是tensor格式
-                if isinstance(v['ground_mask'], np.ndarray):
-                    ground_mask = torch.from_numpy(v['ground_mask']).bool()
-                else:
-                    ground_mask = v['ground_mask'].bool()
-                ground_masks_list.append(ground_mask)
-            else:
-                # 如果没有ground掩码，创建全False的mask (没有地面)
-                ground_masks_list.append(torch.zeros(v['img'].shape[1], v['img'].shape[2], dtype=torch.bool))
-
-        vggt_batch['ground_masks'] = torch.stack(ground_masks_list, dim=0)  # [S, H, W]
-
     with tf32_off(), torch.amp.autocast("cuda", enabled=False):
         # 转换world points的坐标系到第一帧相机坐标系
         if vggt_batch['world_points'] is not None:
@@ -1879,16 +1160,6 @@ def cut3r_batch_to_vggt(views):
             # 4维: [S, H, W, C] -> [1, S, H, W, C] (添加batch维度)
             vggt_batch['flowmap'] = vggt_batch['flowmap'].unsqueeze(0).contiguous()
         # 其他维度保持不变
-    
-    # 处理SAM掩码的维度转换
-    if 'sam_masks' in vggt_batch:
-        # 从 [S, num_masks, H, W] 转换为 [B, S, num_masks, H, W]，其中B=1
-        vggt_batch['sam_masks'] = vggt_batch['sam_masks'].unsqueeze(0).contiguous()  # [B, S, num_masks, H, W]
-
-    # 处理ground掩码的维度转换
-    if 'ground_masks' in vggt_batch:
-        # 从 [S, H, W] 转换为 [B, S, H, W]，其中B=1
-        vggt_batch['ground_masks'] = vggt_batch['ground_masks'].unsqueeze(0).contiguous()  # [B, S, H, W]
 
     return vggt_batch
 
