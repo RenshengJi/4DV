@@ -77,19 +77,27 @@ def parse_args():
     parser.add_argument("--velocity_alpha", type=float, default=1.0,
                        help="Weight for pred velocity in fusion (0-1), default 0.5 means 50% each")
 
+    # VGGT模型配置参数
+    parser.add_argument("--sh_degree", type=int, default=0, help="Spherical harmonics degree")
+    parser.add_argument("--use_gs_head", action="store_true", default=True, help="Use DPTGSHead for gaussian_head")
+    parser.add_argument("--use_gs_head_velocity", action="store_true", default=False, help="Use DPTGSHead for velocity_head")
+
     return parser.parse_args()
 
 
-def load_model(model_path, device):
+def load_model(model_path, device, args):
     """加载Stage1模型（参考demo_stage2_inference.py）"""
     print(f"Loading model from: {model_path}")
+    print(f"Model config: sh_degree={args.sh_degree}, use_gs_head={args.use_gs_head}, use_gs_head_velocity={args.use_gs_head_velocity}")
 
     model = VGGT(
         img_size=518,
         patch_size=14,
         embed_dim=1024,
         use_sky_token=True,
-        sh_degree=0
+        sh_degree=args.sh_degree,
+        use_gs_head=args.use_gs_head,
+        use_gs_head_velocity=args.use_gs_head_velocity
     )
 
     checkpoint = torch.load(model_path, map_location="cpu")
@@ -607,8 +615,7 @@ def run_single_inference(model, dataset, dynamic_processor, idx, num_views, devi
 
         pred_velocity = preds.get('velocity', torch.zeros(1, S, H, W, 3, device=device))[0]
 
-        # Apply velocity activation
-        pred_velocity = torch.sign(pred_velocity) * (torch.exp(torch.abs(pred_velocity)) - 1)
+        # velocity已在模型forward中激活，这里直接使用
         pred_velocity = pred_velocity[:, :, :, [2, 0, 1]]
         pred_velocity[:, :, :, 2] = -pred_velocity[:, :, :, 2]
 
@@ -733,7 +740,7 @@ def main():
     # debugpy.wait_for_client()
 
     # Load model and dataset
-    model = load_model(args.model_path, device)
+    model = load_model(args.model_path, device, args)
     dataset = load_dataset(args.seq_dir, args.num_views)
 
     # Create dynamic processor (不传use_gt_camera参数)

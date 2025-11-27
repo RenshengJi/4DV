@@ -13,7 +13,6 @@ from gsplat.rendering import rasterization
 from dust3r.utils.metrics import compute_lpips
 from vggt.utils.pose_enc import extri_intri_to_pose_encoding, pose_encoding_to_extri_intri
 import torch
-import torch_scatter
 import torch.nn as nn
 import torch.nn.functional as F
 from math import ceil, floor
@@ -100,14 +99,14 @@ def velocity_loss(velocity):
     独立的velocity正则化损失函数
 
     Args:
-        velocity: [B, S, H*W, 3] 或 [S, H*W, 3] - 预测的速度场
+        velocity: [B, S, H*W, 3] 或 [S, H*W, 3] - 预测的速度场（已激活）
 
     Returns:
         torch.Tensor: velocity正则化损失
     """
     # velocity regularization loss
     velocity = velocity.reshape(-1, 3)  # [S, H*W, 3]
-    velocity = torch.sign(velocity) * (torch.exp(torch.abs(velocity)) - 1)
+    # velocity已在模型forward中激活，这里直接使用
     velocity_loss = F.l1_loss(velocity, torch.zeros_like(velocity))
     velocity_loss = check_and_fix_inf_nan(velocity_loss, "velocity_loss")
     return velocity_loss
@@ -197,7 +196,7 @@ def cross_render_and_loss(conf, interval, forward_consist_mask, backward_consist
                           image_width, 3)  # [S, H*W, 3]
         velocity = velocity.squeeze(
             0).reshape(-1, image_height * image_width, 3)  # [S, H*W, 3]
-        velocity = torch.sign(velocity) * (torch.exp(torch.abs(velocity)) - 1)
+        # velocity已在模型forward中激活，这里直接使用
         velocity = velocity_local_to_global(
             velocity.reshape(-1, 3), extrinsic_inv).reshape(S, image_height * image_width, 3)
 
@@ -380,8 +379,7 @@ def gt_flow_loss_ours(velocity, vggt_batch):
         # 将velocity reshape为与gt_velocity相同的格式
         velocity = velocity.reshape(B, S, H, W, 3)  # [B, S, H, W, 3]
 
-        # 将预测的velocity从原始输出转换（应用exp变换）
-        velocity = torch.sign(velocity) * (torch.exp(torch.abs(velocity)) - 1)
+        # velocity已在模型forward中激活，这里直接使用
 
         # 只在有GT velocity的位置计算loss
         # 扩展mask以匹配velocity的维度
@@ -465,8 +463,7 @@ def gt_flow_loss(velocity, velocity_conf, vggt_batch, gamma=1.0, alpha=0.2, grad
         else:
             raise ValueError(f"Unexpected velocity shape: {velocity.shape}")
 
-        # 将预测的velocity从原始输出转换（应用exp变换）
-        velocity = torch.sign(velocity) * (torch.exp(torch.abs(velocity)) - 1)
+        # velocity已在模型forward中激活，这里直接使用
 
         # 调用conf_loss函数来计算三个损失
         conf_loss_dict = conf_loss(
@@ -524,9 +521,9 @@ def flow_loss(conf, interval, forward_flow, backward_flow, forward_consist_mask,
         gt_gaussian_means = gt_xyz.reshape(B, S, H, W, 3).permute(
             0, 1, 4, 2, 3).contiguous()
 
-        # 3. 预测的velocity
+        # 3. 预测的velocity（已在模型forward中激活）
         velocity = velocity.reshape(-1, 3)
-        velocity = torch.sign(velocity) * (torch.exp(torch.abs(velocity)) - 1)
+        # velocity已在模型forward中激活，这里直接使用
         velocity = velocity_local_to_global(velocity, extrinsic_inv)
         pred_fwd_vel = velocity.reshape(
             B, S, H, W, 3).permute(0, 1, 4, 2, 3).contiguous()
@@ -714,7 +711,7 @@ def warp_gaussian(flow, mask, gaussian_means, gaussian_vel, T, H, W, direction="
 
 
 
-def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic, gt_rgb, pred_sky_colors=None, sky_masks=None, sampled_frame_indices=None, iteration=0, lpips_start_iter=5000, sh_degree=0):
+def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic, gt_rgb, pred_sky_colors=None, sky_masks=None, sampled_frame_indices=None, sh_degree=0):
     """
     自渲染损失函数：每一帧自己进行渲染与监督，支持天空区域的mask替代
 
@@ -728,8 +725,6 @@ def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic,
         pred_sky_colors: [B, S, H, W, 3] 预测的天空颜色 (可选)
         sky_masks: [B, S, H, W] 天空mask，1表示天空区域 (可选)
         sampled_frame_indices: list 采样的帧索引 (可选，如果为None则渲染所有帧)
-        iteration: int 当前训练iteration (用于控制LPIPS loss启动时机)
-        lpips_start_iter: int LPIPS loss开始计算的iteration (default: 5000)
         sh_degree: int spherical harmonics degree
 
     Returns:
@@ -867,12 +862,9 @@ def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic,
         rgb_loss = F.l1_loss(pred_rgb, gt_colors_sampled)
         rgb_loss = check_and_fix_inf_nan(rgb_loss, "self_rgb_mse")
 
-        # Only compute LPIPS loss after lpips_start_iter
-        if iteration >= lpips_start_iter:
-            lpips_loss = compute_lpips(pred_rgb, gt_colors_sampled).mean()
-            lpips_loss = check_and_fix_inf_nan(lpips_loss, "self_lpips_loss")
-        else:
-            lpips_loss = torch.tensor(0.0, device=gt_rgb.device, requires_grad=True)
+        # Compute LPIPS loss
+        lpips_loss = compute_lpips(pred_rgb, gt_colors_sampled).mean()
+        lpips_loss = check_and_fix_inf_nan(lpips_loss, "self_lpips_loss")
 
         self_loss_dict = {
             "loss_self_render_rgb": rgb_loss,
@@ -1784,8 +1776,7 @@ def aggregator_render_loss(
     gt_extrinsic, gt_intrinsic, gt_rgb, gt_depth, gt_depth_mask=None,
     voxel_size=0.05, gt_scale=1.0,
     sky_colors=None, sampled_frame_indices=None,
-    use_lpips=True, iteration=0, lpips_start_iter=5000,
-    dynamic_threshold=0.1, sh_degree=0
+    use_lpips=True, dynamic_threshold=0.1, sh_degree=0
 ):
     """
     Aggregator Render Loss - 监督gaussian_head, 辅助监督depth和velocity
@@ -1865,10 +1856,9 @@ def aggregator_render_loss(
 
         # Transform velocity to global frame
         velocity_reshaped = velocity_flat.reshape(B * S, H * W, 3)
-        # Apply velocity activation (exp transform)
-        velocity_activated = torch.sign(velocity_reshaped) * (torch.exp(torch.abs(velocity_reshaped)) - 1)
+        # velocity已在模型forward中激活，这里直接使用
         velocity_global_per_frame = velocity_local_to_global(
-            velocity_activated.reshape(-1, 3),
+            velocity_reshaped.reshape(-1, 3),
             extrinsic_inv.view(1, B * S, 4, 4)
         ).reshape(B * S, H * W, 3)  # [BS, H*W, 3]
 
@@ -2075,9 +2065,9 @@ def aggregator_render_loss(
         else:
             depth_loss = F.l1_loss(render_depths, gt_depths_stack)
 
-        # LPIPS loss - Only compute after lpips_start_iter
+        # LPIPS loss
         lpips_loss = torch.tensor(0.0, device=device)
-        if use_lpips and iteration >= lpips_start_iter:
+        if use_lpips:
             lpips_loss = compute_lpips(render_colors, gt_colors_stack).mean()
 
         return {

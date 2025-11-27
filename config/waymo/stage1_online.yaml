@@ -4,15 +4,24 @@
 # debug: true
 
 # =============== 模型配置 ===============
-model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=0, use_gs_head=True)"
+model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=0, use_gs_head=True, use_gs_head_velocity=False)"
 # sh_degree: 球谐函数的阶数（0=只有DC分量3个参数，1=DC+方向性12个参数，2=27个参数，3=48个参数）
-# use_gs_head: 是否使用DPTGSHead (True=DPTGSHead, False=DPTHead)
-#   - True: 使用DPTGSHead for gaussian_head and velocity_head (默认)
-#   - False: 使用普通DPTHead for gaussian_head and velocity_head
+# use_gs_head: 是否对gaussian_head使用DPTGSHead (True=DPTGSHead, False=DPTHead)
+#   - True: gaussian_head使用DPTGSHead (默认)
+#   - False: gaussian_head使用普通DPTHead
+# use_gs_head_velocity: 是否对velocity_head使用DPTGSHead (True=DPTGSHead, False=DPTHead)
+#   - True: velocity_head使用DPTGSHead
+#   - False: velocity_head使用普通DPTHead (默认)
 # Gaussian head的output_dim会根据sh_degree自动计算：11 + 3*(sh_degree+1)^2
-# pretrained: model.pt
-# pretrained_velocity: False
-pretrained_velocity: "checkpoints/waymo_new/segmetation+degree0+lr5e-5forreusme_resumefrombefore/checkpoint-epoch_0_13020.pth"
+
+# 相机参数配置
+use_gt_camera: True  # 是否在模型forward中使用GT相机参数来计算world_points
+                      # True: 使用GT的extrinsics和intrinsics (默认)
+                      # False: 使用模型预测的pose_enc
+
+pretrained: model.pt
+pretrained_velocity: False
+# pretrained_velocity: "checkpoints/waymo_new/segmetation+degree0+lr5e-5forreusme_resumefrombefore/checkpoint-epoch_0_13020.pth"
 
 # VGGT冻结策略配置
 # 可选值: "none", "encoder", "encoder_frame", "backbone", "backbone_camera", "backbone_pts",
@@ -52,16 +61,8 @@ num_test_views: 16
 n_corres_train: 0
 n_corres_test: 0
 
-# =============== 训练阶段配置 ===============
-# 'stage1': 第一阶段训练 - 训练VGGT主模型的gaussian head, velocity head等
-# 'stage2': 第二阶段训练 - 只训练refine模型，包含渲染损失
-# 'joint': 联合训练模式 - 同时训练两个阶段（实验性）
-training_stage: 'stage1'
-
 # =============== 第一阶段损失权重配置 ===============
 # 权重为0则完全不计算该损失
-
-lpips_start_iter: 5000                     # LPIPS loss开始计算的iteration
 
 # 1. Self Render Loss (训练gaussian head)
 self_render_weight: 0.0                    # Gaussian参数学习的主要损失
@@ -119,7 +120,7 @@ aggregator_frame_sample_ratio: 1.0         # Aggregator渲染时的帧采样比�
 
 # 13. Aggregator_all Render Loss (代替Stage2 refine网络的渲染loss)
 # 这个loss直接在Stage1中使用动态物体处理+渲染监督,跳过Stage2的refine网络
-# 需要enable_stage2=true才能使用(需要OnlineDynamicProcessor和Stage2Loss)
+aggregator_all_start_iter: 10000           # Aggregator_all loss开始计算的iteration (默认50k)
 aggregator_all_render_rgb_weight: 1.0      # Aggregator_all RGB渲染损失权重
 aggregator_all_render_depth_weight: 1.0    # Aggregator_all depth渲染损失权重
 aggregator_all_render_lpips_weight: 0.1    # Aggregator_all LPIPS渲染损失权重
@@ -142,7 +143,7 @@ velocity_transform_mode: "procrustes"          # velocity变换模式: "simple"(
 
 allow_repeat: False
 
-train_dataset: Waymo_Multi(allow_repeat=${allow_repeat}, split=None,
+train_dataset: 2 * Waymo_Multi(allow_repeat=${allow_repeat}, split=None,
   ROOT="../data/waymo/train_full",
   img_ray_mask_p=[1.0, 0.0, 0.0], valid_camera_id_list=["1", "2", "3"],
   aug_crop=0, resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], transform=ImgNorm,
@@ -158,10 +159,10 @@ seed: 0
 batch_size: 1
 accum_iter: 4
 gradient_checkpointing: True
-epochs: 2
+epochs: 1
 start_epoch: 0
 weight_decay: 0.05
-lr: 5e-5
+lr: 1e-4
 min_lr: 1e-8
 warmup_epochs: 0.02
 amp: 1
@@ -184,19 +185,12 @@ print_img_freq: 50000000
 num_imgs_vis: 4
 
 # =============== 输出配置 ===============
-save_dir: 'checkpoints/waymo_new'
+save_dir: 'checkpoints/new'
 # exp_name: 'aggregator_from_scratch'
-exp_name: 'segmetation+degree0+lr5e-5forreusme_resumefrombefore+fixdepth'
+exp_name: 'start'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/
-
-# =============== 第二阶段配置 ===============
-# 注意：如果使用 aggregator_all_render loss，需要设置 enable_stage2: true
-# 但保持 training_stage: 'stage1'，这样只初始化动态处理器和loss，不训练refine网络
-enable_stage2: false                       # 设为true以启用aggregator_all loss
-stage2_start_epoch: 999                    # 设置很大的值以禁用Stage2训练
-stage2_frequency: 999
 
 # =============== Hydra配置 ===============
 hydra:

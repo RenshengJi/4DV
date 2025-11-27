@@ -80,19 +80,27 @@ def parse_args():
     parser.add_argument("--tracking_velocity_threshold", type=float, default=0.2,
                        help="Velocity threshold for tracking")
 
+    # VGGT模型配置参数
+    parser.add_argument("--sh_degree", type=int, default=0, help="Spherical harmonics degree")
+    parser.add_argument("--use_gs_head", action="store_true", default=True, help="Use DPTGSHead for gaussian_head")
+    parser.add_argument("--use_gs_head_velocity", action="store_true", default=False, help="Use DPTGSHead for velocity_head")
+
     return parser.parse_args()
 
 
-def load_model(model_path, device):
+def load_model(model_path, device, args):
     """加载Stage1模型"""
     print(f"Loading model from: {model_path}")
+    print(f"Model config: sh_degree={args.sh_degree}, use_gs_head={args.use_gs_head}, use_gs_head_velocity={args.use_gs_head_velocity}")
 
     model = VGGT(
         img_size=518,
         patch_size=14,
         embed_dim=1024,
         use_sky_token=True,
-        sh_degree=0
+        sh_degree=args.sh_degree,
+        use_gs_head=args.use_gs_head,
+        use_gs_head_velocity=args.use_gs_head_velocity
     )
 
     checkpoint = torch.load(model_path, map_location="cpu")
@@ -492,8 +500,23 @@ def run_single_inference(model, dataset, dynamic_processor, idx, num_views, devi
         if sky_colors is not None:
             sky_colors = sky_colors[0]  # [num_sampled, 3, H, W]
 
+        # 获取GT的scale factor,将metric尺度的translation_offset转换到非metric尺度
+        # vggt_batch['depth_scale_factor'] = 1 / dist_avg，用于将metric尺度归一化
+        # 因此要从非metric转到metric需要除以scale_factor，从metric转到非metric需要乘以scale_factor
+        depth_scale_factor = vggt_batch.get('depth_scale_factor', None)
+
+        if depth_scale_factor is not None:
+            # 用户提供的translation_offset是metric尺度(米)
+            # 需要转换到预测的非metric尺度
+            offset = args.translation_offset * depth_scale_factor.item()
+            print(f"[Scale Info] GT depth_scale_factor: {depth_scale_factor.item():.6f}")
+            print(f"[Scale Info] Metric translation offset: {args.translation_offset:.3f}m")
+            print(f"[Scale Info] Non-metric translation offset: {offset:.6f}")
+        else:
+            offset = args.translation_offset
+            print(f"[Warning] No depth_scale_factor found, using translation_offset directly: {offset:.3f}")
+
         # 定义9个视角的相机偏移 (使用OpenCV坐标系: X=右, Y=下, Z=前)
-        offset = args.translation_offset
         camera_offsets = {
             'up_left':    (-offset, -offset, 0.0),   # 左上 (X负=左, Y负=上)
             'up':         (0.0, -offset, 0.0),       # 上 (Y负=上)
@@ -596,7 +619,7 @@ def main():
     print(f"Using device: {device}\n")
 
     # Load model and dataset
-    model = load_model(args.model_path, device)
+    model = load_model(args.model_path, device, args)
     dataset = load_dataset(args.seq_dir, args.num_views)
 
     # Create dynamic processor

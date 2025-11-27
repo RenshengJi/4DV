@@ -38,6 +38,7 @@ CUDA_VISIBLE_DEVICES=0 /opt/miniconda/envs/vggt/bin/python inference.py \
     --seq_dir "data/waymo/train_full/" \
     --output_dir "./results/no_conf" \
     --device cuda --num_views 8 --fps 10 \
+    --sh_degree 0 --use_gs_head --use_gs_head_velocity \
     --use_velocity_based_transform --velocity_transform_mode procrustes --use_gt_camera \
     --velocity_threshold 0.1 --clustering_eps 0.3 --clustering_min_samples 10 \
     --min_object_size 500 --tracking_position_threshold 2.0 --tracking_velocity_threshold 0.2 \
@@ -61,7 +62,8 @@ CUDA_VISIBLE_DEVICES=0 /opt/miniconda/envs/vggt/bin/python inference_nvs.py \
     --seq_dir "data/waymo/train_full/" \
     --output_dir "./results/nvs_no_Conf" \
     --device cuda --num_views 8 --fps 10 \
-    --translation_offset 0.1 \
+    --sh_degree 0 --use_gs_head --use_gs_head_velocity \
+    --translation_offset 3 \
     --use_velocity_based_transform --velocity_transform_mode procrustes --use_gt_camera \
     --velocity_threshold 0.1 --clustering_eps 0.3 --clustering_min_samples 10 \
     --min_object_size 500 --tracking_position_threshold 2.0 --tracking_velocity_threshold 0.2 \
@@ -74,9 +76,25 @@ CUDA_VISIBLE_DEVICES=0 /opt/miniconda/envs/vggt/bin/python inference_nvs.py \
 |------|------|--------|
 | `--start_idx / --end_idx / --step` | 批量推理的帧范围和步长 | 100 / 100000 / 100 |
 | `--idx` | 单帧推理的帧索引 | - |
+| `--sh_degree` | 球谐函数阶数 (0/1/2/3) | 0 |
+| `--use_gs_head` | gaussian_head 使用 DPTGSHead | True |
+| `--use_gs_head_velocity` | velocity_head 使用 DPTGSHead | False |
 | `--velocity_transform_mode` | 速度变换模式：`simple` 或 `procrustes` | procrustes |
 | `--translation_offset` | NVS相机平移偏移量(米) | 0.1 |
 | `--velocity_threshold` | 动态物体速度阈值 | 0.1 |
 | `--clustering_eps` | DBSCAN聚类距离阈值(米) | 0.3 |
 | `--min_object_size` | 最小物体点数 | 500 |
 | `--tracking_position_threshold` | 跟踪位置阈值 | 2.0 |
+
+**VGGT模型配置参数说明：**
+- `--sh_degree`: 球谐函数阶数，控制颜色表示的复杂度
+  - 0: 只有DC分量 (3个参数)
+  - 1: DC + 方向性 (12个参数)
+  - 2: 27个参数
+  - 3: 48个参数
+- `--use_gs_head`: 控制 gaussian_head 使用的网络架构
+  - True: 使用 DPTGSHead (默认)
+  - False: 使用 DPTHead
+- `--use_gs_head_velocity`: 控制 velocity_head 使用的网络架构
+  - True: 使用 DPTGSHead
+  - False: 使用 DPTHead (默认)

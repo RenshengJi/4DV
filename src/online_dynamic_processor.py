@@ -24,7 +24,6 @@ from collections import defaultdict
 import sys
 import os
 from cuml.cluster import DBSCAN
-# from sklearn.cluster import DBSCAN as SklearnDBSCAN
 import cupy as cp
 from scipy.optimize import linear_sum_assignment
 
@@ -595,8 +594,6 @@ class OnlineDynamicProcessor:
             # ========== Stage 1: 数据预处理 ==========
             preprocessing_start = time.time()
             preds = self._preprocess_predictions(preds, vggt_batch, images, B, S, H, W)
-            velocity = preds.get('velocity')
-            gaussian_params = preds.get('gaussian_params')
 
             # 保存sh_degree和gaussian_output_dim到实例变量，供其他方法使用
             self.sh_degree = preds.get('sh_degree', 0)
@@ -607,7 +604,7 @@ class OnlineDynamicProcessor:
 
             # ========== Stage 2: 聚类 + 背景分离 ==========
             clustering_start = time.time()
-            clustering_results = self._perform_clustering_with_existing_method(preds, vggt_batch, velocity)
+            clustering_results = self._perform_clustering_with_existing_method(preds, vggt_batch)
             static_gaussians = self._create_static_background_from_labels(preds, clustering_results, H, W, S, sky_masks)
             stage_times['clustering_background'] = time.time() - clustering_start
 
@@ -623,7 +620,7 @@ class OnlineDynamicProcessor:
             # ========== Stage 4: 动态物体聚合 ==========
             aggregation_start = time.time()
             dynamic_objects = self._aggregate_dynamic_objects(
-                matched_clustering_results, preds, vggt_batch, gaussian_params, H, W
+                matched_clustering_results, preds, vggt_batch, H, W
             )
             stage_times['aggregation'] = time.time() - aggregation_start
 
@@ -664,44 +661,6 @@ class OnlineDynamicProcessor:
         sh_dim = 3 * ((sh_degree + 1) ** 2)
         gaussian_output_dim = 11 + sh_dim  # xyz(3) + scale(3) + sh(sh_dim) + rotation(4) + opacity(1)
 
-        # 获取相机参数（一次性获取，避免重复计算）
-        extrinsics, intrinsics = None, None
-        if 'pose_enc' in preds:
-            from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-            extrinsics, intrinsics = pose_encoding_to_extri_intri(
-                preds["pose_enc"], images.shape[-2:]
-            )
-            # 添加齐次坐标行
-            extrinsics = torch.cat([
-                extrinsics,
-                torch.tensor([0, 0, 0, 1], device=extrinsics.device)[
-                    None, None, None, :].repeat(1, extrinsics.shape[1], 1, 1)
-            ], dim=-2)
-
-        # 处理velocity
-        velocity = preds.get('velocity')
-        if velocity is not None:
-            velocity_processed = torch.sign(velocity) * (torch.exp(torch.abs(velocity)) - 1)
-
-            # 转换到全局坐标系
-            if extrinsics is not None:
-                from vggt.training.loss import velocity_local_to_global
-                extrinsic_inv = torch.linalg.inv(extrinsics)
-
-                if len(velocity_processed.shape) == 5:  # [B, S, H, W, 3]
-                    B_v, S_v, H_v, W_v, _ = velocity_processed.shape
-                    velocity_flat = velocity_processed.reshape(B_v, S_v * H_v * W_v, 3)
-
-                    velocity_transformed = []
-                    for b in range(B_v):
-                        vel_b = velocity_flat[b].reshape(-1, 3)
-                        vel_transformed = velocity_local_to_global(vel_b, extrinsic_inv[b:b+1])
-                        velocity_transformed.append(vel_transformed.reshape(S_v, H_v, W_v, 3))
-
-                    velocity_processed = torch.stack(velocity_transformed, dim=0)
-
-            preds_updated['velocity'] = velocity_processed
-
         # 处理gaussian参数
         gaussian_params = preds.get('gaussian_params')
         if gaussian_params is not None:
@@ -713,26 +672,10 @@ class OnlineDynamicProcessor:
             else:
                 gaussian_params_reshaped = gaussian_params.reshape(S, H * W, gaussian_output_dim)
 
-            # 用depth计算的3D坐标替换前三维
-            depth_data = preds.get('depth')
-            if depth_data is not None and extrinsics is not None:
-                try:
-                    from vggt.training.loss import depth_to_world_points
-
-                    depth_for_points = depth_data.reshape(B*S, H, W, 1)
-                    world_points = depth_to_world_points(depth_for_points, intrinsics)
-                    world_points = world_points.reshape(world_points.shape[0], -1, 3)
-
-                    extrinsic_inv = torch.linalg.inv(extrinsics)
-                    xyz_camera = torch.matmul(
-                        extrinsic_inv[0, :, :3, :3],
-                        world_points.transpose(-1, -2)
-                    ).transpose(-1, -2) + extrinsic_inv[0, :, :3, 3:4].transpose(-1, -2)
-                    xyz_camera = xyz_camera.reshape(S, H * W, 3)
-
-                    gaussian_params_reshaped[:, :, :3] = xyz_camera
-                except:
-                    pass  # 静默失败
+            # 用vggt.py中计算的xyz_camera替换前三维（避免重复计算）
+            if 'xyz_camera' in preds:
+                xyz_camera = preds['xyz_camera'][0]  # [S, H*W, 3]
+                gaussian_params_reshaped[:, :, :3] = xyz_camera
 
             preds_updated['gaussian_params'] = gaussian_params_reshaped.unsqueeze(0).reshape(B, S * H * W, gaussian_output_dim)
 
@@ -743,7 +686,6 @@ class OnlineDynamicProcessor:
         matched_clustering_results: List[Dict],
         preds: Dict[str, Any],
         vggt_batch: Dict[str, Any],
-        gaussian_params: torch.Tensor,
         H: int, W: int
     ) -> List[Dict]:
         """聚合动态物体（必须使用光流聚合）"""
@@ -768,74 +710,42 @@ class OnlineDynamicProcessor:
     def _perform_clustering_with_existing_method(
         self,
         preds: Dict[str, Any],
-        vggt_batch: Dict[str, Any],
-        velocity: Optional[torch.Tensor]
+        vggt_batch: Dict[str, Any]
     ) -> List[Dict]:
         """使用demo_video_with_pointcloud_save.py中的聚类方法"""
         try:
-            # 从VGGT预测结果中提取点云坐标
-            if 'depth' in preds and 'pose_enc' in preds:
-                # 使用预测的相机参数（与demo一致）
-                from vggt.training.loss import depth_to_world_points, velocity_local_to_global
-                from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+            # 从preds中获取velocity_global（已经在vggt.py中计算并转换到全局坐标系）
+            velocity_global = preds.get('velocity_global')
 
-                depths = preds['depth']  # 可能是 [B, S, H, W] 或 [S, H, W, 1]
-                # 获取预测的相机参数
-                pose_result = pose_encoding_to_extri_intri(
-                    preds["pose_enc"], vggt_batch["images"].shape[-2:]
-                )
-                if len(pose_result) != 2:
-                    raise ValueError(
-                        f"pose_encoding_to_extri_intri returned {len(pose_result)} values, expected 2")
-                extrinsics, intrinsics = pose_result
-                # 添加齐次坐标行
-                extrinsics = torch.cat([
-                    extrinsics,
-                    torch.tensor([0, 0, 0, 1], device=extrinsics.device)[
-                        None, None, None, :].repeat(1, extrinsics.shape[1], 1, 1)
-                ], dim=-2)
-
-                # 统一depth格式为 [B, S, H, W]
-                depths = depths.squeeze(-1) if depths.shape[-1] == 1 else depths
-                if depths.ndim == 3:  # [S, H, W] -> [B, S, H, W]
-                    depths = depths.unsqueeze(0)
-                if depths.ndim != 4:
-                    raise ValueError(f"Unexpected depth shape: {depths.shape}, expected 4D after normalization")
-                B, S, H, W = depths.shape
-
-                # 计算世界坐标点云
-                # 先添加最后一个维度到depth以匹配函数期望的[N, H, W, 1]格式
-                depth_with_dim = depths.reshape(B*S, H, W, 1)  # [B*S, H, W, 1]
-                xyz_world = depth_to_world_points(
-                    depth_with_dim,
-                    intrinsics.reshape(B*S, 3, 3)
-                )  # [B*S, H*W, 3]
-
-                # 重新整形为 [B, S, H*W, 3]
-                xyz_world = xyz_world.reshape(B, S, H*W, 3)
-
-                # 转换到相机坐标系（与demo一致）
-                extrinsic_inv = torch.linalg.inv(extrinsics)  # [B, S, 4, 4]
-                xyz_world_flat = xyz_world[0]  # [S, H*W, 3]
-                # 使用第一个batch的extrinsic_inv进行坐标变换
-                extrinsic_inv_first = extrinsic_inv[0]  # [S, 4, 4]
-                xyz = torch.matmul(extrinsic_inv_first[:, :3, :3], xyz_world_flat.transpose(-1, -2)).transpose(-1, -2) + \
-                    extrinsic_inv_first[:, :3,
-                                        3:4].transpose(-1, -2)  # [S, H*W, 3]
-
+            # 使用vggt.py中已计算的xyz_camera（避免重复计算）
+            if 'xyz_camera' in preds:
+                # 使用已计算的camera坐标系xyz [B, S, H*W, 3]
+                xyz_camera = preds['xyz_camera']
+                xyz = xyz_camera[0]  # [S, H*W, 3]
+                B, S = xyz_camera.shape[0], xyz_camera.shape[1]
+                H_W = xyz.shape[1]
+                # 从world_points推断H和W
+                if 'world_points' in preds:
+                    world_points_shape = preds['world_points'].shape  # [B, S, H, W, 3]
+                    H, W = world_points_shape[2], world_points_shape[3]
+                else:
+                    # 根据H*W推断H和W（假设H和W接近）
+                    import math
+                    H = W = int(math.sqrt(H_W))
             else:
-                B, S = velocity.shape[0], velocity.shape[1] if velocity is not None else 4
+                # 如果xyz_camera不存在，使用默认值
+                B, S = velocity_global.shape[0], velocity_global.shape[1] if velocity_global is not None else 4
                 H, W = 224, 224  # 默认尺寸
                 xyz = torch.zeros(S, H*W, 3, device=self.device)
 
-            # 统一velocity格式为 [S, H*W, 3]（取第一个batch）
-            if velocity is not None:
-                velocity_reshaped = velocity[0]  # [S, ...]
+            # 统一velocity_global格式为 [S, H*W, 3]（取第一个batch）
+            if velocity_global is not None:
+                velocity_reshaped = velocity_global[0]  # [S, ...]
                 if velocity_reshaped.ndim == 4:  # [S, H, W, 3] -> [S, H*W, 3]
                     velocity_reshaped = velocity_reshaped.reshape(velocity_reshaped.shape[0], -1, 3)
                 if velocity_reshaped.ndim != 3 or velocity_reshaped.shape[-1] != 3:
-                    raise ValueError(f"Unexpected velocity shape: {velocity.shape}")
-                # 注意：速度后处理和坐标变换已经在process_dynamic_objects开头完成
+                    raise ValueError(f"Unexpected velocity_global shape: {velocity_global.shape}")
+                # 注意：速度激活和坐标变换已经在vggt.py的forward中完成
             else:
                 velocity_reshaped = torch.zeros(S, H*W, 3, device=self.device)
 
@@ -1214,111 +1124,6 @@ class OnlineDynamicProcessor:
                 'object_id') or aggregated_object.get('global_id')
         return self._points_to_gaussian_params_fallback(points, object_id)
 
-    def _points_to_gaussian_params_correct(self, aggregated_object, preds, clustering_results, global_id) -> Optional[torch.Tensor]:
-        """正确的方法：通过像素索引直接对应Gaussian参数，而不是空间最近邻匹配"""
-        try:
-            if preds is None or 'gaussian_params' not in preds:
-                return None
-
-            gaussian_params = preds['gaussian_params']  # [B, S*H*W, 14]
-
-            # 从aggregated_object中获取参考帧信息
-            reference_frame = aggregated_object.get('middle_frame', 0)
-            aggregated_points = aggregated_object.get('aggregated_points', [])
-
-            if len(aggregated_points) == 0:
-                return None
-
-            # 从clustering_results中找到对应参考帧的聚类结果
-            # 注意：clustering_results的索引可能与frame_idx不同
-            reference_clustering = None
-
-
-            # 方法1: 直接通过frame_idx匹配
-            for result in clustering_results:
-                frame_idx = result.get('frame_idx')
-                if frame_idx == reference_frame:
-                    reference_clustering = result
-                    break
-
-            # 方法2: 如果没找到，尝试通过索引匹配（reference_frame可能是相对索引）
-            if reference_clustering is None and 0 <= reference_frame < len(clustering_results):
-                reference_clustering = clustering_results[reference_frame]
-
-            if reference_clustering is None:
-                return self._points_to_gaussian_params_fallback(aggregated_points, global_id)
-
-            # 获取该物体在参考帧中的像素索引
-            global_ids = reference_clustering.get('global_ids', [])
-            cluster_indices = reference_clustering.get('cluster_indices', [])
-
-            # 找到属于该global_id的像素索引
-            # cluster_indices是一个list of lists，每个元素是一个聚类的像素索引列表
-            object_pixel_indices = []
-            for i, gid in enumerate(global_ids):
-                if gid == global_id:
-                    # cluster_indices[i] 是该聚类的所有像素索引列表
-                    if i < len(cluster_indices):
-                        object_pixel_indices.extend(cluster_indices[i])
-
-            if len(object_pixel_indices) == 0:
-                return self._points_to_gaussian_params_fallback(aggregated_points, global_id)
-
-
-            # 直接通过像素索引提取对应的Gaussian参数
-            B, N_total, feature_dim = gaussian_params.shape
-
-            # gaussian_params的形状是 [B, S*H*W, 14]，我们需要计算正确的全局索引
-            # cluster_indices中的像素索引是相对于单帧的（0到H*W-1），需要转换为全局索引
-
-            # 首先，我们需要推断H, W和S
-            # 从clustering_results推断出H*W
-            H_W = len(reference_clustering.get('points', []))
-            if H_W == 0:
-                return self._points_to_gaussian_params_fallback(aggregated_points, global_id)
-
-            # 从N_total和H_W推断S
-            S = N_total // H_W if H_W > 0 else 1
-
-            selected_gaussians_list = []
-
-            for pixel_idx in object_pixel_indices:
-                # 计算在全局flatten结构中的索引
-                # 全局索引 = reference_frame * H*W + pixel_idx
-                global_idx = reference_frame * H_W + pixel_idx
-
-                if 0 <= global_idx < N_total:
-                    selected_gaussians_list.append(
-                        gaussian_params[0, global_idx])  # 使用batch=0
-                else:
-                    pass  # 索引超出范围，跳过
-
-            if len(selected_gaussians_list) == 0:
-                return self._points_to_gaussian_params_fallback(aggregated_points, global_id)
-
-            selected_gaussians = torch.stack(
-                selected_gaussians_list, dim=0)  # [N, 14]
-
-            # 激活Gaussian参数
-            selected_gaussians = self._apply_gaussian_activation(
-                selected_gaussians)
-
-            # 使用聚合后的点云位置替换Gaussian的位置参数
-            points_tensor = torch.from_numpy(
-                aggregated_points).to(self.device).float()
-
-            # 如果点数不匹配，取较小的数量
-            min_count = min(len(selected_gaussians), len(points_tensor))
-            selected_gaussians = selected_gaussians[:min_count]
-            points_tensor = points_tensor[:min_count]
-
-            selected_gaussians[:, :3] = points_tensor[:, :3]
-
-
-            return selected_gaussians
-
-        except Exception as e:
-            return self._points_to_gaussian_params_fallback(aggregated_object.get('aggregated_points', []), global_id)
 
     def _extract_gaussian_params_from_preds(self, points, preds, aggregated_colors=None) -> Optional[torch.Tensor]:
         """从VGGT预测中提取对应点云的真实Gaussian参数，优先使用聚合颜色"""

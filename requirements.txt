@@ -1,7 +1,6 @@
 --extra-index-url https://download.pytorch.org/whl/cu121
 torch==2.3.1+cu121 
 torchvision==0.18.1+cu121 
-torch_scatter
 cuml-cu12
 numpy
 Pillow
@@ -19,3 +18,4 @@ h5py
 viser
 hydra-core
 imageio-ffmpeg
+tensorboard

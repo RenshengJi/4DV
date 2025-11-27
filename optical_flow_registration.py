@@ -1030,10 +1030,10 @@ class OpticalFlowRegistration:
             # 获取velocity数据（如果启用velocity-based方法）
             velocity_src = None
             velocity_dst = None
-            if self.use_velocity_based_transform and 'velocity' in preds:
-                # velocity shape: [B, S, H, W, 3]
-                velocity_src = preds['velocity'][0, frame_idx]  # [H, W, 3]
-                velocity_dst = preds['velocity'][0, next_frame]  # [H, W, 3]
+            if self.use_velocity_based_transform and 'velocity_global' in preds:
+                # velocity_global shape: [B, S, H, W, 3] - 全局坐标系的velocity
+                velocity_src = preds['velocity_global'][0, frame_idx]  # [H, W, 3]
+                velocity_dst = preds['velocity_global'][0, next_frame]  # [H, W, 3]
 
             # 获取depth_conf数据（如果可用）
             depth_conf_src = None
@@ -1187,9 +1187,10 @@ class OpticalFlowRegistration:
                 # 获取velocity数据（如果启用velocity-based方法）
                 velocity_src = None
                 velocity_dst = None
-                if self.use_velocity_based_transform and 'velocity' in preds:
-                    velocity_src = preds['velocity'][0, frame_idx]  # [H, W, 3]
-                    velocity_dst = preds['velocity'][0, next_frame]  # [H, W, 3]
+                if self.use_velocity_based_transform and 'velocity_global' in preds:
+                    # velocity_global shape: [B, S, H, W, 3] - 全局坐标系的velocity
+                    velocity_src = preds['velocity_global'][0, frame_idx]  # [H, W, 3]
+                    velocity_dst = preds['velocity_global'][0, next_frame]  # [H, W, 3]
 
                 # 获取depth_conf数据（如果可用）
                 depth_conf_src = None

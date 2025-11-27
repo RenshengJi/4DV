@@ -571,9 +571,7 @@ def train(args):
                             vggt_batch["intrinsics"],
                             vggt_batch["images"],
                             pred_sky_colors=preds.get("pred_sky_colors"),
-                            sky_masks=vggt_batch.get("sky_masks"),
-                            iteration=epoch * len(data_loader_train) + data_iter_step,
-                            lpips_start_iter=getattr(args, 'lpips_start_iter', 5000)
+                            sky_masks=vggt_batch.get("sky_masks")
                         )
                         # 将所有self_render损失加入到总loss中
                         self_render_rgb_loss = self_loss_dict.get("loss_self_render_rgb", 0.0)
@@ -811,8 +809,6 @@ def train(args):
                             sky_colors=sky_colors,
                             sampled_frame_indices=sampled_frame_indices,
                             use_lpips=(loss_weights['aggregator_render_lpips_weight'] > 0),
-                            iteration=epoch * len(data_loader_train) + data_iter_step,
-                            lpips_start_iter=getattr(args, 'lpips_start_iter', 5000),
                             dynamic_threshold=getattr(args, 'aggregator_dynamic_threshold', 0.1)
                         )
 
@@ -835,10 +831,15 @@ def train(args):
                 aggregator_all_rgb_weight = loss_weights.get('aggregator_all_render_rgb_weight', 0.0)
                 aggregator_all_depth_weight = loss_weights.get('aggregator_all_render_depth_weight', 0.0)
                 aggregator_all_lpips_weight = loss_weights.get('aggregator_all_render_lpips_weight', 0.0)
+                aggregator_all_start_iter = getattr(args, 'aggregator_all_start_iter', 50000)
 
-                if (aggregator_all_rgb_weight > 0 or
+                # 计算当前iteration
+                current_iteration = epoch * len(data_loader_train) + data_iter_step
+
+                if ((aggregator_all_rgb_weight > 0 or
                     aggregator_all_depth_weight > 0 or
-                    aggregator_all_lpips_weight > 0):
+                    aggregator_all_lpips_weight > 0) and
+                    current_iteration >= aggregator_all_start_iter):
                     try:
                         # Step 1: 处理动态物体 (使用OnlineDynamicProcessor)
                         # 使用GT camera而不是预测的pose_enc
