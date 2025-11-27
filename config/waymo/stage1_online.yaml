@@ -124,6 +124,9 @@ aggregator_all_start_iter: 10000           # Aggregator_all loss开始计算的i
 aggregator_all_render_rgb_weight: 1.0      # Aggregator_all RGB渲染损失权重
 aggregator_all_render_depth_weight: 1.0    # Aggregator_all depth渲染损失权重
 aggregator_all_render_lpips_weight: 0.1    # Aggregator_all LPIPS渲染损失权重
+aggregator_all_detach_velocity: false      # 是否detach velocity阻止梯度回传到velocity head
+                                           # true: velocity.detach()不回传梯度，只用velocity监督dynamic objects
+                                           # false: 允许渲染loss梯度回传到velocity head (默认)
 # Stage2配置（用于aggregator_all loss的渲染配置）
 stage2_render_only_dynamic: false          # 是否只渲染动态物体
 stage2_supervise_only_dynamic: false       # 是否只监督动态区域

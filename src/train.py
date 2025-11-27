@@ -854,7 +854,12 @@ def train(args):
                                 gt_extrinsics, gt_intrinsics, image_size_hw, pose_encoding_type="absT_quaR_FoV"
                             )
                             preds_for_dynamic['pose_enc'] = gt_pose_enc
-                            # preds_for_dynamic['velocity'] = preds_for_dynamic['velocity'].detach()
+
+                        # 根据配置选择是否detach velocity
+                        if args.aggregator_all_detach_velocity and 'velocity' in preds_for_dynamic:
+                            preds_for_dynamic['velocity'] = preds_for_dynamic['velocity'].detach()
+                        if args.aggregator_all_detach_velocity and 'velocity_global' in preds_for_dynamic:
+                            preds_for_dynamic['velocity_global'] = preds_for_dynamic['velocity_global'].detach()
 
                         dynamic_objects_data = dynamic_processor.process_dynamic_objects(
                             preds_for_dynamic, vggt_batch, auxiliary_models
