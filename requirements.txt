@@ -18,3 +18,4 @@ tensorboard
 h5py
 viser
 hydra-core
+imageio-ffmpeg

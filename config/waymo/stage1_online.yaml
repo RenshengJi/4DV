@@ -4,8 +4,11 @@
 # debug: true
 
 # =============== 模型配置 ===============
-model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=0)"
+model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=0, use_gs_head=True)"
 # sh_degree: 球谐函数的阶数（0=只有DC分量3个参数，1=DC+方向性12个参数，2=27个参数，3=48个参数）
+# use_gs_head: 是否使用DPTGSHead (True=DPTGSHead, False=DPTHead)
+#   - True: 使用DPTGSHead for gaussian_head and velocity_head (默认)
+#   - False: 使用普通DPTHead for gaussian_head and velocity_head
 # Gaussian head的output_dim会根据sh_degree自动计算：11 + 3*(sh_degree+1)^2
 # pretrained: model.pt
 # pretrained_velocity: False

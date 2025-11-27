@@ -92,7 +92,7 @@ def load_model(model_path, device):
         patch_size=14,
         embed_dim=1024,
         use_sky_token=True,
-        sh_degree=2
+        sh_degree=0
     )
 
     checkpoint = torch.load(model_path, map_location="cpu")
@@ -391,19 +391,19 @@ def create_nvs_grid(rendered_views, translation_offset):
     for s in range(S):
         # 提取每个视角的当前帧
         # Row 1: up-left, up, up-right
-        up_left = rendered_views['up_left'][s].permute(1, 2, 0).cpu().numpy()
-        up = rendered_views['up'][s].permute(1, 2, 0).cpu().numpy()
-        up_right = rendered_views['up_right'][s].permute(1, 2, 0).cpu().numpy()
+        up_left = rendered_views['up_left'][s].permute(1, 2, 0).detach().cpu().numpy()
+        up = rendered_views['up'][s].permute(1, 2, 0).detach().cpu().numpy()
+        up_right = rendered_views['up_right'][s].permute(1, 2, 0).detach().cpu().numpy()
 
         # Row 2: left, center, right
-        left = rendered_views['left'][s].permute(1, 2, 0).cpu().numpy()
-        center = rendered_views['center'][s].permute(1, 2, 0).cpu().numpy()
-        right = rendered_views['right'][s].permute(1, 2, 0).cpu().numpy()
+        left = rendered_views['left'][s].permute(1, 2, 0).detach().cpu().numpy()
+        center = rendered_views['center'][s].permute(1, 2, 0).detach().cpu().numpy()
+        right = rendered_views['right'][s].permute(1, 2, 0).detach().cpu().numpy()
 
         # Row 3: down-left, down, down-right
-        down_left = rendered_views['down_left'][s].permute(1, 2, 0).cpu().numpy()
-        down = rendered_views['down'][s].permute(1, 2, 0).cpu().numpy()
-        down_right = rendered_views['down_right'][s].permute(1, 2, 0).cpu().numpy()
+        down_left = rendered_views['down_left'][s].permute(1, 2, 0).detach().cpu().numpy()
+        down = rendered_views['down'][s].permute(1, 2, 0).detach().cpu().numpy()
+        down_right = rendered_views['down_right'][s].permute(1, 2, 0).detach().cpu().numpy()
 
         # 创建网格: 3 rows x 3 columns
         row1 = np.concatenate([up_left, up, up_right], axis=1)

@@ -49,10 +49,12 @@ def freeze_all_params(modules):
 
 
 class VGGT(nn.Module, PyTorchModelHubMixin):
-    def __init__(self, img_size=518, patch_size=14, embed_dim=1024, use_sky_token=True, use_scale_token=True, memory_efficient=True, sh_degree=0):
+    def __init__(self, img_size=518, patch_size=14, embed_dim=1024, use_sky_token=True, use_scale_token=True, memory_efficient=True, sh_degree=0, use_gs_head=True):
         super().__init__()
         # Store sh_degree for use in forward and other methods
         self.sh_degree = sh_degree
+        # Store use_gs_head for determining head type
+        self.use_gs_head = use_gs_head
 
         # Calculate gaussian head output dimension based on sh_degree
         # Gaussian parameters: xyz_offset(3) + scale(3) + sh_coeffs + rotation(4) + opacity(1)
@@ -73,8 +75,12 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         self.camera_head = CameraHead(dim_in=2 * embed_dim)
         self.point_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log", conf_activation="expp1")
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1")
-        self.gaussian_head = DPTGSHead(dim_in=2 * embed_dim, output_dim=gaussian_output_dim, activation="linear", conf_activation="expp1")
-        self.velocity_head = DPTGSHead(dim_in=2 * embed_dim, output_dim=4, activation="linear", conf_activation="expp1")
+
+        # Choose head type based on use_gs_head flag
+        HeadClass = DPTGSHead if use_gs_head else DPTHead
+        self.gaussian_head = HeadClass(dim_in=2 * embed_dim, output_dim=gaussian_output_dim, activation="linear", conf_activation="expp1")
+        self.velocity_head = HeadClass(dim_in=2 * embed_dim, output_dim=4, activation="linear", conf_activation="expp1")
+
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size)
 
         # Sky token support - now managed at VGGT level
