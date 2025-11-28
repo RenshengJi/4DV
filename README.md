@@ -50,7 +50,33 @@ CUDA_VISIBLE_DEVICES=0 /opt/miniconda/envs/vggt/bin/python inference.py \
 /opt/miniconda/envs/vggt/bin/python inference.py --idx 1600
 ```
 
-### 2. 新视角合成（3x3网格布局）
+### 2. Velocity可视化（单行布局）
+
+生成速度预测可视化：GT RGB | GT Velocity | GT RGB + Pred Velocity 融合
+
+```bash
+CUDA_VISIBLE_DEVICES=0 /opt/miniconda/envs/vggt/bin/python inference_velocity.py \
+    --batch_mode \
+    --start_idx 100 --end_idx 100000 --step 100 \
+    --model_path "src/checkpoints/waymo_stage1_online/fromaggregator_all_lr1e-5_procrustes_area500_velocityconstraint0.05_gtcamera_xyzgrad+fixdbscan+sky+fixepsmetric+noconf/checkpoint-epoch_0_37980.pth" \
+    --seq_dir "data/waymo/train_full/" \
+    --output_dir "./results/velocity_outputs" \
+    --device cuda --num_views 8 --fps 10 \
+    --sh_degree 0 --use_gs_head --use_gs_head_velocity --use_gt_camera \
+    --velocity_alpha 0.5 --velocity_scale 0.1 \
+    --continue_on_error
+```
+
+**单帧推理**
+```bash
+/opt/miniconda/envs/vggt/bin/python inference_velocity.py \
+    --idx 1600 \
+    --model_path "path/to/checkpoint.pth" \
+    --seq_dir "data/waymo/train_full/" \
+    --velocity_alpha 0.5
+```
+
+### 3. 新视角合成（3x3网格布局）
 
 生成9个不同视角的RGB渲染结果
 
@@ -80,6 +106,8 @@ CUDA_VISIBLE_DEVICES=0 /opt/miniconda/envs/vggt/bin/python inference_nvs.py \
 | `--use_gs_head` | gaussian_head 使用 DPTGSHead | True |
 | `--use_gs_head_velocity` | velocity_head 使用 DPTGSHead | False |
 | `--velocity_transform_mode` | 速度变换模式：`simple` 或 `procrustes` | procrustes |
+| `--velocity_alpha` | Pred velocity在融合中的权重 (0-1) | 0.5 |
+| `--velocity_scale` | Velocity可视化缩放因子 | 0.1 |
 | `--translation_offset` | NVS相机平移偏移量(米) | 0.1 |
 | `--velocity_threshold` | 动态物体速度阈值 | 0.1 |
 | `--clustering_eps` | DBSCAN聚类距离阈值(米) | 0.3 |

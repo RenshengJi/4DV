@@ -4,7 +4,7 @@
 # debug: true
 
 # =============== 模型配置 ===============
-model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=0, use_gs_head=True, use_gs_head_velocity=False)"
+model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=0, use_gs_head=True, use_gs_head_velocity=False, use_gt_camera=True, velocity_head_small_init=True)"
 # sh_degree: 球谐函数的阶数（0=只有DC分量3个参数，1=DC+方向性12个参数，2=27个参数，3=48个参数）
 # use_gs_head: 是否对gaussian_head使用DPTGSHead (True=DPTGSHead, False=DPTHead)
 #   - True: gaussian_head使用DPTGSHead (默认)
@@ -13,11 +13,12 @@ model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=0, use_gs_he
 #   - True: velocity_head使用DPTGSHead
 #   - False: velocity_head使用普通DPTHead (默认)
 # Gaussian head的output_dim会根据sh_degree自动计算：11 + 3*(sh_degree+1)^2
-
-# 相机参数配置
-use_gt_camera: True  # 是否在模型forward中使用GT相机参数来计算world_points
-                      # True: 使用GT的extrinsics和intrinsics (默认)
-                      # False: 使用模型预测的pose_enc
+# use_gt_camera: 是否在模型forward中使用GT相机参数来计算world_points
+#   - True: 使用GT的extrinsics和intrinsics
+#   - False: 使用模型预测的pose_enc (默认)
+# velocity_head_small_init: 是否对velocity_head最后一层进行小初始化
+#   - True: 最后一层weight初始化为小值(std=0.001)，bias初始化为0，使velocity从接近0开始
+#   - False: 使用默认初始化 (默认)
 
 pretrained: model.pt
 pretrained_velocity: False
@@ -149,13 +150,13 @@ allow_repeat: False
 train_dataset: 2 * Waymo_Multi(allow_repeat=${allow_repeat}, split=None,
   ROOT="../data/waymo/train_full",
   img_ray_mask_p=[1.0, 0.0, 0.0], valid_camera_id_list=["1", "2", "3"],
-  aug_crop=0, resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], transform=ImgNorm,
-  num_views=${num_views}, n_corres=${n_corres_train}, seq_aug_crop=True, load_sam_masks=False)
+  aug_crop=0, resolution=[(518, 336)], transform=ImgNorm,
+  num_views=${num_views}, n_corres=${n_corres_train}, seq_aug_crop=True, load_sam_masks=False, zero_ground_velocity=True)
 
 test_dataset: 1000 @ Waymo_Multi(split=None,
   ROOT="../data/waymo/train_full",
   img_ray_mask_p=[1.0, 0.0, 0.0], valid_camera_id_list=["1", "2", "3"],
-  resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], num_views=${num_test_views}, seed=42, n_corres=${n_corres_test})
+  resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], num_views=${num_test_views}, seed=42, n_corres=${n_corres_test}, zero_ground_velocity=True)
 
 # =============== 优化器配置 ===============
 seed: 0

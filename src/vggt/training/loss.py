@@ -112,62 +112,6 @@ def velocity_loss(velocity):
     return velocity_loss
 
 
-def velocity_local_to_global(velocity, extrinsic):
-    """
-    将速度从局部坐标系（每一帧自己的坐标系）转换到全局坐标系（第一帧的坐标系）
-
-    Args:
-        velocity: [N, 3] - 局部坐标系下的速度向量
-        extrinsic: [B, S, 4, 4] - 相机外参矩阵，其中B=1，S是序列长度
-
-    Returns:
-        torch.Tensor: [N, 3] - 全局坐标系下的速度向量
-    """
-    with tf32_off():
-        # 获取序列长度
-        B, S, _, _ = extrinsic.shape
-        assert B == 1, f"Expected batch size 1, got {B}"
-
-        # 重塑velocity以匹配帧数
-        # velocity: [N, 3] -> [S, H*W, 3] 其中 N = S * H * W
-        N = velocity.shape[0]
-        H_W = N // S
-        velocity_reshaped = velocity.reshape(S, H_W, 3)  # [S, H*W, 3]
-
-        # 获取第一帧的变换矩阵作为全局坐标系
-        global_transform = extrinsic[0, 0]  # [4, 4] - 第一帧的相机到世界变换
-
-        # 初始化全局速度
-        global_velocity = torch.zeros_like(velocity_reshaped)
-
-        # 对每一帧进行处理
-        for frame_idx in range(S):
-            # 获取当前帧的变换矩阵
-            current_transform = extrinsic[0, frame_idx]  # [4, 4] - 当前帧的相机到世界变换
-
-            # 计算从当前帧到全局坐标系的变换
-            # 全局坐标系 = 第一帧坐标系
-            # 当前帧到全局的变换 = 全局变换的逆 × 当前帧变换
-            current_to_global = torch.matmul(
-                torch.linalg.inv(global_transform), current_transform)
-
-            # 提取旋转矩阵和平移向量
-            R = current_to_global[:3, :3]  # [3, 3]
-            t = current_to_global[:3, 3]   # [3]
-
-            # 将局部速度转换到全局坐标系
-            # 对于速度向量，只需要应用旋转变换，不需要平移
-            frame_velocity = velocity_reshaped[frame_idx]  # [H*W, 3]
-            global_frame_velocity = torch.matmul(
-                frame_velocity, R.T)  # [H*W, 3]
-
-            global_velocity[frame_idx] = global_frame_velocity
-
-        # 重塑回原始形状
-        global_velocity = global_velocity.reshape(N, 3)
-
-        return global_velocity
-
 
 def cross_render_and_loss(conf, interval, forward_consist_mask, backward_consist_mask, depth, gaussian_params, velocity, pose_enc, extrinsic, intrinsic, gt_rgb, gt_depth, point_masks, sh_degree=0):
     # gaussian_params: [N, output_dim] where output_dim = 11 + 3*(sh_degree+1)^2

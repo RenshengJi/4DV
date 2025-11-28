@@ -13,7 +13,7 @@ class Waymo_Multi(BaseMultiViewDataset):
     """Dataset of outdoor street scenes, 5 images each time"""
 
     def __init__(self, *args, ROOT, img_ray_mask_p=[0.85, 0.10, 0.05], valid_camera_id_list=["1", "2", "3"],
-                 load_sam_masks=False, **kwargs):
+                 load_sam_masks=False, zero_ground_velocity=True, **kwargs):
         self.ROOT = ROOT
         self.img_ray_mask_p = img_ray_mask_p
         self.max_interval = 8
@@ -21,6 +21,7 @@ class Waymo_Multi(BaseMultiViewDataset):
         self.is_metric = True
         self.valid_camera_id_list = valid_camera_id_list
         self.load_sam_masks = load_sam_masks  # 是否加载SAM掩码
+        self.zero_ground_velocity = zero_ground_velocity  # 是否使用语义分割清零地面velocity
         super().__init__(*args, **kwargs)
         assert self.split is None
         self._load_data()
@@ -199,7 +200,7 @@ class Waymo_Multi(BaseMultiViewDataset):
                 )
 
             # Apply semantic segmentation to zero out velocity on road and sidewalk
-            if seg_mask is not None and flowmap is not None:
+            if self.zero_ground_velocity and seg_mask is not None and flowmap is not None:
                 # Cityscapes color palette: road=[128,64,128], sidewalk=[244,35,232]
                 road_color = np.array([128, 64, 128])
                 sidewalk_color = np.array([244, 35, 232])

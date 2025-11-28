@@ -399,12 +399,6 @@ def train(args):
             "Please check vggt_freeze_strategy is not freezing all parameters\n"
             f"Stage1 trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad)}"
         )
-    printer.info(f"Total parameter groups for optimizer: {len(param_groups)}")
-    for i, group in enumerate(param_groups):
-        group_name = group.get('name', f'group_{i}')
-        num_params = len(group['params'])
-        group_lr = group.get('lr', args.lr)
-        printer.info(f"  Group {i} ({group_name}): {num_params} parameters, lr={group_lr}")
 
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
     loss_scaler = NativeScaler(accelerator=accelerator)
@@ -1112,42 +1106,41 @@ def cut3r_batch_to_vggt(views):
     }
 
     with tf32_off(), torch.amp.autocast("cuda", enabled=False):
-        # 转换world points的坐标系到第一帧相机坐标系
-        if vggt_batch['world_points'] is not None:
-            B, S, H, W, _ = vggt_batch['world_points'].shape
-            world_points = vggt_batch['world_points'].reshape(B, S, H*W, 3)
-            world_points = torch.matmul(torch.linalg.inv(vggt_batch['extrinsics'][0])[:, :3, :3], world_points.transpose(-1, -2)).transpose(-1, -2) + \
-                                       torch.linalg.inv(vggt_batch['extrinsics'][0])[:, :3, 3:4].transpose(-1, -2)
-            vggt_batch['world_points'] = world_points.reshape(B, S, H, W, 3)
+        B, S, H, W, _ = vggt_batch['world_points'].shape
+        world_points = vggt_batch['world_points'].reshape(B, S, H*W, 3)
+        # world_points from world to cam0
+        world_points = torch.matmul(torch.linalg.inv(vggt_batch['extrinsics'][0])[:, :3, :3], world_points.transpose(-1, -2)).transpose(-1, -2) + \
+                                    torch.linalg.inv(vggt_batch['extrinsics'][0])[:, :3, 3:4].transpose(-1, -2)
+        vggt_batch['world_points'] = world_points.reshape(B, S, H, W, 3)
 
-            # 处理flowmap - 应用scaling (ground mask已经在waymo.py的_get_views中应用)
-            if vggt_batch['flowmap'] is not None:
-                vggt_batch['flowmap'][..., :3] *=  0.1
+        # 处理flowmap
+        if vggt_batch['flowmap'] is not None:
+            vggt_batch['flowmap'][..., :3] *=  0.1
 
-            # 转换extrinsics的坐标系到第一帧相机坐标系
-            vggt_batch['extrinsics'] = torch.matmul(
-                    torch.linalg.inv(vggt_batch['extrinsics']),
-                    vggt_batch['extrinsics'][0]
-                )
+        # extrinsics from (cam to world) to (cam0 to cam), 即以第一个视角为参考系
+        vggt_batch['extrinsics'] = torch.matmul(
+                torch.linalg.inv(vggt_batch['extrinsics']),
+                vggt_batch['extrinsics'][0]
+            )
 
-            # 将extrinsics(中的T)以及world_points、depth进行非metric化
-            world_points_flatten = vggt_batch['world_points'].reshape(-1, 3)
-            world_points_mask_flatten = vggt_batch['point_masks'].reshape(-1) if vggt_batch['point_masks'] is not None else torch.ones_like(world_points_flatten[:, 0], dtype=torch.bool)
-            dist_avg = world_points_flatten[world_points_mask_flatten].norm(dim=-1).mean()
-            depth_scale_factor = 1 / dist_avg
-            pose_scale_factor = depth_scale_factor
+        # 将extrinsics(中的T)以及world_points、depth进行非metric化
+        world_points_flatten = vggt_batch['world_points'].reshape(-1, 3)
+        world_points_mask_flatten = vggt_batch['point_masks'].reshape(-1) if vggt_batch['point_masks'] is not None else torch.ones_like(world_points_flatten[:, 0], dtype=torch.bool)
+        dist_avg = world_points_flatten[world_points_mask_flatten].norm(dim=-1).mean()
+        depth_scale_factor = 1 / dist_avg
+        pose_scale_factor = depth_scale_factor
 
-            # 保存depth_scale_factor到batch中用于scale loss监督
-            vggt_batch['depth_scale_factor'] = depth_scale_factor
+        # 保存depth_scale_factor到batch中用于scale loss监督
+        vggt_batch['depth_scale_factor'] = depth_scale_factor
 
-            # 应用非metric化
-            vggt_batch['depths'] = vggt_batch['depths'] * depth_scale_factor
-            vggt_batch['extrinsics'][:, :, :3, 3] = vggt_batch['extrinsics'][:, :, :3, 3] * pose_scale_factor
-            vggt_batch['world_points'] = vggt_batch['world_points'] * depth_scale_factor
+        # 应用非metric化
+        vggt_batch['depths'] = vggt_batch['depths'] * depth_scale_factor
+        vggt_batch['extrinsics'][:, :, :3, 3] = vggt_batch['extrinsics'][:, :, :3, 3] * pose_scale_factor
+        vggt_batch['world_points'] = vggt_batch['world_points'] * depth_scale_factor
 
-            # 对flowmap应用非metric化：只对velocity magnitude进行缩放
-            if vggt_batch['flowmap'] is not None:
-                vggt_batch['flowmap'][..., :3] = vggt_batch['flowmap'][..., :3] * depth_scale_factor
+        # 对flowmap应用非metric化：只对velocity magnitude进行缩放
+        if vggt_batch['flowmap'] is not None:
+            vggt_batch['flowmap'][..., :3] = vggt_batch['flowmap'][..., :3] * depth_scale_factor
 
 
     vggt_batch['images'] = vggt_batch['images'].permute(1, 0, 2, 3, 4).contiguous()

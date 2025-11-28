@@ -49,7 +49,7 @@ def freeze_all_params(modules):
 
 
 class VGGT(nn.Module, PyTorchModelHubMixin):
-    def __init__(self, img_size=518, patch_size=14, embed_dim=1024, use_sky_token=True, use_scale_token=True, memory_efficient=True, sh_degree=0, use_gs_head=True, use_gs_head_velocity=False):
+    def __init__(self, img_size=518, patch_size=14, embed_dim=1024, use_sky_token=True, use_scale_token=True, memory_efficient=True, sh_degree=0, use_gs_head=True, use_gs_head_velocity=False, use_gt_camera=False, velocity_head_small_init=False):
         super().__init__()
         # Store sh_degree for use in forward and other methods
         self.sh_degree = sh_degree
@@ -57,6 +57,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         self.use_gs_head = use_gs_head
         # Store use_gs_head_velocity for determining velocity head type
         self.use_gs_head_velocity = use_gs_head_velocity
+        # Store use_gt_camera for determining which camera parameters to use
+        self.use_gt_camera = use_gt_camera
 
         # Calculate gaussian head output dimension based on sh_degree
         # Gaussian parameters: xyz_offset(3) + scale(3) + sh_coeffs + rotation(4) + opacity(1)
@@ -84,6 +86,10 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         # Choose head type based on use_gs_head_velocity flag for velocity head
         VelocityHeadClass = DPTGSHead if use_gs_head_velocity else DPTHead
         self.velocity_head = VelocityHeadClass(dim_in=2 * embed_dim, output_dim=4, activation="linear", conf_activation="expp1")
+
+        # Apply small initialization to velocity_head if requested
+        if velocity_head_small_init:
+            self._apply_small_init_to_velocity_head()
 
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size)
 
@@ -114,6 +120,27 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 nn.ReLU(),
                 nn.Linear(256, 1),
             )
+
+    def _apply_small_init_to_velocity_head(self):
+        """
+        Apply small initialization to the last layer of velocity_head.
+        Sets bias to 0 and weights to small values (std=0.001).
+        This helps velocity predictions start from near-zero values.
+        """
+        # For DPTHead: last layer is scratch.output_conv2[-1] (the final Conv2d)
+        # For DPTGSHead: similar structure with output_conv2
+        if hasattr(self.velocity_head, 'scratch') and hasattr(self.velocity_head.scratch, 'output_conv2'):
+            output_conv2 = self.velocity_head.scratch.output_conv2
+            # output_conv2 is a Sequential with the last layer being Conv2d
+            if isinstance(output_conv2, nn.Sequential):
+                last_layer = output_conv2[-1]
+                if isinstance(last_layer, nn.Conv2d):
+                    # Small weight initialization (std=0.001)
+                    nn.init.normal_(last_layer.weight, mean=0.0, std=0.001)
+                    # Zero bias initialization
+                    if last_layer.bias is not None:
+                        nn.init.zeros_(last_layer.bias)
+                    print(f"[VGGT] Applied small initialization to velocity_head last layer: weight std=0.001, bias=0")
 
     def set_freeze(self, freeze):
         to_be_frozen = {
@@ -156,7 +183,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
 
     def forward(self, images: torch.Tensor, query_points: torch.Tensor = None,
                 gt_extrinsics: torch.Tensor = None, gt_intrinsics: torch.Tensor = None,
-                frame_sample_ratio: float = 0.25, use_gt_camera: bool = False):
+                frame_sample_ratio: float = 0.25):
         """
         Forward pass of the VGGT model.
 
@@ -172,9 +199,6 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 Default: None
             frame_sample_ratio (float, optional): Ratio of frames to sample for sky rendering.
                 Default: 0.25
-            use_gt_camera (bool, optional): Whether to use GT camera parameters for world points computation.
-                If True, uses gt_extrinsics and gt_intrinsics; otherwise uses predicted pose_enc.
-                Default: False
 
         Returns:
             dict: A dictionary containing the following predictions:
@@ -224,11 +248,11 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 predictions["depth_conf"] = depth_conf
 
                 # Compute world points from depth and camera parameters
-                # Determine which camera parameters to use based on use_gt_camera flag
+                # Determine which camera parameters to use based on self.use_gt_camera flag
                 extrinsics_to_use = None
                 intrinsics_to_use = None
 
-                if use_gt_camera and gt_extrinsics is not None and gt_intrinsics is not None:
+                if self.use_gt_camera and gt_extrinsics is not None and gt_intrinsics is not None:
                     # Use GT camera parameters
                     extrinsics_to_use = gt_extrinsics
                     intrinsics_to_use = gt_intrinsics
@@ -334,29 +358,28 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 )
                 # Apply velocity activation: sign(x) * (exp(|x|) - 1)
                 velocity = torch.sign(velocity_raw) * (torch.exp(torch.abs(velocity_raw)) - 1)
-                predictions["velocity"] = velocity  # Camera frame velocity (for loss)
+                predictions["velocity"] = velocity  # cam coordinate
                 predictions["velocity_conf"] = velocity_conf
 
                 # Transform velocity to global coordinate frame if camera parameters are available
                 if extrinsics_to_use is not None and intrinsics_to_use is not None:
-                    from vggt.training.loss import velocity_local_to_global
+                    # velocity is in camera coordinate frame, we need to transform it to world frame
+                    # extrinsics_to_use is world2cam, so extrinsic_inv is cam2world
+                    extrinsic_cam2world = torch.linalg.inv(extrinsics_to_use)  # [B, S, 4, 4]
 
-                    # Get extrinsic_inv for transformation
-                    extrinsic_inv = torch.linalg.inv(extrinsics_to_use)  # [B, S, 4, 4]
+                    # Extract rotation matrix from cam2world
+                    R_cam2world = extrinsic_cam2world[:, :, :3, :3]  # [B, S, 3, 3]
 
-                    # Reshape velocity for transformation [B, S, H, W, 3]
+                    # velocity shape: [B, S, H, W, 3]
+                    # Transform: vel_world = R_cam2world @ vel_camera
                     B_v, S_v, H_v, W_v, _ = velocity.shape
-                    velocity_flat = velocity.reshape(B_v, S_v * H_v * W_v, 3)
+                    velocity_reshaped = velocity.reshape(B_v, S_v, H_v * W_v, 3)  # [B, S, H*W, 3]
 
-                    # Transform velocity for each batch
-                    velocity_global_list = []
-                    for b in range(B_v):
-                        vel_b = velocity_flat[b].reshape(-1, 3)  # [S*H*W, 3]
-                        vel_global = velocity_local_to_global(vel_b, extrinsic_inv[b:b+1])
-                        velocity_global_list.append(vel_global.reshape(S_v, H_v, W_v, 3))
+                    # Apply rotation: [B, S, 3, 3] @ [B, S, H*W, 3]^T -> [B, S, 3, H*W] -> transpose -> [B, S, H*W, 3]
+                    velocity_global = torch.matmul(R_cam2world, velocity_reshaped.transpose(-1, -2)).transpose(-1, -2)
+                    velocity_global = velocity_global.reshape(B_v, S_v, H_v, W_v, 3)
 
-                    velocity_global = torch.stack(velocity_global_list, dim=0)  # [B, S, H, W, 3]
-                    predictions["velocity_global"] = velocity_global  # Global frame velocity (for downstream use)
+                    predictions["velocity_global"] = velocity_global  # World frame velocity (for downstream use)
 
         if self.track_head is not None and query_points is not None:
             track_list, vis, conf = self.track_head(

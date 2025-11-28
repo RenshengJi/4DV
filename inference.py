@@ -57,7 +57,6 @@ def parse_args():
                        help="Use velocity-based transformation")
     parser.add_argument("--velocity_transform_mode", type=str, default="procrustes",
                        choices=["simple", "procrustes"], help="Velocity transformation mode")
-    parser.add_argument("--use_gt_camera", action="store_true", help="Use GT camera parameters")
 
     # 聚类参数
     parser.add_argument("--velocity_threshold", type=float, default=0.1,
@@ -81,6 +80,7 @@ def parse_args():
     parser.add_argument("--sh_degree", type=int, default=0, help="Spherical harmonics degree")
     parser.add_argument("--use_gs_head", action="store_true", default=True, help="Use DPTGSHead for gaussian_head")
     parser.add_argument("--use_gs_head_velocity", action="store_true", default=False, help="Use DPTGSHead for velocity_head")
+    parser.add_argument("--use_gt_camera", action="store_true", help="Use GT camera parameters")
 
     return parser.parse_args()
 
@@ -97,7 +97,8 @@ def load_model(model_path, device, args):
         use_sky_token=True,
         sh_degree=args.sh_degree,
         use_gs_head=args.use_gs_head,
-        use_gs_head_velocity=args.use_gs_head_velocity
+        use_gs_head_velocity=args.use_gs_head_velocity,
+        use_gt_camera=args.use_gt_camera
     )
 
     checkpoint = torch.load(model_path, map_location="cpu")
