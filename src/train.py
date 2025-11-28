@@ -990,10 +990,10 @@ def train(args):
                 ):
                     print("saving at step", data_iter_step)
                     save_model(epoch - 1, f"epoch_{epoch}_{data_iter_step}", float("inf"))
-                metric_logger.synchronize_between_processes(accelerator)
-                printer.info("Averaged stats: %s", metric_logger)
-                
 
+    # gather the stats from all processes (应该在epoch结束后，for循环外面)
+    metric_logger.synchronize_between_processes(accelerator)
+    printer.info("Averaged stats: %s", metric_logger)
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
