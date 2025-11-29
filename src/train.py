@@ -434,7 +434,7 @@ def train(args):
     printer.info(f"Start training for {args.epochs} epochs")
     start_time = time.time()
 
-    for epoch in range(args.start_epoch, args.epochs + 1):
+    for epoch in range(args.start_epoch, args.epochs):
         if hasattr(data_loader_train, "dataset") and hasattr(data_loader_train.dataset, "set_epoch"):
             data_loader_train.dataset.set_epoch(epoch)
         if (

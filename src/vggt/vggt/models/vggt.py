@@ -456,6 +456,15 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             predicted_scale = self.scale_head(scale_token_pooled)  # [B, 1]
             predictions["scale"] = predicted_scale.squeeze(-1)  # [B]
 
+        # Add batch dimension information to predictions for downstream processing
+        B, S, C, H, W = images.shape
+        predictions["batch_dims"] = {
+            "B": B,
+            "S": S,
+            "H": H,
+            "W": W
+        }
+
         return predictions
 
     def generate_sky_color(self, ray_directions, sky_token):

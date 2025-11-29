@@ -40,7 +40,7 @@ def _print_main(*args, **kwargs):
 
 
 
-def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, min_samples=10, area_threshold=750, conf_mask=None, gt_scale=None):
+def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, min_samples=10, area_threshold=750, gt_scale=None):
     """
     对每一帧进行动态物体聚类
 
@@ -51,7 +51,6 @@ def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, 
         eps: DBSCAN的邻域半径（metric尺度，米）
         min_samples: DBSCAN的最小样本数
         area_threshold: 面积阈值，过滤掉面积小于此值的聚类
-        conf_mask: [S, H*W] confidence掩码，True表示高置信度像素
         gt_scale: float or tensor - GT scale factor，用于将xyz和velocity转换到metric尺度
 
     Returns:
@@ -82,11 +81,6 @@ def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, 
         # 过滤动态点（速度大于阈值的点，阈值现在是metric尺度）
         dynamic_mask = velocity_magnitude > velocity_threshold
 
-        # 应用confidence掩码：只有高置信度且动态的点才参与聚类
-        if conf_mask is not None:
-            frame_conf_mask = conf_mask[frame_idx]  # [H*W]
-            dynamic_mask = dynamic_mask & frame_conf_mask  # 同时满足动态和高置信度
-
         dynamic_points = frame_points[dynamic_mask]  # [N_dynamic, 3] - 非metric尺度
         dynamic_velocities = frame_velocity[dynamic_mask]  # [N_dynamic, 3] - 非metric尺度
 
@@ -113,24 +107,25 @@ def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, 
             dynamic_points_metric_cp = cp.asarray(dynamic_points_metric.detach())
             dbscan = DBSCAN(eps=eps, min_samples=min_samples)
             cluster_labels_cp = dbscan.fit_predict(dynamic_points_metric_cp)
-            # 转换回NumPy数组
-            cluster_labels = cp.asnumpy(cluster_labels_cp)
+            # 直接转换为PyTorch tensor（零拷贝，使用DLPack协议）
+            cluster_labels = torch.as_tensor(cluster_labels_cp, device='cuda')
         except Exception as e:
             # 回退到sklearn CPU版本
             try:
                 dynamic_points_metric_np = dynamic_points_metric.detach().cpu().numpy()
                 dbscan_sklearn = SklearnDBSCAN(eps=eps, min_samples=min_samples)
-                cluster_labels = dbscan_sklearn.fit_predict(dynamic_points_metric_np)
+                cluster_labels_np = dbscan_sklearn.fit_predict(dynamic_points_metric_np)
+                cluster_labels = torch.from_numpy(cluster_labels_np).to(device)
             except Exception as sklearn_e:
                 # 简单回退：所有点标记为噪声
-                cluster_labels = np.full(len(dynamic_points), -1)
+                cluster_labels = torch.full((len(dynamic_points),), -1, dtype=torch.long, device=device)
 
         # 将聚类结果映射回原始点云
         full_labels = torch.full((len(frame_points),), -1, device=frame_points.device)
-        full_labels[dynamic_mask] = torch.from_numpy(cluster_labels).to(frame_points.device).long()
+        full_labels[dynamic_mask] = cluster_labels.to(frame_points.device).long()
 
         # 统计聚类数量（排除噪声点，标签为-1）
-        all_unique_labels = set(cluster_labels)
+        all_unique_labels = set(cluster_labels.cpu().numpy().tolist())
         if -1 in all_unique_labels:
             all_unique_labels.remove(-1)
         initial_num_clusters = len(all_unique_labels)
@@ -160,7 +155,7 @@ def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, 
                 valid_labels.append(label)
             else:
                 # 将过滤掉的聚类重新标记为静态点（-1）
-                cluster_indices = np.where(cluster_mask)[0]
+                cluster_indices = torch.where(cluster_mask)[0]
                 dynamic_indices = torch.where(dynamic_mask)[0]
                 filtered_indices = dynamic_indices[cluster_indices]
                 full_labels[filtered_indices] = -1
@@ -584,16 +579,22 @@ class OnlineDynamicProcessor:
         stage_times = {}
 
         try:
-            # 获取基本信息
-            images = vggt_batch['images']  # [B, S, 3, H, W]
-            B, S, C, H, W = images.shape
+            # 从preds获取批次维度信息（已在vggt.py的forward中保存）
+            batch_dims = preds.get('batch_dims', {})
+            B = batch_dims.get('B', 1)
+            S = batch_dims.get('S', 4)
+            H = batch_dims.get('H', 224)
+            W = batch_dims.get('W', 224)
+
+            # 获取images用于预处理
+            images = vggt_batch.get('images')  # [B, S, 3, H, W]
 
             # 获取sky_masks（如果有的话）
             sky_masks = vggt_batch.get('sky_masks', None)  # [B, S, H, W] or None
 
             # ========== Stage 1: 数据预处理 ==========
             preprocessing_start = time.time()
-            preds = self._preprocess_predictions(preds, vggt_batch, images, B, S, H, W)
+            preds = self._preprocess_predictions(preds, vggt_batch, images)
 
             # 保存sh_degree和gaussian_output_dim到实例变量，供其他方法使用
             self.sh_degree = preds.get('sh_degree', 0)
@@ -605,7 +606,7 @@ class OnlineDynamicProcessor:
             # ========== Stage 2: 聚类 + 背景分离 ==========
             clustering_start = time.time()
             clustering_results = self._perform_clustering_with_existing_method(preds, vggt_batch)
-            static_gaussians = self._create_static_background_from_labels(preds, clustering_results, H, W, S, sky_masks)
+            static_gaussians = self._create_static_background_from_labels(preds, clustering_results, sky_masks)
             stage_times['clustering_background'] = time.time() - clustering_start
 
             # ========== Stage 3: 跨帧跟踪 ==========
@@ -620,7 +621,7 @@ class OnlineDynamicProcessor:
             # ========== Stage 4: 动态物体聚合 ==========
             aggregation_start = time.time()
             dynamic_objects = self._aggregate_dynamic_objects(
-                matched_clustering_results, preds, vggt_batch, H, W
+                matched_clustering_results, preds, vggt_batch
             )
             stage_times['aggregation'] = time.time() - aggregation_start
 
@@ -650,34 +651,32 @@ class OnlineDynamicProcessor:
         self,
         preds: Dict[str, Any],
         vggt_batch: Dict[str, Any],
-        images: torch.Tensor,
-        B: int, S: int, H: int, W: int
+        images: torch.Tensor
     ) -> Dict[str, Any]:
         """预处理VGGT预测结果：处理velocity和gaussian参数"""
         preds_updated = preds.copy()
+
+        # 从preds获取批次维度信息
+        batch_dims = preds['batch_dims']
+        B = batch_dims['B']
+        S = batch_dims['S']
+        H = batch_dims['H']
+        W = batch_dims['W']
 
         # 获取sh_degree并计算gaussian参数维度
         sh_degree = preds.get('sh_degree', 0)  # 默认为0
         sh_dim = 3 * ((sh_degree + 1) ** 2)
         gaussian_output_dim = 11 + sh_dim  # xyz(3) + scale(3) + sh(sh_dim) + rotation(4) + opacity(1)
 
-        # 处理gaussian参数
-        gaussian_params = preds.get('gaussian_params')
-        if gaussian_params is not None:
-            # 重新整形为 [S, H*W, gaussian_output_dim]
-            if gaussian_params.dim() == 3 and gaussian_params.shape[1] == S * H * W:
-                gaussian_params_reshaped = gaussian_params[0].reshape(S, H * W, gaussian_output_dim)
-            elif gaussian_params.dim() == 3 and gaussian_params.shape[0] == S:
-                gaussian_params_reshaped = gaussian_params
-            else:
-                gaussian_params_reshaped = gaussian_params.reshape(S, H * W, gaussian_output_dim)
+        # 处理gaussian参数：VGGT输出是 [B, S, H, W, gaussian_output_dim]
+        gaussian_params = preds['gaussian_params']  # [B, S, H, W, gaussian_output_dim]
+        gaussian_params_reshaped = gaussian_params[0].reshape(S, H * W, gaussian_output_dim)  # [S, H*W, gaussian_output_dim]
 
-            # 用vggt.py中计算的xyz_camera替换前三维（避免重复计算）
-            if 'xyz_camera' in preds:
-                xyz_camera = preds['xyz_camera'][0]  # [S, H*W, 3]
-                gaussian_params_reshaped[:, :, :3] = xyz_camera
+        # 用vggt.py中计算的xyz_camera替换前三维（避免重复计算）
+        xyz_camera = preds['xyz_camera'][0]  # [S, H*W, 3]
+        gaussian_params_reshaped[:, :, :3] = xyz_camera
 
-            preds_updated['gaussian_params'] = gaussian_params_reshaped.unsqueeze(0).reshape(B, S * H * W, gaussian_output_dim)
+        preds_updated['gaussian_params'] = gaussian_params_reshaped.reshape(1, S, H, W, gaussian_output_dim)  # [B, S, H, W, gaussian_output_dim]
 
         return preds_updated
 
@@ -685,8 +684,7 @@ class OnlineDynamicProcessor:
         self,
         matched_clustering_results: List[Dict],
         preds: Dict[str, Any],
-        vggt_batch: Dict[str, Any],
-        H: int, W: int
+        vggt_batch: Dict[str, Any]
     ) -> List[Dict]:
         """聚合动态物体（必须使用光流聚合）"""
         if not matched_clustering_results:
@@ -714,48 +712,24 @@ class OnlineDynamicProcessor:
     ) -> List[Dict]:
         """使用demo_video_with_pointcloud_save.py中的聚类方法"""
         try:
-            # 从preds中获取velocity_global（已经在vggt.py中计算并转换到全局坐标系）
-            velocity_global = preds.get('velocity_global')
+            # 从preds获取批次维度信息（已在vggt.py的forward中保存）
+            batch_dims = preds['batch_dims']
+            B = batch_dims['B']
+            S = batch_dims['S']
+            H = batch_dims['H']
+            W = batch_dims['W']
 
-            # 使用vggt.py中已计算的xyz_camera（避免重复计算）
-            if 'xyz_camera' in preds:
-                # 使用已计算的camera坐标系xyz [B, S, H*W, 3]
-                xyz_camera = preds['xyz_camera']
-                xyz = xyz_camera[0]  # [S, H*W, 3]
-                B, S = xyz_camera.shape[0], xyz_camera.shape[1]
-                H_W = xyz.shape[1]
-                # 从world_points推断H和W
-                if 'world_points' in preds:
-                    world_points_shape = preds['world_points'].shape  # [B, S, H, W, 3]
-                    H, W = world_points_shape[2], world_points_shape[3]
-                else:
-                    # 根据H*W推断H和W（假设H和W接近）
-                    import math
-                    H = W = int(math.sqrt(H_W))
-            else:
-                # 如果xyz_camera不存在，使用默认值
-                B, S = velocity_global.shape[0], velocity_global.shape[1] if velocity_global is not None else 4
-                H, W = 224, 224  # 默认尺寸
-                xyz = torch.zeros(S, H*W, 3, device=self.device)
+            # 获取xyz_camera（已在vggt.py中计算）
+            xyz_camera = preds['xyz_camera']  # [B, S, H*W, 3]
+            xyz = xyz_camera[0]  # [S, H*W, 3]
 
-            # 统一velocity_global格式为 [S, H*W, 3]（取第一个batch）
-            if velocity_global is not None:
-                velocity_reshaped = velocity_global[0]  # [S, ...]
-                if velocity_reshaped.ndim == 4:  # [S, H, W, 3] -> [S, H*W, 3]
-                    velocity_reshaped = velocity_reshaped.reshape(velocity_reshaped.shape[0], -1, 3)
-                if velocity_reshaped.ndim != 3 or velocity_reshaped.shape[-1] != 3:
-                    raise ValueError(f"Unexpected velocity_global shape: {velocity_global.shape}")
-                # 注意：速度激活和坐标变换已经在vggt.py的forward中完成
-            else:
-                velocity_reshaped = torch.zeros(S, H*W, 3, device=self.device)
+            # 获取velocity_global（已在vggt.py中计算并转换到全局坐标系）
+            velocity_global = preds['velocity_global']  # [B, S, H, W, 3] or [B, S, H*W, 3]
+            velocity_reshaped = velocity_global[0]  # [S, H, W, 3] or [S, H*W, 3]
 
-            # 获取confidence掩码
-            conf_mask = None
-            if 'depth_conf_mask' in preds and preds['depth_conf_mask'] is not None:
-                conf_mask = preds['depth_conf_mask']  # [B, S, H, W]
-                if len(conf_mask.shape) == 4:
-                    conf_mask = conf_mask[0]  # [S, H, W]
-                conf_mask = conf_mask.reshape(S, H*W)  # [S, H*W]
+            # 统一为 [S, H*W, 3] 格式
+            if velocity_reshaped.ndim == 4:  # [S, H, W, 3]
+                velocity_reshaped = velocity_reshaped.reshape(S, H * W, 3)
 
             # 获取gt_scale用于将velocity转换到metric尺度
             gt_scale = vggt_batch.get('depth_scale_factor', 1.0)
@@ -763,23 +737,22 @@ class OnlineDynamicProcessor:
                 gt_scale = gt_scale[0] if gt_scale.ndim > 0 else gt_scale
 
             # 使用直接定义的动态物体聚类函数
-            # 注意：不在这里detach，让xyz和velocity保留梯度
-            # 在clustering函数内部，只在需要numpy/cupy操作时才detach
             clustering_results = dynamic_object_clustering(
-                xyz,  # [S, H*W, 3] - 保留梯度！
-                velocity_reshaped,  # [S, H*W, 3] (非metric尺度) - 保留梯度！
+                xyz,  # [S, H*W, 3] - 保留梯度
+                velocity_reshaped,  # [S, H*W, 3] - 保留梯度
                 velocity_threshold=self.velocity_threshold,  # 速度阈值(metric尺度, m/s)
                 eps=self.clustering_eps,  # DBSCAN的邻域半径
                 min_samples=self.clustering_min_samples,  # DBSCAN的最小样本数
                 area_threshold=self.min_object_size,  # 面积阈值
-                conf_mask=conf_mask,  # confidence掩码
                 gt_scale=gt_scale  # GT scale factor
             )
 
             return clustering_results
 
         except Exception as e:
-            # 返回空的聚类结果
+            _print_main(f"⚠️  聚类失败: {e}")
+            import traceback
+            traceback.print_exc()
             return []
 
 
@@ -1392,26 +1365,21 @@ class OnlineDynamicProcessor:
         self,
         preds: Dict[str, Any],
         clustering_results: List[Dict],
-        H: int, W: int, S: int,
         sky_masks: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """直接使用动态聚类结果中的full_labels提取静态背景（标签为-1的gaussian），并过滤sky区域"""
         try:
-            # 获取gaussian参数
-            gaussian_params = preds.get('gaussian_params')
-            if gaussian_params is None:
-                return self._create_default_static_background(H, W)
+            # 从preds获取批次维度信息
+            batch_dims = preds['batch_dims']
+            H = batch_dims['H']
+            W = batch_dims['W']
+            S = batch_dims['S']
 
-            # 重新整形Gaussian参数为 [S, H*W, gaussian_output_dim]
-            if gaussian_params.dim() == 3 and gaussian_params.shape[1] == S * H * W:
-                # [B, S*H*W, gaussian_output_dim] -> [S, H*W, gaussian_output_dim]
-                gaussian_params = gaussian_params[0].reshape(S, H * W, self.gaussian_output_dim)
-            elif gaussian_params.dim() == 3 and gaussian_params.shape[0] == S:
-                # [S, H*W, gaussian_output_dim] -> 已经是正确形状
-                pass
-            else:
-                # 其他情况，尝试重新整形
-                gaussian_params = gaussian_params.reshape(S, H * W, self.gaussian_output_dim)
+            # 获取gaussian参数（必须存在）
+            gaussian_params = preds['gaussian_params']  # [B, S, H, W, gaussian_output_dim]
+
+            # 重新整形为 [S, H*W, gaussian_output_dim]
+            gaussian_params = gaussian_params[0].reshape(S, H * W, self.gaussian_output_dim)
 
             static_gaussians = []
 
@@ -1453,43 +1421,10 @@ class OnlineDynamicProcessor:
             return static_gaussians
 
         except Exception as e:
-            # 回退到默认方法
-            _print_main(f"⚠️  静态背景提取失败: {e}，回退到默认方法")
+            _print_main(f"❌ 静态背景提取失败: {e}")
             import traceback
             traceback.print_exc()
-            return self._create_default_static_background(H, W)
-
-    def _create_default_static_background(self, H: int, W: int) -> torch.Tensor:
-        """创建默认静态背景（回退方案）"""
-        try:
-            num_background_points = min(1000, H * W // 100)
-            background_gaussians = torch.zeros(
-                num_background_points, self.gaussian_output_dim, device=self.device)
-
-            # xyz位置: 随机分布在3D空间中 (0:3)
-            background_gaussians[:, :3] = torch.randn(
-                num_background_points, 3, device=self.device) * 2.0
-
-            # scale尺度 (3:6)
-            background_gaussians[:, 3:6] = 0.1
-
-            # SH系数 (6:6+sh_dim) - 设置DC分量为灰色
-            sh_start = 6
-            background_gaussians[:, sh_start:sh_start+3] = 0.3
-
-            # rotation旋转（单位四元数） (6+sh_dim:6+sh_dim+4)
-            rotation_start = 6 + self.sh_dim
-            background_gaussians[:, rotation_start:rotation_start+4] = torch.tensor(
-                [1.0, 0.0, 0.0, 0.0], device=self.device)
-
-            # opacity不透明度 (6+sh_dim+4)
-            opacity_idx = 6 + self.sh_dim + 4
-            background_gaussians[:, opacity_idx] = 0.1
-
-            return background_gaussians
-
-        except Exception as e:
-            return torch.zeros(100, self.gaussian_output_dim, device=self.device)
+            raise
 
     def get_statistics(self) -> Dict[str, Any]:
         """获取处理统计信息"""

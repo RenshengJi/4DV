@@ -1854,11 +1854,11 @@ class OpticalFlowRegistration:
         Args:
             aggregated_points: 聚合后的3D点坐标 [N, 3] - torch.Tensor，保留梯度
             point_indices: 每个点对应的(frame_idx, pixel_idx) [(frame, pixel), ...]
-            gaussian_params: VGGT预测的Gaussian参数 [B, S*H*W, 14]
+            gaussian_params: VGGT预测的Gaussian参数 [B, S, H, W, gaussian_output_dim]
             vggt_batch: 批次数据
 
         Returns:
-            合并的Gaussian参数 [N, 14] 或 None，保留梯度
+            合并的Gaussian参数 [N, gaussian_output_dim] 或 None，保留梯度
         """
         try:
             if 'images' not in vggt_batch:
@@ -1870,6 +1870,11 @@ class OpticalFlowRegistration:
                 return None
 
             B, S, C, H, W = vggt_batch['images'].shape
+
+            # Reshape gaussian_params from [B, S, H, W, gaussian_output_dim] to [B, S*H*W, gaussian_output_dim]
+            gaussian_output_dim = gaussian_params.shape[-1]
+            gaussian_params = gaussian_params.reshape(B, S * H * W, gaussian_output_dim)
+
             H_W = H * W
 
             # 分离frame_indices和pixel_indices
@@ -1893,7 +1898,7 @@ class OpticalFlowRegistration:
                 return None
 
             # 使用矢量操作一次性提取所有对应的Gaussian参数
-            extracted_gaussians = gaussian_params[0, valid_global_indices].clone()  # [N_valid, 14]
+            extracted_gaussians = gaussian_params[0, valid_global_indices].clone()  # [N_valid, gaussian_output_dim]
 
             # 用聚合后的点坐标替换Gaussian参数的前三维（保留梯度！）
             # aggregated_points已经是torch.Tensor，直接使用
@@ -1923,13 +1928,13 @@ class OpticalFlowRegistration:
 
         Args:
             clustering_result: 单帧聚类结果
-            cluster_idx: 聚类索引  
+            cluster_idx: 聚类索引
             frame_idx: 帧索引
-            gaussian_params: VGGT预测的Gaussian参数 [B, S*H*W, 14]
+            gaussian_params: VGGT预测的Gaussian参数 [B, S, H, W, gaussian_output_dim]
             vggt_batch: 批次数据
 
         Returns:
-            提取的Gaussian参数 [N, 14] 或 None
+            提取的Gaussian参数 [N, gaussian_output_dim] 或 None
         """
         try:
             # 获取该聚类的像素索引
@@ -1951,17 +1956,18 @@ class OpticalFlowRegistration:
                 print(f"    无法从vggt_batch获取图像尺寸")
                 return None
 
+            # Reshape gaussian_params from [B, S, H, W, gaussian_output_dim] to [B, S*H*W, gaussian_output_dim]
+            gaussian_output_dim = gaussian_params.shape[-1]
+            gaussian_params = gaussian_params.reshape(B, S * H * W, gaussian_output_dim)
+
             # 计算全局索引：frame_idx * H*W + pixel_idx
             H_W = H * W
             # 使用矢量操作计算全局索引
-            pixel_indices_tensor = torch.tensor(pixel_indices, dtype=torch.long)
+            pixel_indices_tensor = torch.tensor(pixel_indices, dtype=torch.long, device=gaussian_params.device)
             global_indices = frame_idx * H_W + pixel_indices_tensor
 
-            # 提取对应的Gaussian参数
-            B_g, N_total, feature_dim = gaussian_params.shape
-
             # 使用矢量索引直接提取参数，避免for循环
-            selected_gaussians_tensor = gaussian_params[0, global_indices]  # [N, 14]
+            selected_gaussians_tensor = gaussian_params[0, global_indices]  # [N, gaussian_output_dim]
 
             if selected_gaussians_tensor.shape[0] == 0:
                 print(f"    无法提取有效的Gaussian参数")
@@ -1972,6 +1978,8 @@ class OpticalFlowRegistration:
 
         except Exception as e:
             print(f"    提取Gaussian参数失败: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def _apply_transformation(self, points: torch.Tensor, transformation: torch.Tensor) -> torch.Tensor:
