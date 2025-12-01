@@ -1620,8 +1620,8 @@ class OpticalFlowRegistration:
             frame_idx = object_frames[0]
             result = clustering_results[frame_idx]
             cluster_idx = result['global_ids'].index(global_id)
-            object_mask = result['labels'] == cluster_idx
-            object_points = result['points'][object_mask]  # 保留torch.Tensor，保留梯度
+            object_mask = result['labels'] == cluster_idx    #TODO:  delete
+            object_points = result['points'][object_mask]  # 保留torch.Tensor，保留梯度. #TODO: delete
 
             # 单帧颜色处理已删除（不再需要）
 
@@ -1634,7 +1634,7 @@ class OpticalFlowRegistration:
             frame_gaussians = {}  # 新增：每帧的原始Gaussian参数
             if preds and 'gaussian_params' in preds:
                 # 创建单帧的点索引对应关系
-                single_frame_point_indices = [(frame_idx, pixel_idx) for pixel_idx in single_frame_pixel_indices[:len(object_points)]]
+                single_frame_point_indices = [(frame_idx, pixel_idx) for pixel_idx in single_frame_pixel_indices[:len(object_points)]]    #TODO: delete
 
                 canonical_gaussians = self._extract_all_frames_gaussian_params(
                     object_points,  # 直接传torch.Tensor，保留梯度
@@ -1662,9 +1662,9 @@ class OpticalFlowRegistration:
                 'middle_frame': frame_idx,  # 统一使用middle_frame
                 'object_frames': [frame_idx],
                 'transformations': {},
-                'canonical_gaussians': canonical_gaussians,  # 添加Gaussian参数
-                'frame_gaussians': frame_gaussians,  # 新增：每帧的原始Gaussian参数
-                'reference_frame': frame_idx,  # 保留向后兼容
+                'canonical_gaussians': canonical_gaussians,  # canonical space
+                'frame_gaussians': frame_gaussians,  # 每帧的原始Gaussian参数
+                'reference_frame': frame_idx,  # 保留向后兼容 
                 'num_frames': 1,
                 'num_points': len(object_points),
                 'step_times': step_times  # 添加时间统计

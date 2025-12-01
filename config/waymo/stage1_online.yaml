@@ -25,10 +25,9 @@ pretrained_velocity: False
 # pretrained_velocity: "checkpoints/waymo_new/segmetation+degree0+lr5e-5forreusme_resumefrombefore/checkpoint-epoch_0_13020.pth"
 
 # VGGT冻结策略配置
-# 可选值: "none", "encoder", "encoder_frame", "backbone", "backbone_camera", "backbone_pts",
-#        "vggt", "vggt_wo_velocity", "vggt_wo_depth", "vggt_wo_gaussian_and_velocity", "all", "old"
+# 可选值: "none", "noap",
 # null表示不设置冻结策略（保持模型默认行为）
-vggt_freeze_strategy: null
+vggt_freeze_strategy: "noap"
 
 
 # =============== 辅助模型配置 ===============

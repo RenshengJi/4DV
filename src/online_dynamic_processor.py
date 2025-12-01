@@ -769,7 +769,7 @@ class OnlineDynamicProcessor:
 
         try:
 
-            # 1. 预计算所有帧之间的光流
+            # 1. 预计算所有帧之间的光流. #TODO: delete
             flow_start = time.time()
             flows = self.optical_flow_registration.precompute_optical_flows(
                 vggt_batch)
@@ -790,7 +790,7 @@ class OnlineDynamicProcessor:
             aggregation_start = time.time()
             individual_object_times = []
 
-            for i, global_id in enumerate(all_global_ids):
+            for i, global_id in enumerate(all_global_ids):   #TODO: parallel
                 object_start = time.time()
                 try:
                     aggregated_object = self.optical_flow_registration.aggregate_object_to_middle_frame(

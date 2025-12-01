@@ -128,7 +128,7 @@ def load_dataset(seq_dir, num_views):
         valid_camera_id_list=["1", "2", "3"],
         resolution=[(518, 378), (518, 336), (518, 294), (518, 252), (518, 210),
                     (518, 140), (378, 518), (336, 518), (294, 518), (252, 518)],
-        num_views=num_views,  # 使用函数参数而不是args.num_views
+        num_views=num_views,  
         seed=42,
         n_corres=0,
         seq_aug_crop=True

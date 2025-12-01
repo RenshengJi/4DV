@@ -145,12 +145,12 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
     def set_freeze(self, freeze):
         to_be_frozen = {
             "none": [],
-            "all": [
+            "noap": [
                 self.aggregator,
                 self.camera_head,
                 self.point_head,
                 self.depth_head,
-                self.gaussian_head,
+                # self.gaussian_head,
                 self.velocity_head,
                 self.scale_head if self.use_scale_token else None,
                 self.scale_token if self.use_scale_token else None,
