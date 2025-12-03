@@ -130,6 +130,11 @@ aggregator_all_detach_velocity: false      # 是否detach velocity阻止梯度�
 # Stage2配置（用于aggregator_all loss的渲染配置）
 stage2_render_only_dynamic: false          # 是否只渲染动态物体
 stage2_supervise_only_dynamic: false       # 是否只监督动态区域
+
+# 渲染配置（用于self_render_loss和aggregator_all_loss）
+enable_voxel_pruning: true                 # 是否启用voxel剪枝
+voxel_size: 0.002                          # voxel大小（metric尺度，单位米）
+
 # 动态处理器配置（用于aggregator_all loss的动态物体处理）
 min_object_size: 500                       # 最小物体尺寸（点数）
 max_objects_per_frame: 10                  # 每帧最大物体数量

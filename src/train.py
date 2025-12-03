@@ -178,6 +178,8 @@ def train(args):
         'depth_weight': getattr(args, 'aggregator_all_render_depth_weight', 1.0),
         'lpips_weight': getattr(args, 'aggregator_all_render_lpips_weight', 0.1),
         'render_only_dynamic': getattr(args, 'stage2_render_only_dynamic', False),
+        'enable_voxel_pruning': getattr(args, 'enable_voxel_pruning', True),
+        'voxel_size': getattr(args, 'voxel_size', 0.002),
     }
     stage2_criterion = Stage2CompleteLoss(render_loss_config=stage2_loss_config)
     stage2_criterion.to(device)
@@ -556,7 +558,9 @@ def train(args):
                     try:
                         self_loss_dict, _ = self_render_and_loss(
                             vggt_batch=vggt_batch,
-                            preds=preds
+                            preds=preds,
+                            enable_voxel_pruning=getattr(args, 'enable_voxel_pruning', True),
+                            voxel_size=getattr(args, 'voxel_size', 0.002)
                         )
                         # 将所有self_render损失加入到总loss中
                         self_render_rgb_loss = self_loss_dict.get("loss_self_render_rgb", 0.0)
@@ -867,7 +871,8 @@ def train(args):
                                 extrinsics=extrinsics,
                                 sky_masks=sky_masks,
                                 sky_colors=sky_colors,
-                                sampled_frame_indices=sampled_frame_indices
+                                sampled_frame_indices=sampled_frame_indices,
+                                depth_scale_factor=vggt_batch.get('depth_scale_factor', None)
                             )
 
                             # 提取各项loss并加权

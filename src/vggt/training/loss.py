@@ -12,6 +12,7 @@ from dust3r.utils.misc import tf32_off
 from gsplat.rendering import rasterization
 from dust3r.utils.metrics import compute_lpips
 from vggt.utils.pose_enc import extri_intri_to_pose_encoding, pose_encoding_to_extri_intri
+from vggt.training.stage2_loss import prune_gaussians_by_voxel
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -655,7 +656,7 @@ def warp_gaussian(flow, mask, gaussian_means, gaussian_vel, T, H, W, direction="
 
 
 
-def self_render_and_loss(vggt_batch, preds, sampled_frame_indices=None, sh_degree=0):
+def self_render_and_loss(vggt_batch, preds, sampled_frame_indices=None, sh_degree=0, enable_voxel_pruning=True, voxel_size=0.002):
     """
     自渲染损失函数：每一帧自己进行渲染与监督，支持天空区域的mask替代
 
@@ -664,6 +665,8 @@ def self_render_and_loss(vggt_batch, preds, sampled_frame_indices=None, sh_degre
         preds: dict 模型预测结果，包含gaussian_params, xyz_camera, extrinsics, intrinsics, pred_sky_colors等
         sampled_frame_indices: list 采样的帧索引 (可选，如果为None则渲染所有帧)
         sh_degree: int spherical harmonics degree
+        enable_voxel_pruning: bool 是否启用voxel剪枝
+        voxel_size: float voxel大小（metric尺度，单位米）
 
     Returns:
         dict: 损失字典
@@ -715,10 +718,19 @@ def self_render_and_loss(vggt_batch, preds, sampled_frame_indices=None, sh_degre
         render_colors_tensor = torch.zeros(num_frames_to_render, image_height, image_width, 4, device=gt_rgb.device, dtype=xyz.dtype)
         render_alphas_tensor = torch.zeros(num_frames_to_render, image_height, image_width, 1, device=gt_rgb.device, dtype=xyz.dtype)
 
+        # 获取depth_scale_factor用于voxel pruning
+        depth_scale_factor = vggt_batch.get('depth_scale_factor', None)
+        if depth_scale_factor is not None and torch.is_tensor(depth_scale_factor):
+            depth_scale_factor = depth_scale_factor.item()
+
         # 对采样的帧进行自渲染
         for render_idx, i in enumerate(sampled_frame_indices):
             # 使用当前帧的3D点进行渲染（不使用velocity，因为是自己渲染自己）
             mean_current = xyz[i]  # 不使用velocity，直接使用当前帧的3D点
+            scale_current = scale[i]
+            rotations_current = rotations[i]
+            opacity_current = opacity[i]
+            sh_coeffs_current = sh_coeffs_reshaped[i]
 
             # 3. 天空处理：与stage2_loss.py保持一致，过滤掉天空区域的gaussian点
             if sky_masks is not None:
@@ -728,32 +740,47 @@ def self_render_and_loss(vggt_batch, preds, sampled_frame_indices=None, sh_degre
                 non_sky_mask = ~current_sky_mask.bool()
 
                 if non_sky_mask.sum() > 0:
-                    # 只渲染非天空区域的gaussian点
-                    render_color, render_alpha, _ = rasterization(
-                        mean_current[non_sky_mask], rotations[i][non_sky_mask],
-                        scale[i][non_sky_mask], opacity[i][non_sky_mask], sh_coeffs_reshaped[i][non_sky_mask],
-                        viewmat[i], K[i], image_width, image_height,
-                        sh_degree=sh_degree, render_mode="RGB+ED",
-                        radius_clip=0, near_plane=0.0001,
-                        far_plane=1000.0,
-                        eps2d=0.3,
-                    )
+                    # 过滤天空区域
+                    mean_current = mean_current[non_sky_mask]
+                    scale_current = scale_current[non_sky_mask]
+                    rotations_current = rotations_current[non_sky_mask]
+                    opacity_current = opacity_current[non_sky_mask]
+                    sh_coeffs_current = sh_coeffs_current[non_sky_mask]
                 else:
                     # 如果全是天空，创建空的渲染结果
                     render_color = torch.zeros((image_height, image_width, 4),
                                              device=mean_current.device, dtype=mean_current.dtype)
                     render_alpha = torch.zeros((image_height, image_width, 1),
                                              device=mean_current.device, dtype=mean_current.dtype)
-            else:
-                # 没有天空mask，正常渲染所有点
+                    render_colors_tensor[render_idx] = render_color
+                    render_alphas_tensor[render_idx] = render_alpha
+                    continue
+
+            # 应用voxel pruning（如果启用且有点可以渲染）
+            if enable_voxel_pruning and mean_current.shape[0] > 0:
+                mean_current, scale_current, rotations_current, opacity_current, sh_coeffs_current = prune_gaussians_by_voxel(
+                    mean_current, scale_current, rotations_current, opacity_current, sh_coeffs_current,
+                    voxel_size=voxel_size,
+                    depth_scale_factor=depth_scale_factor
+                )
+
+            # 渲染
+            if mean_current.shape[0] > 0:
                 render_color, render_alpha, _ = rasterization(
-                    mean_current, rotations[i], scale[i], opacity[i], sh_coeffs_reshaped[i],
+                    mean_current, rotations_current,
+                    scale_current, opacity_current, sh_coeffs_current,
                     viewmat[i], K[i], image_width, image_height,
                     sh_degree=sh_degree, render_mode="RGB+ED",
                     radius_clip=0, near_plane=0.0001,
                     far_plane=1000.0,
                     eps2d=0.3,
                 )
+            else:
+                # 没有点可渲染，创建空的渲染结果
+                render_color = torch.zeros((image_height, image_width, 4),
+                                         device=gt_rgb.device, dtype=xyz.dtype)
+                render_alpha = torch.zeros((image_height, image_width, 1),
+                                         device=gt_rgb.device, dtype=xyz.dtype)
 
             # Write directly to pre-allocated tensor using render_idx
             render_colors_tensor[render_idx] = render_color

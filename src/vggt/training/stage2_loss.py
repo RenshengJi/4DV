@@ -116,6 +116,105 @@ def depth_to_world_points(depth, intrinsic):
     return camera_points
 
 
+def prune_gaussians_by_voxel(means, scales, rotations, opacities, colors, voxel_size, depth_scale_factor=None):
+    """
+    使用voxel方法对Gaussian进行剪枝，合并同一voxel内的Gaussian。
+
+    参考自HunyuanWorld的prune_gs方法，但不使用权重加权，而是直接平均。
+
+    Args:
+        means: [N, 3] Gaussian中心位置
+        scales: [N, 3] Gaussian缩放
+        rotations: [N, 4] Gaussian旋转（四元数）
+        opacities: [N] Gaussian不透明度
+        colors: [N, K, 3] Gaussian颜色（K为球谐基数或1）
+        voxel_size: float voxel大小（metric尺度）
+        depth_scale_factor: float 深度缩放因子，用于将norm尺度转换为metric尺度
+
+    Returns:
+        pruned_means, pruned_scales, pruned_rotations, pruned_opacities, pruned_colors
+    """
+    if means.shape[0] == 0:
+        return means, scales, rotations, opacities, colors
+
+    # 如果提供了depth_scale_factor，需要将xyz从norm尺度转换到metric尺度
+    if depth_scale_factor is not None:
+        # depth_scale_factor = 1 / dist_avg，所以metric尺度 = norm尺度 / depth_scale_factor
+        effective_voxel_size = voxel_size * depth_scale_factor
+    else:
+        effective_voxel_size = voxel_size
+
+    # 计算voxel索引
+    voxel_indices = (means / effective_voxel_size).floor().long()  # [N, 3]
+
+    # 将3D voxel索引转换为1D索引以便分组
+    min_indices = voxel_indices.min(dim=0)[0]
+    voxel_indices = voxel_indices - min_indices  # 确保索引从0开始
+    max_dims = voxel_indices.max(dim=0)[0] + 1
+
+    # 将3D索引展平为1D
+    flat_indices = (voxel_indices[:, 0] * max_dims[1] * max_dims[2] +
+                   voxel_indices[:, 1] * max_dims[2] +
+                   voxel_indices[:, 2])
+
+    # 找到唯一的voxel
+    unique_voxels, inverse_indices = torch.unique(flat_indices, return_inverse=True)
+    K = len(unique_voxels)
+
+    device = means.device
+    num_sh = colors.shape[1] if colors.ndim == 3 else 1
+
+    # 初始化合并后的Gaussian参数
+    merged_means = torch.zeros((K, 3), device=device, dtype=means.dtype)
+    merged_scales = torch.zeros((K, 3), device=device, dtype=scales.dtype)
+    merged_rotations = torch.zeros((K, 4), device=device, dtype=rotations.dtype)
+    merged_opacities = torch.zeros(K, device=device, dtype=opacities.dtype)
+    if colors.ndim == 3:
+        merged_colors = torch.zeros((K, num_sh, 3), device=device, dtype=colors.dtype)
+    else:
+        merged_colors = torch.zeros((K, 3), device=device, dtype=colors.dtype)
+
+    # 计算每个voxel内的点数，用于平均
+    counts = torch.zeros(K, device=device, dtype=torch.float32)
+    counts.scatter_add_(0, inverse_indices, torch.ones_like(inverse_indices, dtype=torch.float32))
+    counts = torch.clamp(counts, min=1.0)  # 避免除0
+
+    # 合并means（直接平均）
+    for d in range(3):
+        merged_means[:, d].scatter_add_(0, inverse_indices, means[:, d])
+    merged_means = merged_means / counts.unsqueeze(1)
+
+    # 合并scales（直接平均）
+    for d in range(3):
+        merged_scales[:, d].scatter_add_(0, inverse_indices, scales[:, d])
+    merged_scales = merged_scales / counts.unsqueeze(1)
+
+    # 合并opacities（直接平均）
+    merged_opacities.scatter_add_(0, inverse_indices, opacities)
+    merged_opacities = merged_opacities / counts
+
+    # 合并colors（直接平均）
+    if colors.ndim == 3:
+        # [N, num_sh, 3] 格式
+        for sh_idx in range(num_sh):
+            for d in range(3):
+                merged_colors[:, sh_idx, d].scatter_add_(0, inverse_indices, colors[:, sh_idx, d])
+        merged_colors = merged_colors / counts.unsqueeze(-1).unsqueeze(-1)
+    else:
+        # [N, 3] 格式
+        for d in range(3):
+            merged_colors[:, d].scatter_add_(0, inverse_indices, colors[:, d])
+        merged_colors = merged_colors / counts.unsqueeze(1)
+
+    # 合并quaternions（平均后归一化）
+    for d in range(4):
+        merged_rotations[:, d].scatter_add_(0, inverse_indices, rotations[:, d])
+    quat_norms = torch.norm(merged_rotations, dim=1, keepdim=True)
+    merged_rotations = merged_rotations / torch.clamp(quat_norms, min=1e-8)
+
+    return merged_means, merged_scales, merged_rotations, merged_opacities, merged_colors
+
+
 class Stage2RenderLoss(nn.Module):
     """第二阶段渲染损失"""
 
@@ -125,7 +224,9 @@ class Stage2RenderLoss(nn.Module):
         depth_weight: float = 0.0,  # 禁用depth loss
         lpips_weight: float = 0.0,  # LPIPS loss权重
         render_only_dynamic: bool = False,  # 是否只渲染动态物体
-        sh_degree: int = 0  # 球谐函数阶数
+        sh_degree: int = 0,  # 球谐函数阶数
+        enable_voxel_pruning: bool = True,  # 是否启用voxel剪枝
+        voxel_size: float = 0.002  # voxel大小（metric尺度，单位米）
     ):
         super().__init__()
         self.rgb_weight = rgb_weight
@@ -133,6 +234,8 @@ class Stage2RenderLoss(nn.Module):
         self.lpips_weight = lpips_weight
         self.render_only_dynamic = render_only_dynamic
         self.sh_degree = sh_degree
+        self.enable_voxel_pruning = enable_voxel_pruning
+        self.voxel_size = voxel_size
 
     def forward(
         self,
@@ -143,7 +246,8 @@ class Stage2RenderLoss(nn.Module):
         extrinsics: torch.Tensor,
         sky_masks: Optional[torch.Tensor] = None,
         sky_colors: Optional[torch.Tensor] = None,
-        sampled_frame_indices: Optional[torch.Tensor] = None
+        sampled_frame_indices: Optional[torch.Tensor] = None,
+        depth_scale_factor: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
         计算第二阶段的渲染损失
@@ -157,6 +261,7 @@ class Stage2RenderLoss(nn.Module):
             sky_masks: [B, S, H, W] 天空区域掩码
             sky_colors: [B, num_frames, 3, H, W] 天空颜色，用于与渲染结果合成
             sampled_frame_indices: [num_frames] 采样帧索引
+            depth_scale_factor: 深度缩放因子，用于voxel pruning
 
         Returns:
             loss_dict: 损失字典
@@ -178,7 +283,8 @@ class Stage2RenderLoss(nn.Module):
             # 渲染当前帧
             rendered_rgb, rendered_depth, rendered_alpha = self._render_frame(
                 refined_scene, frame_intrinsic, frame_extrinsic, H, W, frame_idx,
-                render_only_dynamic=self.render_only_dynamic
+                render_only_dynamic=self.render_only_dynamic,
+                depth_scale_factor=depth_scale_factor
             )
 
             # 如果提供了 sky_colors，使用 alpha 与 sky 合成最终图像
@@ -287,7 +393,8 @@ class Stage2RenderLoss(nn.Module):
         width: int,
         frame_idx: int = 0,
         sky_colors: Optional[torch.Tensor] = None,
-        render_only_dynamic: bool = False
+        render_only_dynamic: bool = False,
+        depth_scale_factor: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         渲染单帧图像
@@ -300,6 +407,7 @@ class Stage2RenderLoss(nn.Module):
             frame_idx: 当前帧索引
             sky_colors: [H, W, 3] 天空颜色 (可选)
             render_only_dynamic: 是否只渲染动态物体 (默认False)
+            depth_scale_factor: 深度缩放因子，用于voxel pruning
 
         Returns:
             rendered_rgb: [3, H, W] 渲染的RGB图像
@@ -375,10 +483,24 @@ class Stage2RenderLoss(nn.Module):
 
         # 安全性检查：检测并修复NaN/Inf值
         means = torch.nan_to_num(means, nan=0.0, posinf=0.0, neginf=0.0)
-        scales = torch.nan_to_num(scales, nan=0.01, posinf=1.0, neginf=0.01) 
-        colors = torch.nan_to_num(colors, nan=0.5, posinf=1.0, neginf=0.0) 
+        scales = torch.nan_to_num(scales, nan=0.01, posinf=1.0, neginf=0.01)
+        colors = torch.nan_to_num(colors, nan=0.5, posinf=1.0, neginf=0.0)
         rotations = torch.nan_to_num(rotations, nan=0.0, posinf=1.0, neginf=-1.0)
-        opacities = torch.nan_to_num(opacities, nan=0.5, posinf=1.0, neginf=0.0) 
+        opacities = torch.nan_to_num(opacities, nan=0.5, posinf=1.0, neginf=0.0)
+
+        # 应用voxel pruning（如果启用）
+        if self.enable_voxel_pruning and means.shape[0] > 0:
+            # 提取depth_scale_factor的数值
+            dsf = depth_scale_factor.item() if depth_scale_factor is not None and torch.is_tensor(depth_scale_factor) else depth_scale_factor
+
+            # colors需要保持[N, 1, 3]格式
+            colors_squeezed = colors.squeeze(1)  # [N, 3]
+            means, scales, rotations, opacities, colors_pruned = prune_gaussians_by_voxel(
+                means, scales, rotations, opacities, colors_squeezed,
+                voxel_size=self.voxel_size,
+                depth_scale_factor=dsf
+            )
+            colors = colors_pruned.unsqueeze(1)  # [N, 3] -> [N, 1, 3]
 
         # 准备渲染参数
         viewmat = extrinsic.unsqueeze(0)  # [1, 4, 4]
@@ -479,7 +601,8 @@ class Stage2CompleteLoss(nn.Module):
         extrinsics: torch.Tensor,
         sky_masks: Optional[torch.Tensor] = None,
         sky_colors: Optional[torch.Tensor] = None,
-        sampled_frame_indices: Optional[torch.Tensor] = None
+        sampled_frame_indices: Optional[torch.Tensor] = None,
+        depth_scale_factor: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
         计算第二阶段的完整损失
@@ -494,6 +617,7 @@ class Stage2CompleteLoss(nn.Module):
             sky_masks: 天空区域掩码
             sky_colors: [B, num_frames, 3, H, W] 天空颜色
             sampled_frame_indices: [num_frames] 采样帧索引
+            depth_scale_factor: 深度缩放因子，用于voxel pruning
 
         Returns:
             complete_loss_dict: 完整损失字典
@@ -502,7 +626,8 @@ class Stage2CompleteLoss(nn.Module):
         render_loss_dict = self.render_loss(
             refined_scene, gt_images, gt_depths,
             intrinsics, extrinsics, sky_masks,
-            sky_colors, sampled_frame_indices
+            sky_colors, sampled_frame_indices,
+            depth_scale_factor
         )
 
         # 直接使用渲染损失作为完整损失
