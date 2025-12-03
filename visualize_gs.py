@@ -45,8 +45,6 @@ def parse_args():
     parser.add_argument("--fps", type=float, default=10.0, help="Playback frame rate (frames per second)")
 
     # Dynamic processor参数
-    parser.add_argument("--use_velocity_based_transform", action="store_true",
-                       help="Use velocity-based transformation")
     parser.add_argument("--velocity_transform_mode", type=str, default="procrustes",
                        choices=["simple", "procrustes"], help="Velocity transformation mode")
     parser.add_argument("--use_gt_camera", action="store_true", help="Use GT camera parameters")
@@ -443,7 +441,6 @@ def run_inference(args):
     # Create dynamic processor
     dynamic_processor = OnlineDynamicProcessor(
         device=device,
-        use_velocity_based_transform=args.use_velocity_based_transform,
         velocity_transform_mode=args.velocity_transform_mode,
         velocity_threshold=args.velocity_threshold,
         clustering_eps=args.clustering_eps,

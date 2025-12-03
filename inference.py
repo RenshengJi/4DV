@@ -53,8 +53,6 @@ def parse_args():
     parser.add_argument("--continue_on_error", action="store_true", help="Continue on error in batch mode")
 
     # Dynamic processor参数
-    parser.add_argument("--use_velocity_based_transform", action="store_true",
-                       help="Use velocity-based transformation")
     parser.add_argument("--velocity_transform_mode", type=str, default="procrustes",
                        choices=["simple", "procrustes"], help="Velocity transformation mode")
 
@@ -744,10 +742,9 @@ def main():
     model = load_model(args.model_path, device, args)
     dataset = load_dataset(args.seq_dir, args.num_views)
 
-    # Create dynamic processor (不传use_gt_camera参数)
+    # Create dynamic processor
     dynamic_processor = OnlineDynamicProcessor(
         device=device,
-        use_velocity_based_transform=args.use_velocity_based_transform,
         velocity_transform_mode=args.velocity_transform_mode,
         velocity_threshold=args.velocity_threshold,
         clustering_eps=args.clustering_eps,

@@ -162,7 +162,6 @@ def train(args):
         'tracking_position_threshold': getattr(args, 'tracking_position_threshold', 2.0),
         'tracking_velocity_threshold': getattr(args, 'tracking_velocity_threshold', 0.2),
         'use_optical_flow_aggregation': getattr(args, 'enable_optical_flow_aggregation', True),
-        'use_velocity_based_transform': getattr(args, 'use_velocity_based_transform', False),
         'velocity_transform_mode': getattr(args, 'velocity_transform_mode', 'simple')
     }
 

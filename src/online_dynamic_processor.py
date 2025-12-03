@@ -12,18 +12,17 @@
 """
 
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
 import numpy as np
-import cv2
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any
 import time
 from collections import defaultdict
 
-# 导入现有的聚类和光流配准系统
+# 聚类和匹配算法
 import sys
 import os
 from cuml.cluster import DBSCAN
+from sklearn.cluster import DBSCAN as SklearnDBSCAN
 import cupy as cp
 from scipy.optimize import linear_sum_assignment
 
@@ -283,15 +282,11 @@ def match_objects_across_frames(clustering_results, position_threshold=0.5, velo
                         pos_distance = torch.norm(
                             current_center - predicted_center).item()
 
-                        # 计算速度相似度
-                        vel_distance = torch.norm(
-                            current_velocity - prev_velocity).item()
-
                         # 综合评分（位置权重更高）
-                        score = pos_distance  # + 0.3 * vel_distance
+                        score = pos_distance 
 
                         # 如果满足阈值条件，设置成本；否则保持无穷大
-                        if pos_distance < position_threshold:  # and vel_distance < velocity_threshold:
+                        if pos_distance < position_threshold: 
                             cost_matrix[i, j] = score
 
                 # 使用匈牙利算法求解最优匹配
@@ -392,58 +387,45 @@ def match_objects_across_frames(clustering_results, position_threshold=0.5, velo
 
 
 
-def _import_optical_flow():
-    """延迟导入光流配准"""
+def _import_velocity_registration():
+    """导入velocity配准模块"""
     try:
         import importlib.util
-        import sys
 
-        # 添加根目录和src目录到sys.path
+        # 获取路径
         root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         src_dir = os.path.join(root_dir, 'src')
-        vggt_dir = os.path.join(src_dir, 'vggt')  # vggt 模块目录
-        raft_core_dir = os.path.join(src_dir, 'SEA-RAFT', 'core')  # RAFT 模块目录
-        optical_flow_path = os.path.join(root_dir, "optical_flow_registration.py")
+        registration_path = os.path.join(src_dir, "velocity_registration.py")
 
         # 检查文件是否存在
-        if not os.path.exists(optical_flow_path):
-            _print_main(f"Error: optical_flow_registration.py not found at: {optical_flow_path}")
-            _print_main(f"Root dir: {root_dir}")
-            _print_main(f"Current file: {__file__}")
+        if not os.path.exists(registration_path):
+            _print_main(f"Error: velocity_registration.py not found at: {registration_path}")
             return None
 
-        # 添加必要的路径到sys.path（用于导入vggt、raft等模块）
-        # - vggt_dir: 用于 'from vggt.utils.auxiliary import ...'
-        # - raft_core_dir: 用于 'from raft import RAFT'
+        # 添加必要的路径到sys.path
+        vggt_dir = os.path.join(src_dir, 'vggt')
+        raft_core_dir = os.path.join(src_dir, 'SEA-RAFT', 'core')
         for path in [root_dir, src_dir, vggt_dir, raft_core_dir]:
             if path not in sys.path:
                 sys.path.insert(0, path)
 
-        optical_flow_spec = importlib.util.spec_from_file_location(
-            "optical_flow_reg",
-            optical_flow_path
-        )
-
-        if optical_flow_spec is None:
-            _print_main(f"Error: Failed to create spec for {optical_flow_path}")
+        # 动态加载模块
+        spec = importlib.util.spec_from_file_location("velocity_registration", registration_path)
+        if spec is None or spec.loader is None:
+            _print_main(f"Error: Failed to create module spec")
             return None
 
-        optical_flow_module = importlib.util.module_from_spec(optical_flow_spec)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
 
-        if optical_flow_spec.loader is None:
-            _print_main(f"Error: Spec loader is None for {optical_flow_path}")
+        # 返回VelocityBasedRegistration类
+        if not hasattr(module, 'VelocityBasedRegistration'):
+            _print_main(f"Error: VelocityBasedRegistration class not found")
             return None
 
-        optical_flow_spec.loader.exec_module(optical_flow_module)
-
-        if not hasattr(optical_flow_module, 'OpticalFlowRegistration'):
-            _print_main(f"Error: OpticalFlowRegistration class not found in module")
-            _print_main(f"Available attributes: {dir(optical_flow_module)}")
-            return None
-
-        return optical_flow_module.OpticalFlowRegistration
+        return module.VelocityBasedRegistration
     except Exception as e:
-        _print_main(f"Failed to import optical flow: {e}")
+        _print_main(f"Failed to import velocity registration: {e}")
         import traceback
         traceback.print_exc()
         return None
@@ -454,9 +436,9 @@ class OnlineDynamicProcessor:
     在线动态物体处理器
 
     实时执行：
-    1. 动态物体检测和聚类（使用demo_video_with_pointcloud_save.py中的方法）
-    2. 跨帧物体跟踪（使用成熟的匹配算法）
-    3. 光流配准和聚合（使用optical_flow_registration.py中的方法）
+    1. 动态物体检测和聚类
+    2. 跨帧物体跟踪
+    3. Velocity配准和聚合
     4. 第二阶段训练数据准备
     """
 
@@ -472,7 +454,6 @@ class OnlineDynamicProcessor:
         tracking_position_threshold: float = 2.0,  # 跨帧跟踪位置阈值
         tracking_velocity_threshold: float = 0.2,  # 跨帧跟踪速度阈值
         use_optical_flow_aggregation: bool = True,
-        use_velocity_based_transform: bool = False,  # 使用velocity计算变换（无需光流）
         velocity_transform_mode: str = "simple",  # velocity变换模式: "simple"或"procrustes"
         enable_temporal_cache: bool = True,
         cache_size: int = 16
@@ -490,8 +471,7 @@ class OnlineDynamicProcessor:
             clustering_min_samples: DBSCAN最小样本数
             tracking_position_threshold: 跨帧跟踪位置阈值
             tracking_velocity_threshold: 跨帧跟踪速度阈值
-            use_optical_flow_aggregation: 是否使用光流聚合
-            use_velocity_based_transform: 是否使用velocity计算变换（无需光流）
+            use_optical_flow_aggregation: 是否使用velocity聚合
             velocity_transform_mode: velocity变换模式
                 - "simple": 仅用velocity平均值估计平移T，旋转R为单位矩阵（快速）
                 - "procrustes": 使用xyz+velocity，用Procrustes算法估计完整R和T（更准确）
@@ -510,35 +490,27 @@ class OnlineDynamicProcessor:
         self.use_optical_flow_aggregation = use_optical_flow_aggregation
         self.velocity_transform_mode = velocity_transform_mode
 
-        # 初始化光流配准系统（必须成功）
+        # 初始化velocity配准系统（必须成功）
         self.optical_flow_registration = None
-        self._optical_flow_class = None
         if use_optical_flow_aggregation:
-            self._optical_flow_class = _import_optical_flow()
-
-            # 必须成功导入光流类
-            if self._optical_flow_class is None:
+            # 导入VelocityBasedRegistration类
+            VelocityRegistrationClass = _import_velocity_registration()
+            if VelocityRegistrationClass is None:
                 raise RuntimeError(
-                    "Failed to import OpticalFlowRegistration class. "
-                    "Please ensure optical_flow_registration.py exists and is accessible."
+                    "Failed to import VelocityBasedRegistration class. "
+                    "Please ensure velocity_registration.py exists and is accessible."
                 )
 
-            # 立即初始化光流配准系统（必须成功）
+            # 初始化velocity配准系统
             try:
-                self.optical_flow_registration = self._optical_flow_class(
+                self.optical_flow_registration = VelocityRegistrationClass(
                     device=str(device),
-                    min_inliers_ratio=0.1,  # 降低最小内点比例
-                    ransac_threshold=5.0,   # 增加RANSAC阈值
-                    max_flow_magnitude=200.0,  # 增加最大光流幅度
-                    use_velocity_based_transform=use_velocity_based_transform,  # 使用velocity计算变换
-                    velocity_transform_mode=velocity_transform_mode  # velocity变换模式
+                    min_inliers_ratio=0.1,
+                    velocity_transform_mode=velocity_transform_mode
                 )
-                _print_main(f"✓ Optical flow registration initialized successfully")
+                _print_main("✓ Velocity-based registration initialized successfully")
             except Exception as e:
-                raise RuntimeError(
-                    f"Failed to initialize OpticalFlowRegistration: {e}. "
-                    "Optical flow aggregation is required and must be initialized successfully."
-                ) from e
+                raise RuntimeError(f"Failed to initialize VelocityBasedRegistration: {e}") from e
 
         # 聚类函数已直接定义在此文件中，不需要缓存
 
@@ -686,13 +658,13 @@ class OnlineDynamicProcessor:
         preds: Dict[str, Any],
         vggt_batch: Dict[str, Any]
     ) -> List[Dict]:
-        """聚合动态物体（必须使用光流聚合）"""
+        """聚合动态物体（必须使用velocity配准）"""
         if not matched_clustering_results:
             return []
 
-        # 必须使用光流聚合
+        # 必须使用velocity配准
         if self.optical_flow_registration is None:
-            raise RuntimeError("Optical flow registration is not initialized! Must use optical flow aggregation.")
+            raise RuntimeError("Velocity registration is not initialized! Must use velocity-based aggregation.")
 
         dynamic_objects, _ = self._aggregate_with_existing_optical_flow_method(
             matched_clustering_results, preds, vggt_batch
@@ -762,31 +734,23 @@ class OnlineDynamicProcessor:
         preds: Dict[str, Any],
         vggt_batch: Dict[str, Any]
     ) -> tuple[List[Dict], Dict[str, float]]:
-        """使用optical_flow_registration.py中的光流聚合方法，返回结果和详细时间统计"""
+        """使用velocity_registration.py中的聚合方法，返回结果和详细时间统计"""
         import time
         method_start = time.time()
         detailed_times = {}
 
         try:
-
-            # 1. 预计算所有帧之间的光流. #TODO: delete
-            flow_start = time.time()
-            flows = self.optical_flow_registration.precompute_optical_flows(
-                vggt_batch)
-            flow_time = time.time() - flow_start
-            detailed_times['1. 预计算光流'] = flow_time
-
-            # 2. 获取所有全局物体ID
+            # 获取所有全局物体ID
             ids_start = time.time()
             all_global_ids = set()
             for result in clustering_results:
                 all_global_ids.update(result.get('global_ids', []))
             ids_time = time.time() - ids_start
-            detailed_times['2. 获取全局ID'] = ids_time
+            detailed_times['1. 获取全局ID'] = ids_time
 
             dynamic_objects = []
 
-            # 3. 对每个全局物体进行光流聚合
+            # 对每个全局物体进行聚合
             aggregation_start = time.time()
             individual_object_times = []
 
@@ -794,7 +758,7 @@ class OnlineDynamicProcessor:
                 object_start = time.time()
                 try:
                     aggregated_object = self.optical_flow_registration.aggregate_object_to_middle_frame(
-                        clustering_results, preds, vggt_batch, global_id, flows
+                        clustering_results, preds, vggt_batch, global_id
                     )
                     object_time = time.time() - object_start
                     individual_object_times.append(object_time)
@@ -803,6 +767,9 @@ class OnlineDynamicProcessor:
                         # 使用aggregate_object_to_middle_frame已经提取的canonical_gaussians
                         aggregated_gaussians = aggregated_object.get(
                             'canonical_gaussians')
+
+                        if aggregated_gaussians is None:
+                            _print_main(f"⚠️ Object {global_id}: aggregated_object中没有canonical_gaussians")
 
                         # 获取变换信息
                         reference_frame = aggregated_object.get(
@@ -816,7 +783,7 @@ class OnlineDynamicProcessor:
                         frame_transforms = {}
                         for frame_idx in object_frames:
                             if frame_idx in transformations:
-                                # 直接使用光流聚合器计算的变换矩阵
+                                # 直接使用velocity配准器计算的变换矩阵
                                 transform_data = transformations[frame_idx]
                                 if isinstance(transform_data, dict) and 'transformation' in transform_data:
                                     transform = transform_data['transformation']
@@ -828,12 +795,7 @@ class OnlineDynamicProcessor:
                                     transform = torch.from_numpy(
                                         transform).to(self.device).float()
 
-                                # 关键修复：验证变换矩阵，防止大白球问题
-                                if self._validate_and_fix_transform(transform, frame_idx, global_id):
-                                    frame_transforms[frame_idx] = transform
-                                else:
-                                    _print_main(
-                                        f"跳过对象{global_id}在帧{frame_idx}的异常变换矩阵")
+                                frame_transforms[frame_idx] = transform
                             elif frame_idx == reference_frame:
                                 # reference_frame到自己的变换是恒等变换
                                 frame_transforms[frame_idx] = torch.eye(
@@ -876,11 +838,11 @@ class OnlineDynamicProcessor:
                     traceback.print_exc()
 
             aggregation_total_time = time.time() - aggregation_start
-            detailed_times['3. 聚合所有物体'] = aggregation_total_time
+            detailed_times['2. 聚合所有物体'] = aggregation_total_time
             if individual_object_times:
-                detailed_times['3.1 单物体平均耗时'] = sum(individual_object_times) / len(individual_object_times)
-                detailed_times['3.2 单物体最大耗时'] = max(individual_object_times)
-                detailed_times['3.3 物体数量'] = len(all_global_ids)
+                detailed_times['2.1 单物体平均耗时'] = sum(individual_object_times) / len(individual_object_times)
+                detailed_times['2.2 单物体最大耗时'] = max(individual_object_times)
+                detailed_times['2.3 物体数量'] = len(all_global_ids)
 
             method_total_time = time.time() - method_start
             detailed_times['总耗时'] = method_total_time
@@ -888,478 +850,95 @@ class OnlineDynamicProcessor:
             return dynamic_objects, detailed_times
 
         except Exception as e:
-            # 使用默认尺寸
-            H, W = 64, 64
+            # 异常时直接返回空列表
             detailed_times['异常回退'] = time.time() - method_start
-            return self._create_objects_from_clustering_results(clustering_results, None, H, W), detailed_times
-
-    def _create_objects_from_clustering_results(
-        self,
-        clustering_results: List[Dict],
-        gaussian_params: Optional[torch.Tensor] = None,
-        H: int = None,
-        W: int = None,
-        preds: Optional[Dict] = None
-    ) -> List[Dict]:
-        """从聚类结果创建动态物体（无光流聚合）"""
-        dynamic_objects = []
-
-        try:
-            # 获取所有全局物体ID
-            all_global_ids = set()
-            for result in clustering_results:
-                all_global_ids.update(result.get('global_ids', []))
-
-            for global_id in all_global_ids:
-                # 收集该物体在所有帧中的点云和索引
-                object_points = []
-                object_frames = []
-                object_indices = []
-
-                for frame_idx, result in enumerate(clustering_results):
-                    global_ids = result.get('global_ids', [])
-                    if global_id in global_ids:
-                        cluster_idx = global_ids.index(global_id)
-                        points = result['points']
-                        labels = result['labels']
-                        cluster_indices = result.get('cluster_indices', [])
-
-                        # 提取物体点云
-                        object_mask = labels == cluster_idx
-                        frame_object_points = points[object_mask]
-
-                        # 提取对应的点索引（从VGGT预测中提取gaussian参数需要）
-                        frame_point_indices = []
-                        if cluster_idx < len(cluster_indices):
-                            frame_point_indices = cluster_indices[cluster_idx]
-
-                        if len(frame_object_points) > 0:
-                            object_points.append(frame_object_points)
-                            object_frames.append(frame_idx)
-                            object_indices.append(frame_point_indices)
-
-                if object_points:
-                    # 简单聚合：使用中间帧的点云
-                    middle_idx = len(object_points) // 2
-                    aggregated_points = object_points[middle_idx]
-
-                    # 尝试从VGGT预测中提取gaussian参数
-                    if preds is not None:
-                        # 这里没有aggregated_colors，因为_create_objects_from_clustering_results
-                        # 处理的是原始聚类结果，不是光流聚合结果
-                        aggregated_gaussian = self._extract_gaussian_params_from_preds(
-                            aggregated_points, preds, None
-                        )
-                        if aggregated_gaussian is None:
-                            # 回退方案
-                            aggregated_gaussian = self._points_to_gaussian_params_fallback(
-                                aggregated_points, global_id)
-                    elif gaussian_params is not None and H is not None and W is not None:
-                        middle_frame_idx = object_frames[middle_idx]
-                        middle_point_indices = object_indices[middle_idx]
-                        aggregated_gaussian = self._extract_gaussian_params_from_vggt(
-                            middle_point_indices, middle_frame_idx, gaussian_params, H, W
-                        )
-                        if aggregated_gaussian is None:
-                            # 回退方案
-                            aggregated_gaussian = self._points_to_gaussian_params_fallback(
-                                aggregated_points, global_id)
-                    else:
-                        # 回退方案
-                        aggregated_gaussian = self._points_to_gaussian_params_fallback(
-                            aggregated_points, global_id)
-
-                    # 为Stage2Refiner创建每帧的Gaussian参数和初始变换
-                    frame_gaussians_dict = {}  # 改为字典格式
-                    initial_transforms = []
-                    for i, (frame_points, frame_idx, point_indices) in enumerate(zip(object_points, object_frames, object_indices)):
-                        # 尝试从VGGT提取该帧的gaussian参数
-                        if preds is not None:
-                            frame_gaussian = self._extract_gaussian_params_from_preds(
-                                frame_points, preds, None
-                            )
-                            if frame_gaussian is None:
-                                frame_gaussian = self._points_to_gaussian_params_fallback(
-                                    frame_points, global_id)
-                        elif gaussian_params is not None and H is not None and W is not None:
-                            frame_gaussian = self._extract_gaussian_params_from_vggt(
-                                point_indices, frame_idx, gaussian_params, H, W
-                            )
-                            if frame_gaussian is None:
-                                frame_gaussian = self._points_to_gaussian_params_fallback(
-                                    frame_points, global_id)
-                        else:
-                            frame_gaussian = self._points_to_gaussian_params_fallback(
-                                frame_points, global_id)
-
-                        # 使用frame_idx作为key存储到字典中
-                        frame_gaussians_dict[frame_idx] = (
-                            frame_gaussian if frame_gaussian is not None else aggregated_gaussian)
-                        # 创建单位变换矩阵作为初始变换
-                        transform = torch.eye(4, device=self.device)
-                        initial_transforms.append(transform)
-
-                    dynamic_objects.append({
-                        'object_id': global_id,
-                        'aggregated_points': aggregated_points,
-                        'aggregated_gaussians': aggregated_gaussian,  # Stage2Refiner需要的字段
-                        'frame_gaussians': frame_gaussians_dict,  # Stage2Refiner需要的字段（字典格式）
-                        'initial_transforms': initial_transforms,  # Stage2Refiner需要的字段
-                        'reference_frame': object_frames[middle_idx],
-                        'gaussian_params': aggregated_gaussian,  # 保留原字段以兼容
-                        'num_frames': len(object_frames)
-                    })
-
-            return dynamic_objects
-
-        except Exception as e:
-            return []
-
-    def _extract_gaussian_params_from_vggt(
-        self,
-        point_indices: List[int],
-        frame_idx: int,
-        vggt_gaussian_params: torch.Tensor,
-        H: int, W: int
-    ) -> Optional[torch.Tensor]:
-        """从VGGT预测的gaussian_params中提取对应点的参数"""
-        try:
-            if not point_indices or len(point_indices) == 0:
-                return None
-
-            if vggt_gaussian_params is None:
-                return None
-
-            # vggt_gaussian_params应该是 [S, H*W, 14] 格式（已经经过activation）
-            if len(vggt_gaussian_params.shape) != 3:
-                return None
-
-            S, HW, feature_dim = vggt_gaussian_params.shape
-            if frame_idx >= S:
-                return None
-
-            # 提取该帧对应点的gaussian参数
-            frame_gaussians = vggt_gaussian_params[frame_idx]  # [H*W, 14]
-
-            # 根据点索引提取对应的gaussian参数
-            selected_gaussians = []
-            for idx in point_indices:
-                if 0 <= idx < HW:
-                    selected_gaussians.append(frame_gaussians[idx])
-
-            if not selected_gaussians:
-                return None
-
-            # 堆叠成 [N, 14] 张量
-            gaussian_params = torch.stack(selected_gaussians, dim=0)
-            return gaussian_params
-
-        except Exception as e:
-            return None
+            _print_main(f"❌ 聚合失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return [], detailed_times
 
     def _points_to_gaussian_params(self, aggregated_object, preds=None) -> Optional[torch.Tensor]:
         """将聚合物体转换为Gaussian参数，使用真实的VGGT预测参数"""
         if aggregated_object is None:
             return None
 
-        # 优先从聚合物体中获取真实的Gaussian参数
-        if isinstance(aggregated_object, dict) and 'aggregated_gaussians' in aggregated_object:
-            aggregated_gaussians = aggregated_object['aggregated_gaussians']
-            if aggregated_gaussians is not None:
-                if isinstance(aggregated_gaussians, np.ndarray):
-                    return torch.from_numpy(aggregated_gaussians).to(self.device).float()
-                elif isinstance(aggregated_gaussians, torch.Tensor):
-                    return aggregated_gaussians.to(self.device).float()
-
-        # 如果有点云信息，尝试从VGGT预测中找到对应的Gaussian参数
-        points = None
-        if isinstance(aggregated_object, dict):
-            points = aggregated_object.get('aggregated_points', [])
-        else:
-            points = aggregated_object
-
-        if points is None or len(points) == 0:
+        # 从aggregated_object提取数据
+        if not isinstance(aggregated_object, dict):
             return None
 
-        # 从VGGT预测中提取对应的Gaussian参数
-        if preds is not None and 'gaussian_params' in preds:
-            # 尝试从aggregated_object获取颜色信息
-            aggregated_colors = None
-            if isinstance(aggregated_object, dict):
-                aggregated_colors = aggregated_object.get('aggregated_colors')
-            return self._extract_gaussian_params_from_preds(points, preds, aggregated_colors)
+        # 优先使用已聚合的Gaussian参数
+        aggregated_gaussians = aggregated_object.get('aggregated_gaussians')
+        if aggregated_gaussians is not None:
+            if isinstance(aggregated_gaussians, np.ndarray):
+                return torch.from_numpy(aggregated_gaussians).to(self.device).float()
+            return aggregated_gaussians.to(self.device).float()
 
-        # 最后的回退方案
-        # 尝试从aggregated_object获取object_id
-        object_id = None
-        if isinstance(aggregated_object, dict):
-            object_id = aggregated_object.get(
-                'object_id') or aggregated_object.get('global_id')
-        return self._points_to_gaussian_params_fallback(points, object_id)
+        # 从VGGT预测中提取Gaussian参数
+        points = aggregated_object.get('aggregated_points')
+        if points is None or len(points) == 0 or preds is None:
+            return None
+
+        aggregated_colors = aggregated_object.get('aggregated_colors')
+        return self._extract_gaussian_params_from_preds(points, preds, aggregated_colors)
 
 
     def _extract_gaussian_params_from_preds(self, points, preds, aggregated_colors=None) -> Optional[torch.Tensor]:
-        """从VGGT预测中提取对应点云的真实Gaussian参数，优先使用聚合颜色"""
+        """从VGGT预测中提取对应点云的真实Gaussian参数"""
+        from sklearn.neighbors import NearestNeighbors
+
         try:
-            if 'gaussian_params' not in preds or points is None or len(points) == 0:
-                return None
-
-            gaussian_params = preds['gaussian_params']  # [B, S*H*W, 14]
-
-            # 确保points是torch.Tensor
+            # 转换points为torch.Tensor
             if isinstance(points, np.ndarray):
                 points = torch.from_numpy(points).to(self.device).float()
             elif isinstance(points, list):
-                points = torch.tensor(
-                    points, device=self.device, dtype=torch.float32)
+                points = torch.tensor(points, device=self.device, dtype=torch.float32)
             else:
                 points = points.to(self.device).float()
 
-            # gaussian_params的shape: [B, S*H*W, 14]
-            # 我们需要找到与points最匹配的Gaussian参数
-            B, N_total, feature_dim = gaussian_params.shape
+            # 获取Gaussian参数并展平
+            gaussian_params = preds['gaussian_params']  # [B, S*H*W, feature_dim]
+            gaussian_params_flat = gaussian_params.view(-1, gaussian_params.shape[-1])
 
-            # 重塑gaussian_params为[B*S*H*W, 14]以便处理
-            # [B*S*H*W, 14]
-            gaussian_params_flat = gaussian_params.view(-1, feature_dim)
-
-            # 获取Gaussian的位置信息（前3维）
-            gaussian_positions = gaussian_params_flat[:, :3]  # [B*S*H*W, 3]
-
-            # 使用KD-tree或最近邻搜索找到对应的Gaussian参数
-            from sklearn.neighbors import NearestNeighbors
-
-            # 将位置数据转换为numpy进行KD-tree搜索
-            gaussian_pos_np = gaussian_positions.detach().cpu().numpy()
+            # 使用最近邻搜索匹配Gaussian参数
+            gaussian_positions = gaussian_params_flat[:, :3].detach().cpu().numpy()
             points_np = points[:, :3].detach().cpu().numpy()
 
-            # 修复大白球问题：避免选择相同的Gaussian参数
             N_points = len(points_np)
-            N_gaussians = len(gaussian_pos_np)
+            N_gaussians = len(gaussian_positions)
 
             if N_gaussians < N_points:
-                # 如果Gaussian数量少于点数，随机采样避免重复
-                selected_indices = np.random.choice(
-                    N_gaussians, N_points, replace=True)
-                selected_gaussians = gaussian_params_flat[selected_indices]
+                # Gaussian数量不足，允许重复采样
+                selected_indices = np.random.choice(N_gaussians, N_points, replace=True)
             else:
-                # 使用KD-tree但确保每个点都有独特的参数
-                nbrs = NearestNeighbors(n_neighbors=min(
-                    5, N_gaussians), algorithm='kd_tree').fit(gaussian_pos_np)
-                distances, indices = nbrs.kneighbors(points_np)
+                # 使用KD-tree查找最近邻，每个点选择不同的Gaussian
+                k_neighbors = min(5, N_gaussians)
+                nbrs = NearestNeighbors(n_neighbors=k_neighbors, algorithm='kd_tree').fit(gaussian_positions)
+                _, indices = nbrs.kneighbors(points_np)
 
-                # 为每个点分配不同的Gaussian参数，避免重复
                 selected_indices = []
                 used_indices = set()
-
                 for i in range(N_points):
-                    # 对于每个点，从它的最近邻中选择一个未使用的
-                    candidates = indices[i]  # k个最近邻的索引
-
                     # 优先选择未使用的索引
-                    selected_idx = None
-                    for candidate in candidates:
+                    for candidate in indices[i]:
                         if candidate not in used_indices:
-                            selected_idx = candidate
+                            selected_indices.append(candidate)
+                            used_indices.add(candidate)
                             break
+                    else:
+                        # 所有候选都已使用，选择最近的
+                        selected_indices.append(indices[i][0])
 
-                    # 如果所有候选都被使用了，选择距离最近的
-                    if selected_idx is None:
-                        selected_idx = candidates[0]
-
-                    selected_indices.append(selected_idx)
-                    used_indices.add(selected_idx)
-
-                selected_gaussians = gaussian_params_flat[selected_indices]
-
-            # 关键修复：对从VGGT提取的原始参数进行激活处理
-            # 因为VGGT预测的是原始未激活的参数，需要应用激活函数
-            selected_gaussians = self._apply_gaussian_activation(
-                selected_gaussians)
-
-            # 使用聚合后的点云位置替换Gaussian的位置参数（激活后）
+            # 提取选中的Gaussian参数并更新位置
+            selected_gaussians = gaussian_params_flat[selected_indices].clone()
             selected_gaussians[:, :3] = points[:, :3]
-
-            # 保持VGGT预测参数的原始性，不添加随机扰动
-            # 大白球问题主要通过确保选择不同的Gaussian参数来解决
-
-            # 保持VGGT预测的颜色参数，不用光流聚合的颜色替换
-            # VGGT预测的颜色参数经过神经网络训练，适合3D Gaussian Splatting渲染
-            # 光流聚合的颜色适合传统点云，但不适合Gaussian渲染
-
 
             return selected_gaussians
 
         except Exception as e:
-            # 注意：不要再次激活，因为回退方案中已经会激活
-            return self._points_to_gaussian_params_fallback(points, None)
-
-    def _points_to_gaussian_params_fallback(self, points, object_id=None) -> Optional[torch.Tensor]:
-        """回退方案：当无法从VGGT提取时，生成基本的Gaussian参数"""
-        try:
-            if points is None or len(points) == 0:
-                return None
-
-            # 确保points是torch.Tensor并在正确设备上
-            if isinstance(points, np.ndarray):
-                points = torch.from_numpy(points).to(self.device)
-            elif isinstance(points, torch.Tensor):
-                points = points.to(self.device)
-            else:
-                return None
-
-            N = len(points)
-            # 创建基本的Gaussian参数 [N, gaussian_output_dim]: xyz(3) + scale(3) + sh(sh_dim) + rotation(4) + opacity(1)
-            gaussian_params = torch.zeros(
-                N, self.gaussian_output_dim, device=self.device, dtype=torch.float32)
-
-            # 位置: xyz (positions 0:3)
-            gaussian_params[:, :3] = points[:, :3]
-
-            # 尺度: scale (positions 3:6) - raw values before activation
-            gaussian_params[:, 3:6] = torch.log(torch.tensor(
-                0.01 / 0.05))  # Will become 0.01 after activation
-
-            # SH系数: (positions 6:6+sh_dim) - 使用基于object_id的一致颜色
-            sh_start = 6
-            sh_end = 6 + self.sh_dim
-            if object_id is not None:
-                # 基于object_id生成一致的颜色
-                import math
-                hue = (object_id * 137.5) % 360  # 黄金角度分割，确保颜色差异明显
-                saturation = 0.8
-                value = 0.9
-
-                # HSV到RGB转换
-                h = hue / 60.0
-                c = value * saturation
-                x = c * (1 - abs((h % 2) - 1))
-                m = value - c
-
-                if 0 <= h < 1:
-                    r, g, b = c, x, 0
-                elif 1 <= h < 2:
-                    r, g, b = x, c, 0
-                elif 2 <= h < 3:
-                    r, g, b = 0, c, x
-                elif 3 <= h < 4:
-                    r, g, b = 0, x, c
-                elif 4 <= h < 5:
-                    r, g, b = x, 0, c
-                else:
-                    r, g, b = c, 0, x
-
-                color = torch.tensor([r + m, g + m, b + m], device=self.device)
-                # 只设置DC分量（前3个SH系数）
-                gaussian_params[:, sh_start:sh_start+3] = color.unsqueeze(0).repeat(N, 1)
-                _print_main(
-                    f"回退方案：为object_id={object_id}生成一致颜色 RGB=({r+m:.3f}, {g+m:.3f}, {b+m:.3f})")
-            else:
-                # 默认中性颜色（只设置DC分量）
-                gaussian_params[:, sh_start:sh_start+3] = 0.5
-
-            # 旋转: quaternion (positions sh_end:sh_end+4) - normalized quaternion
-            rotation_start = sh_end
-            gaussian_params[:, rotation_start:rotation_start+4] = torch.tensor(
-                [1.0, 0.0, 0.0, 0.0], device=points.device)  # w, x, y, z
-
-            # 不透明度: opacity (position sh_end+4) - raw value before sigmoid
-            opacity_idx = sh_end + 4
-            gaussian_params[:, opacity_idx] = torch.logit(torch.tensor(
-                0.8, device=points.device))  # Will become 0.8 after sigmoid
-
-            # Apply activation functions to get final parameters
-            gaussian_params = self._apply_gaussian_activation(gaussian_params)
-
-            return gaussian_params
-
-        except Exception as e:
+            _print_main(f"⚠️ 提取Gaussian参数失败: {type(e).__name__}: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return None
-
-    def _apply_gaussian_activation(self, gaussian_params: torch.Tensor) -> torch.Tensor:
-        """
-        Apply activation functions to gaussian parameters
-        Following the same post-processing as in src/vggt/training/loss.py self_render_and_loss
-
-        Args:
-            gaussian_params: [*, gaussian_output_dim] tensor with raw gaussian parameters
-
-        Returns:
-            gaussian_params: [*, gaussian_output_dim] tensor with activated parameters
-        """
-        if gaussian_params is None:
-            return None
-
-        # Clone to avoid modifying original
-        processed_params = gaussian_params.clone()
-
-        # Scale activation: (0.05 * exp(scale)).clamp_max(0.3) - applied to positions 3:6
-        scale_raw = processed_params[..., 3:6]
-        scale_activated = (0.05 * torch.exp(scale_raw)).clamp_max(0.3)
-        processed_params[..., 3:6] = scale_activated
-
-        # SH coefficients: positions 6:6+sh_dim - no activation needed (kept as is)
-
-        # Rotation quaternion normalization: positions 6+sh_dim:6+sh_dim+4
-        sh_end = 6 + self.sh_dim
-        rotations = processed_params[..., sh_end:sh_end+4]
-        rotation_norms = torch.norm(rotations, dim=-1, keepdim=True)
-        rotation_norms = torch.clamp(rotation_norms, min=1e-8)
-        processed_params[..., sh_end:sh_end+4] = rotations / rotation_norms
-
-        # Opacity activation: sigmoid for position 6+sh_dim+4
-        opacity_idx = sh_end + 4
-        opacity_raw = processed_params[..., opacity_idx:opacity_idx+1]
-        opacities = torch.sigmoid(opacity_raw)
-        processed_params[..., opacity_idx:opacity_idx+1] = opacities
-
-        return processed_params
-
-    def _validate_and_fix_transform(self, transform: torch.Tensor, frame_idx: int, global_id: int = None) -> bool:
-        """验证和修复变换矩阵，防止大白球问题"""
-        try:
-            # 检查基本形状
-            if transform.shape != (4, 4):
-                _print_main(f"⚠️  变换矩阵形状异常: {transform.shape}, 期望 (4,4)")
-                return False
-
-            # 检查是否为零矩阵
-            if torch.allclose(transform, torch.zeros_like(transform), atol=1e-8):
-                _print_main(f"⚠️  对象{global_id}帧{frame_idx}: 检测到零变换矩阵！这会导致大白球问题")
-                return False
-
-            # 检查是否有NaN或Inf
-            if torch.isnan(transform).any() or torch.isinf(transform).any():
-                _print_main(f"⚠️  对象{global_id}帧{frame_idx}: 变换矩阵包含NaN或Inf值")
-                return False
-
-            # 检查旋转部分的行列式
-            rotation_part = transform[:3, :3]
-            det = torch.det(rotation_part)
-
-            if det.abs() < 1e-6:
-                _print_main(f"⚠️  对象{global_id}帧{frame_idx}: 变换矩阵奇异 (det={det:.2e})")
-                return False
-
-            # 检查是否过度缩放
-            scales = torch.linalg.norm(rotation_part, dim=0)  # 各轴的缩放
-            if scales.max() > 100 or scales.min() < 0.01:
-                _print_main(
-                    f"⚠️  对象{global_id}帧{frame_idx}: 异常缩放 {scales}, 可能导致渲染问题")
-                return False
-
-            # 检查平移是否过大
-            translation = transform[:3, 3]
-            if torch.norm(translation) > 1000:
-                _print_main(
-                    f"⚠️  对象{global_id}帧{frame_idx}: 平移过大 {translation}, 可能超出相机视野")
-                # 这种情况仍然保留，但给出警告
-
-            return True
-
-        except Exception as e:
-            _print_main(f"❌ 变换矩阵验证失败: {e}")
-            return False
 
     def _create_static_background_from_labels(
         self,

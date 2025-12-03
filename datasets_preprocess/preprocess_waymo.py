@@ -905,6 +905,12 @@ def crop_one_seq(input_dir, output_dir, seq, enable_sam=False, sam_model_type="s
 if __name__ == "__main__":
     parser = get_parser()
     args = parser.parse_args()
+
+    import debugpy
+    debugpy.listen(5697)
+    print("Waiting for debugger to attach...")
+    debugpy.wait_for_client()
+
     main(args.waymo_dir, args.precomputed_pairs, args.output_dir, workers=args.workers,
          enable_sam=args.enable_sam, sam_model_type=args.sam_model_type, sam_device=args.sam_device,
          sam_config_file=args.sam_config_file, sam_ckpt_path=args.sam_ckpt_path,
