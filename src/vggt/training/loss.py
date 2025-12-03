@@ -655,19 +655,13 @@ def warp_gaussian(flow, mask, gaussian_means, gaussian_vel, T, H, W, direction="
 
 
 
-def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic, gt_rgb, pred_sky_colors=None, sky_masks=None, sampled_frame_indices=None, sh_degree=0):
+def self_render_and_loss(vggt_batch, preds, sampled_frame_indices=None, sh_degree=0):
     """
     自渲染损失函数：每一帧自己进行渲染与监督，支持天空区域的mask替代
 
     Args:
-        depth: [B, S, H, W] 深度图
-        gaussian_params: [B, S, H*W, output_dim] 高斯参数 (已激活)
-        pose_enc: [B, S, 7] 姿态编码
-        extrinsic: [B, S, 4, 4] 外参矩阵
-        intrinsic: [B, S, 3, 3] 内参矩阵
-        gt_rgb: [B, S, 3, H, W] 真实RGB图像
-        pred_sky_colors: [B, S, H, W, 3] 预测的天空颜色 (可选)
-        sky_masks: [B, S, H, W] 天空mask，1表示天空区域 (可选)
+        vggt_batch: dict 包含GT数据的batch，包括images, depths, sky_masks, point_masks等
+        preds: dict 模型预测结果，包含gaussian_params, xyz_camera, extrinsics, intrinsics, pred_sky_colors等
         sampled_frame_indices: list 采样的帧索引 (可选，如果为None则渲染所有帧)
         sh_degree: int spherical harmonics degree
 
@@ -676,28 +670,21 @@ def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic,
         dict: 图像字典（用于可视化）
     """
     with tf32_off():
-        # 从姿态编码获取相机参数
-        extrinsic, intrinsic = pose_encoding_to_extri_intri(
-            pose_enc, gt_rgb.shape[-2:])
-        extrinsic = torch.cat([extrinsic, torch.tensor([0, 0, 0, 1], device=extrinsic.device)[
-                              None, None, None, :].repeat(1, extrinsic.shape[1], 1, 1)], dim=-2)
+        # 从vggt_batch中获取GT数据
+        gt_rgb = vggt_batch["images"]  # [B, S, 3, H, W]
+        gt_depths = vggt_batch["depths"]  # [B, S, H, W]
+        sky_masks = vggt_batch.get("sky_masks")  # [B, S, H, W]
+        point_masks = vggt_batch.get("point_masks")  # [B, S, H, W]
+
+        # 从preds中获取预测数据
+        gaussian_params = preds["gaussian_params"]  # [B, S, H*W, output_dim]
+        pred_sky_colors = preds.get("sky_colors")  # [B, num_frames, 3, H, W]
 
         # 获取图像尺寸
         B, S, _, image_height, image_width = gt_rgb.shape
 
-        # 1. 构造高斯参数
-        depth = depth.view(
-            depth.shape[0]*depth.shape[1], depth.shape[2], depth.shape[3], 1)
-        world_points = depth_to_world_points(depth, intrinsic)
-        world_points = world_points.view(
-            world_points.shape[0], world_points.shape[1]*world_points.shape[2], 3)
-
-        # 转换到相机坐标系
-        extrinsic_inv = torch.linalg.inv(extrinsic)
-        xyz = torch.matmul(extrinsic_inv[0, :, :3, :3], world_points.transpose(-1, -2)).transpose(-1, -2) + \
-            extrinsic_inv[0, :, :3, 3:4].transpose(-1, -2)
-        xyz = xyz.reshape(xyz.shape[0], image_height *
-                          image_width, 3)  # [S, H*W, 3]
+        # 1. 从preds中直接获取xyz
+        xyz = preds['xyz_camera'][0]  # [S, H*W, 3]
 
         # 处理高斯参数 (已在forward中激活，直接使用)
         output_dim = 11 + 3 * ((sh_degree + 1) ** 2)
@@ -712,9 +699,11 @@ def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic,
         rotations = parsed['rotations']  # [S, H*W, 4] (already normalized)
         opacity = parsed['opacity'].squeeze(-1)  # [S, H*W] (already activated)
 
-        # 准备渲染参数
-        viewmat = extrinsic.permute(1, 0, 2, 3)
-        K = intrinsic.permute(1, 0, 2, 3)
+        # 2. 从preds中直接获取相机参数并准备渲染参数
+        extrinsics = preds['extrinsics']  # [B, S, 4, 4]
+        intrinsics = preds['intrinsics']  # [B, S, 3, 3]
+        viewmat = extrinsics.permute(1, 0, 2, 3)  # [S, B, 4, 4]
+        K = intrinsics.permute(1, 0, 2, 3)  # [S, B, 3, 3]
 
         # Determine which frames to render
         if sampled_frame_indices is None:
@@ -724,13 +713,14 @@ def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic,
 
         # Pre-allocate tensors for results (only for sampled frames)
         render_colors_tensor = torch.zeros(num_frames_to_render, image_height, image_width, 4, device=gt_rgb.device, dtype=xyz.dtype)
+        render_alphas_tensor = torch.zeros(num_frames_to_render, image_height, image_width, 1, device=gt_rgb.device, dtype=xyz.dtype)
 
         # 对采样的帧进行自渲染
         for render_idx, i in enumerate(sampled_frame_indices):
             # 使用当前帧的3D点进行渲染（不使用velocity，因为是自己渲染自己）
             mean_current = xyz[i]  # 不使用velocity，直接使用当前帧的3D点
 
-            # 如果有天空mask，需要过滤掉天空区域的gaussian点
+            # 3. 天空处理：与stage2_loss.py保持一致，过滤掉天空区域的gaussian点
             if sky_masks is not None:
                 # 将sky_masks转换为与gaussian点相同的格式 [H*W]
                 current_sky_mask = sky_masks[0, i].flatten()  # [H*W]
@@ -739,7 +729,7 @@ def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic,
 
                 if non_sky_mask.sum() > 0:
                     # 只渲染非天空区域的gaussian点
-                    render_color, _, _ = rasterization(
+                    render_color, render_alpha, _ = rasterization(
                         mean_current[non_sky_mask], rotations[i][non_sky_mask],
                         scale[i][non_sky_mask], opacity[i][non_sky_mask], sh_coeffs_reshaped[i][non_sky_mask],
                         viewmat[i], K[i], image_width, image_height,
@@ -752,9 +742,11 @@ def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic,
                     # 如果全是天空，创建空的渲染结果
                     render_color = torch.zeros((image_height, image_width, 4),
                                              device=mean_current.device, dtype=mean_current.dtype)
+                    render_alpha = torch.zeros((image_height, image_width, 1),
+                                             device=mean_current.device, dtype=mean_current.dtype)
             else:
                 # 没有天空mask，正常渲染所有点
-                render_color, _, _ = rasterization(
+                render_color, render_alpha, _ = rasterization(
                     mean_current, rotations[i], scale[i], opacity[i], sh_coeffs_reshaped[i],
                     viewmat[i], K[i], image_width, image_height,
                     sh_degree=sh_degree, render_mode="RGB+ED",
@@ -765,42 +757,42 @@ def self_render_and_loss(depth, gaussian_params, pose_enc, extrinsic, intrinsic,
 
             # Write directly to pre-allocated tensor using render_idx
             render_colors_tensor[render_idx] = render_color
+            if render_alpha is not None:
+                render_alphas_tensor[render_idx] = render_alpha
 
         # Extract RGB and depth from render results (only sampled frames)
         gt_colors_sampled = gt_rgb[0, sampled_frame_indices]  # [num_frames_to_render, 3, H, W]
-        gt_depths_sampled = depth.view(B * S, image_height, image_width)[sampled_frame_indices]  # [num_frames_to_render, H, W]
+        gt_depths_sampled = gt_depths[0, sampled_frame_indices]  # [num_frames_to_render, H, W]
 
         pred_rgb = render_colors_tensor[..., :3].permute(0, 3, 1, 2)   # [num_frames_to_render, 3, H, W]
         pred_rgb = torch.clamp(pred_rgb, min=0, max=1)
-
-        # 如果有天空颜色预测和天空mask，用天空颜色替换天空区域
-        if pred_sky_colors is not None and sky_masks is not None:
-            for render_idx, i in enumerate(sampled_frame_indices):
-                current_sky_mask_2d = sky_masks[0, i]  # [H, W]
-                sky_colors_frame = pred_sky_colors[0, i]  # [H, W, 3]
-
-                # 确保维度匹配
-                sky_mask_bool = current_sky_mask_2d.bool()  # [H, W]
-                if sky_mask_bool.any():
-                    # 将天空颜色从[H, W, 3]转换为[3, H, W]然后替换
-                    sky_colors_chw = sky_colors_frame.permute(2, 0, 1)  # [3, H, W]
-                    pred_rgb[render_idx, :, sky_mask_bool] = sky_colors_chw[:, sky_mask_bool]
-
         pred_depth = render_colors_tensor[..., -1]  # [num_frames_to_render, H, W]
 
+        # 如果有天空颜色预测，使用alpha通道进行加权平均（与stage2_loss.py保持一致）
+        if pred_sky_colors is not None and sky_masks is not None:
+            # 创建一个新的tensor来避免inplace操作
+            pred_rgb_with_sky = pred_rgb.clone()
+            for render_idx, i in enumerate(sampled_frame_indices):
+                # 获取当前帧的渲染RGB和alpha
+                rendered_rgb_frame = pred_rgb[render_idx]  # [3, H, W]
+
+                # Extract alpha: [H, W, 1] -> [H, W]
+                rendered_alpha = render_alphas_tensor[render_idx, :, :, 0]  # [H, W]
+
+                # 获取天空颜色
+                # pred_sky_colors: [B, num_frames, 3, H, W], 使用render_idx索引
+                sky_colors_chw = pred_sky_colors[0, render_idx]  # [3, H, W]
+
+                # 使用alpha进行加权平均：final = alpha * rendered + (1-alpha) * sky
+                # 这与stage2_loss.py第219-222行的处理方式完全一致
+                alpha_3ch = rendered_alpha.unsqueeze(0)  # [1, H, W]
+                pred_rgb_with_sky[render_idx] = alpha_3ch * rendered_rgb_frame + (1 - alpha_3ch) * sky_colors_chw
+
+            pred_rgb = pred_rgb_with_sky
+
         # 计算损失 (only on sampled frames)
-        # 对于depth loss，如果有天空mask需要排除天空区域
-        if sky_masks is not None:
-            # 创建非天空区域的mask (only for sampled frames)
-            non_sky_mask = ~sky_masks[0, sampled_frame_indices].bool()  # [num_frames_to_render, H, W]
-            # 只在非天空区域计算depth loss
-            if non_sky_mask.sum() > 0:
-                depth_loss = F.l1_loss(pred_depth[non_sky_mask], gt_depths_sampled[non_sky_mask])
-            else:
-                depth_loss = torch.tensor(0.0, device=gt_rgb.device, requires_grad=True)
-        else:
-            # 没有天空mask，计算全图depth loss
-            depth_loss = F.l1_loss(pred_depth, gt_depths_sampled)
+        valid_depth_mask = point_masks[0, sampled_frame_indices].bool()  # [num_frames_to_render, H, W]
+        depth_loss = F.l1_loss(pred_depth[valid_depth_mask], gt_depths_sampled[valid_depth_mask])
         depth_loss = check_and_fix_inf_nan(depth_loss, "self_depth_loss")
 
         rgb_loss = F.l1_loss(pred_rgb, gt_colors_sampled)
@@ -1989,11 +1981,13 @@ def aggregator_render_loss(
             # Blend sky colors with rendered colors based on sky masks
             if sky_masks is not None:
                 sampled_sky_masks_bool = sky_masks[0, sampled_frame_indices].bool()  # [num_frames_to_render, H, W]
-                render_colors = torch.where(
+                # Create a new tensor to avoid in-place modification
+                render_colors_with_sky = torch.where(
                     sampled_sky_masks_bool.unsqueeze(1),  # [num_frames_to_render, 1, H, W]
                     sampled_sky_colors,
                     render_colors
                 )
+                render_colors = render_colors_with_sky
 
         # === Step 6: Compute losses ===
         # RGB L1 loss

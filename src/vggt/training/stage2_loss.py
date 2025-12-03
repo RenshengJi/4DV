@@ -125,8 +125,6 @@ class Stage2RenderLoss(nn.Module):
         depth_weight: float = 0.0,  # 禁用depth loss
         lpips_weight: float = 0.0,  # LPIPS loss权重
         render_only_dynamic: bool = False,  # 是否只渲染动态物体
-        supervise_only_dynamic: bool = False,  # 是否只监督动态区域
-        supervise_middle_frame_only: bool = False,  # 是否只渲染监督中间帧
         sh_degree: int = 0  # 球谐函数阶数
     ):
         super().__init__()
@@ -134,8 +132,6 @@ class Stage2RenderLoss(nn.Module):
         self.depth_weight = depth_weight
         self.lpips_weight = lpips_weight
         self.render_only_dynamic = render_only_dynamic
-        self.supervise_only_dynamic = supervise_only_dynamic
-        self.supervise_middle_frame_only = supervise_middle_frame_only
         self.sh_degree = sh_degree
 
     def forward(
@@ -146,7 +142,6 @@ class Stage2RenderLoss(nn.Module):
         intrinsics: torch.Tensor,
         extrinsics: torch.Tensor,
         sky_masks: Optional[torch.Tensor] = None,
-        original_dynamic_objects: Optional[list] = None,
         sky_colors: Optional[torch.Tensor] = None,
         sampled_frame_indices: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
@@ -160,7 +155,6 @@ class Stage2RenderLoss(nn.Module):
             intrinsics: [B, S, 3, 3] 相机内参
             extrinsics: [B, S, 4, 4] 相机外参
             sky_masks: [B, S, H, W] 天空区域掩码
-            original_dynamic_objects: 原始的dynamic_objects（包含frame_pixel_indices）
             sky_colors: [B, num_frames, 3, H, W] 天空颜色，用于与渲染结果合成
             sampled_frame_indices: [num_frames] 采样帧索引
 
@@ -170,126 +164,40 @@ class Stage2RenderLoss(nn.Module):
         B, S, C, H, W = gt_images.shape
         device = gt_images.device
 
-        # 初始化loss为None，后续累加
-        total_rgb_loss = None
-        total_depth_loss = None
-        total_lpips_loss = None
-        num_valid_frames = 0
-
+        # 收集所有帧的渲染结果
         rendered_images = []
         rendered_depths = []
 
-        # 渲染每一帧 - 确保frame_idx不超过张量的维度
+        # 渲染每一帧
         actual_S = min(S, intrinsics.shape[1], extrinsics.shape[1])
 
-        # 确定要渲染的帧范围
-        if self.supervise_middle_frame_only:
-            # 只渲染中间帧
-            middle_frame_idx = actual_S // 2
-            frame_indices = [middle_frame_idx]
-        else:
-            # 渲染所有帧
-            frame_indices = list(range(actual_S))
-
-        for frame_idx in frame_indices:
+        for frame_idx in range(actual_S):
             frame_intrinsic = intrinsics[0, frame_idx]  # [3, 3]
             frame_extrinsic = extrinsics[0, frame_idx]  # [4, 4]
-            frame_gt_image = gt_images[0, frame_idx]  # [3, H, W]
-            frame_gt_depth = gt_depths[0, frame_idx]   # [H, W]
 
             # 渲染当前帧
             rendered_rgb, rendered_depth, rendered_alpha = self._render_frame(
                 refined_scene, frame_intrinsic, frame_extrinsic, H, W, frame_idx,
-                render_only_dynamic=self.render_only_dynamic  # 使用配置参数
+                render_only_dynamic=self.render_only_dynamic
             )
 
             # 如果提供了 sky_colors，使用 alpha 与 sky 合成最终图像
             if sky_colors is not None and sampled_frame_indices is not None:
-                # 找到当前frame_idx对应的sky_colors索引
-                # 将 sampled_frame_indices 转换为 tensor（如果还不是）
                 if not isinstance(sampled_frame_indices, torch.Tensor):
                     sampled_frame_indices = torch.tensor(sampled_frame_indices, device=device)
 
-                # 检查 frame_idx 是否在采样帧中
                 matches = (sampled_frame_indices == frame_idx)
                 if matches.any():
                     sky_idx = matches.nonzero(as_tuple=True)[0].item()
                     frame_sky_color = sky_colors[0, sky_idx]  # [3, H, W]
-
-                    # 合成：final_image = alpha * rendered_rgb + (1 - alpha) * sky_colors
-                    # rendered_alpha: [H, W], rendered_rgb: [3, H, W], sky_colors: [3, H, W]
                     alpha_3ch = rendered_alpha.unsqueeze(0)  # [1, H, W]
                     rendered_rgb = alpha_3ch * rendered_rgb + (1 - alpha_3ch) * frame_sky_color
 
             rendered_images.append(rendered_rgb)
             rendered_depths.append(rendered_depth)
 
-            # 计算监督区域的mask - 不再使用sky_masks进行过滤
-            if self.supervise_only_dynamic:
-                # 创建dynamic mask：只监督动态物体区域
-                # 使用原始的dynamic_objects（包含frame_pixel_indices），而不是refined_scene中的
-                objects_for_mask = original_dynamic_objects if original_dynamic_objects is not None else refined_scene.get('dynamic_objects', [])
-                dynamic_mask = create_dynamic_mask_from_pixel_indices(
-                    objects_for_mask, frame_idx, H, W
-                )
-                mask = dynamic_mask
-            else:
-                # 监督所有区域（包括sky）
-                mask = torch.ones_like(frame_gt_depth, dtype=torch.bool)
-
-            # RGB损失 - 动态区域应该匹配GT
-            if mask.sum() > 0:  # 确保有有效像素
-                rgb_loss = F.l1_loss(
-                    rendered_rgb[mask.unsqueeze(0).repeat(3, 1, 1)],
-                    frame_gt_image[mask.unsqueeze(0).repeat(3, 1, 1)]
-                )
-                # 累加loss
-                if total_rgb_loss is None:
-                    total_rgb_loss = rgb_loss
-                else:
-                    total_rgb_loss = total_rgb_loss + rgb_loss
-                num_valid_frames += 1
-
-            # LPIPS损失 - 在完整图像上计算（包括sky）
-            if self.lpips_weight > 0:
-                # compute_lpips 需要 [B, C, H, W] 格式
-                rendered_rgb_batch = rendered_rgb.unsqueeze(0)  # [1, 3, H, W]
-                gt_rgb_batch = frame_gt_image.unsqueeze(0)  # [1, 3, H, W]
-
-                lpips_loss = compute_lpips(rendered_rgb_batch, gt_rgb_batch).mean()
-
-                # 累加loss
-                if total_lpips_loss is None:
-                    total_lpips_loss = lpips_loss
-                else:
-                    total_lpips_loss = total_lpips_loss + lpips_loss
-
-            # 深度损失 - 仅在权重大于0时计算
-            if self.depth_weight > 0:
-                # 确保rendered_depth有正确的维度
-                if rendered_depth.dim() == 1:
-                    print(
-                        f"Debug: rendered_depth has wrong shape {rendered_depth.shape}, expected 2D. Skipping depth loss.")
-                    continue  # Skip this frame if depth has wrong dimensions
-
-                depth_mask = mask & (frame_gt_depth > 0)  # 排除无效深度
-                if depth_mask.sum() > 0:
-                    depth_loss = F.l1_loss(
-                        rendered_depth[depth_mask],
-                        frame_gt_depth[depth_mask]
-                    )
-                    # 累加loss
-                    if total_depth_loss is None:
-                        total_depth_loss = depth_loss
-                    else:
-                        total_depth_loss = total_depth_loss + depth_loss
-
-        # 平均损失并确保有grad_fn
-        # 如果没有有效的dynamic区域，需要创建一个dummy loss以保持梯度流
-        if total_rgb_loss is None:
-            # 没有任何dynamic像素，创建一个与模型参数连接的零loss
-            # 这样backward不会报错，但梯度为零
-            # 从refined_scene中获取一个参数作为anchor
+        # 如果没有渲染任何帧，返回零损失
+        if len(rendered_images) == 0:
             dummy_param = None
             if 'dynamic_objects' in refined_scene and len(refined_scene['dynamic_objects']) > 0:
                 for obj_data in refined_scene['dynamic_objects']:
@@ -298,103 +206,70 @@ class Stage2RenderLoss(nn.Module):
                         break
 
             if dummy_param is not None and dummy_param.requires_grad:
-                # 创建一个连接到模型参数的零loss
-                total_rgb_loss = (dummy_param.sum() * 0.0)
+                zero_loss = dummy_param.sum() * 0.0
             else:
-                # 如果找不到参数，使用requires_grad的tensor
-                total_rgb_loss = torch.zeros(1, device=device, requires_grad=True).sum()
+                zero_loss = torch.zeros(1, device=device, requires_grad=True).sum()
 
-            num_valid_frames = max(S, 1)
+            return {
+                'stage2_rgb_loss': zero_loss,
+                'stage2_depth_loss': zero_loss,
+                'stage2_lpips_loss': zero_loss,
+                'stage2_total_loss': zero_loss
+            }
+
+        # Stack所有渲染结果
+        pred_rgb = torch.stack(rendered_images, dim=0)  # [actual_S, 3, H, W]
+        pred_depth = torch.stack(rendered_depths, dim=0)  # [actual_S, H, W]
+        gt_rgb = gt_images[0, :actual_S]  # [actual_S, 3, H, W]
+        gt_depth = gt_depths[0, :actual_S]  # [actual_S, H, W]
+
+        # 统一计算RGB loss
+        rgb_loss = F.l1_loss(pred_rgb, gt_rgb)
+
+        # 计算LPIPS loss
+        if self.lpips_weight > 0:
+            lpips_loss = compute_lpips(pred_rgb, gt_rgb).mean()
+        else:
+            lpips_loss = rgb_loss * 0.0
+
+        # 计算Depth loss
+        if self.depth_weight > 0:
+            valid_depth_mask = gt_depth > 0
+            if valid_depth_mask.sum() > 0:
+                depth_loss = F.l1_loss(pred_depth[valid_depth_mask], gt_depth[valid_depth_mask])
+            else:
+                depth_loss = rgb_loss * 0.0
+        else:
+            depth_loss = rgb_loss * 0.0
 
         # 构建loss字典
-        avg_rgb_loss = total_rgb_loss / num_valid_frames if num_valid_frames > 0 else total_rgb_loss
-
         loss_dict = {
-            'stage2_rgb_loss': self.rgb_weight * avg_rgb_loss,
+            'stage2_rgb_loss': self.rgb_weight * rgb_loss,
+            'stage2_depth_loss': self.depth_weight * depth_loss,
+            'stage2_lpips_loss': self.lpips_weight * lpips_loss,
         }
-
-        # Depth loss
-        if self.depth_weight > 0 and total_depth_loss is not None:
-            avg_depth_loss = total_depth_loss / num_valid_frames if num_valid_frames > 0 else total_depth_loss
-            loss_dict['stage2_depth_loss'] = self.depth_weight * avg_depth_loss
-        else:
-            # 使用rgb_loss作为anchor创建零depth loss
-            loss_dict['stage2_depth_loss'] = avg_rgb_loss * 0.0
-
-        # LPIPS loss
-        if self.lpips_weight > 0 and total_lpips_loss is not None:
-            avg_lpips_loss = total_lpips_loss / num_valid_frames if num_valid_frames > 0 else total_lpips_loss
-            loss_dict['stage2_lpips_loss'] = self.lpips_weight * avg_lpips_loss
-        else:
-            # 使用rgb_loss作为anchor创建零lpips loss
-            loss_dict['stage2_lpips_loss'] = avg_rgb_loss * 0.0
-
-        # 总损失
-        total_loss = sum(loss_dict.values())
-        loss_dict['stage2_total_loss'] = total_loss
+        loss_dict['stage2_total_loss'] = sum(loss_dict.values())
 
         # 【可视化指标】分别计算sky和non-sky区域的RGB loss（仅用于展示，不参与梯度回传）
         if sky_masks is not None and len(rendered_images) > 0:
-            vis_rgb_loss_sky = None
-            vis_rgb_loss_nonsky = None
-            vis_num_sky_frames = 0
-            vis_num_nonsky_frames = 0
+            # 使用已stack的tensor，直接计算
+            sky_masks_bool = sky_masks[0, :actual_S].bool()  # [actual_S, H, W]
 
-            # 确定要计算的帧范围（与forward中的frame_indices保持一致）
-            if self.supervise_middle_frame_only:
-                middle_frame_idx = actual_S // 2
-                vis_frame_indices = [middle_frame_idx]
-            else:
-                vis_frame_indices = list(range(actual_S))
+            # 扩展mask到RGB维度
+            sky_mask_3ch = sky_masks_bool.unsqueeze(1).expand(-1, 3, -1, -1)  # [actual_S, 3, H, W]
+            nonsky_mask_3ch = ~sky_mask_3ch
 
-            for i, frame_idx in enumerate(vis_frame_indices):
-                if i >= len(rendered_images):
-                    break
+            # Sky区域loss
+            if sky_mask_3ch.any():
+                sky_pred = pred_rgb[sky_mask_3ch].detach()
+                sky_gt = gt_rgb[sky_mask_3ch].detach()
+                loss_dict['stage2_rgb_loss_sky'] = F.l1_loss(sky_pred, sky_gt)
 
-                frame_gt_image = gt_images[0, frame_idx]  # [3, H, W]
-                rendered_rgb = rendered_images[i]  # [3, H, W]
-                frame_sky_mask = sky_masks[0, frame_idx].bool()  # [H, W], ensure boolean type
-
-                # Sky区域
-                if frame_sky_mask.sum() > 0:
-                    # 使用masked_select提取sky区域的像素
-                    sky_mask_3ch = frame_sky_mask.unsqueeze(0).expand(3, -1, -1)  # [3, H, W]
-                    rendered_sky_pixels = rendered_rgb[sky_mask_3ch]  # [N_sky_pixels]
-                    gt_sky_pixels = frame_gt_image[sky_mask_3ch]  # [N_sky_pixels]
-
-                    rgb_loss_sky = F.l1_loss(
-                        rendered_sky_pixels.detach(),
-                        gt_sky_pixels.detach()
-                    )
-                    if vis_rgb_loss_sky is None:
-                        vis_rgb_loss_sky = rgb_loss_sky
-                    else:
-                        vis_rgb_loss_sky = vis_rgb_loss_sky + rgb_loss_sky
-                    vis_num_sky_frames += 1
-
-                # Non-sky区域
-                nonsky_mask = ~frame_sky_mask
-                if nonsky_mask.sum() > 0:
-                    # 使用masked_select提取non-sky区域的像素
-                    nonsky_mask_3ch = nonsky_mask.unsqueeze(0).expand(3, -1, -1)  # [3, H, W]
-                    rendered_nonsky_pixels = rendered_rgb[nonsky_mask_3ch]  # [N_nonsky_pixels]
-                    gt_nonsky_pixels = frame_gt_image[nonsky_mask_3ch]  # [N_nonsky_pixels]
-
-                    rgb_loss_nonsky = F.l1_loss(
-                        rendered_nonsky_pixels.detach(),
-                        gt_nonsky_pixels.detach()
-                    )
-                    if vis_rgb_loss_nonsky is None:
-                        vis_rgb_loss_nonsky = rgb_loss_nonsky
-                    else:
-                        vis_rgb_loss_nonsky = vis_rgb_loss_nonsky + rgb_loss_nonsky
-                    vis_num_nonsky_frames += 1
-
-            # 添加平均后的可视化指标到loss_dict
-            if vis_rgb_loss_sky is not None and vis_num_sky_frames > 0:
-                loss_dict['stage2_rgb_loss_sky'] = (vis_rgb_loss_sky / vis_num_sky_frames).detach()
-            if vis_rgb_loss_nonsky is not None and vis_num_nonsky_frames > 0:
-                loss_dict['stage2_rgb_loss_nonsky'] = (vis_rgb_loss_nonsky / vis_num_nonsky_frames).detach()
+            # Non-sky区域loss
+            if nonsky_mask_3ch.any():
+                nonsky_pred = pred_rgb[nonsky_mask_3ch].detach()
+                nonsky_gt = gt_rgb[nonsky_mask_3ch].detach()
+                loss_dict['stage2_rgb_loss_nonsky'] = F.l1_loss(nonsky_pred, nonsky_gt)
 
         # 检查和修复异常值
         for key, value in loss_dict.items():
@@ -402,56 +277,6 @@ class Stage2RenderLoss(nn.Module):
 
         return loss_dict
     
-    def render_refined_scene(
-        self,
-        refined_scene: Dict,
-        intrinsics: torch.Tensor,
-        extrinsics: torch.Tensor,
-        image_height: int,
-        image_width: int,
-        sky_colors: Optional[torch.Tensor] = None
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
-        """
-        仅渲染细化后的场景，返回rendered_images和rendered_depths
-
-        Args:
-            refined_scene: 细化后的场景表示
-            intrinsics: [B, S, 3, 3] 相机内参
-            extrinsics: [B, S, 4, 4] 相机外参
-            image_height: 图像高度
-            image_width: 图像宽度
-            sky_colors: [S, H, W, 3] 天空颜色，用于替换低opacity区域 (可选)
-
-        Returns:
-            rendered_images: List[torch.Tensor] 渲染的RGB图像列表
-            rendered_depths: List[torch.Tensor] 渲染的深度图列表
-            rendered_alphas: List[torch.Tensor] 渲染的不透明度列表
-        """
-        S = intrinsics.shape[1]
-        rendered_images = []
-        rendered_depths = []
-        rendered_alphas = []
-
-        # 渲染每一帧
-        for frame_idx in range(S):
-            frame_intrinsic = intrinsics[0, frame_idx]  # [3, 3]
-            frame_extrinsic = extrinsics[0, frame_idx]  # [4, 4]
-
-            # 获取当前帧的天空颜色
-            frame_sky_colors = None
-            if sky_colors is not None:
-                frame_sky_colors = sky_colors[frame_idx]  # [H, W, 3]
-
-            # 渲染当前帧
-            rendered_rgb, rendered_depth, rendered_alpha = self._render_frame(
-                refined_scene, frame_intrinsic, frame_extrinsic,
-                image_height, image_width, frame_idx, frame_sky_colors
-            )
-            rendered_images.append(rendered_rgb)
-            rendered_depths.append(rendered_depth)
-            rendered_alphas.append(rendered_alpha)
-
-        return rendered_images, rendered_depths, rendered_alphas
 
     def _render_frame(
         self,
@@ -504,7 +329,7 @@ class Stage2RenderLoss(nn.Module):
         dynamic_objects_data = refined_scene.get('dynamic_objects', [])
         for obj_data in dynamic_objects_data:
             # 检查物体是否在当前帧存在
-            if not self._object_exists_in_frame(obj_data, frame_idx):
+            if 'frame_transforms' not in obj_data or frame_idx not in obj_data['frame_transforms']:
                 continue
 
             # 获取物体在正规空间(canonical)的Gaussian参数
@@ -550,11 +375,10 @@ class Stage2RenderLoss(nn.Module):
 
         # 安全性检查：检测并修复NaN/Inf值
         means = torch.nan_to_num(means, nan=0.0, posinf=0.0, neginf=0.0)
-        scales = torch.nan_to_num(scales, nan=0.01, posinf=1.0, neginf=0.01) #.clamp(min=0.001, max=10.0)
-        colors = torch.nan_to_num(colors, nan=0.5, posinf=1.0, neginf=0.0) #.clamp(min=0.0, max=1.0)
-        # rotations = F.normalize(torch.nan_to_num(rotations, nan=0.0, posinf=1.0, neginf=-1.0), p=2, dim=-1)
+        scales = torch.nan_to_num(scales, nan=0.01, posinf=1.0, neginf=0.01) 
+        colors = torch.nan_to_num(colors, nan=0.5, posinf=1.0, neginf=0.0) 
         rotations = torch.nan_to_num(rotations, nan=0.0, posinf=1.0, neginf=-1.0)
-        opacities = torch.nan_to_num(opacities, nan=0.5, posinf=1.0, neginf=0.0) #.clamp(min=0.0, max=1.0)
+        opacities = torch.nan_to_num(opacities, nan=0.5, posinf=1.0, neginf=0.0) 
 
         # 准备渲染参数
         viewmat = extrinsic.unsqueeze(0)  # [1, 4, 4]
@@ -572,89 +396,11 @@ class Stage2RenderLoss(nn.Module):
 
         # 提取渲染结果
         rendered_image, rendered_alphas, _ = render_result
-
-        # Extract RGB: [1, H, W, C] -> [3, H, W]
         rendered_rgb = rendered_image[0, :, :, :3].permute(2, 0, 1)
-
-        # Extract depth: [1, H, W, C] -> [H, W]
         rendered_depth = rendered_image[0, :, :, -1]
-
-        # Extract alpha: [1, H, W, 1] -> [H, W]
         rendered_alpha = rendered_alphas[0, :, :, 0] if rendered_alphas is not None else torch.zeros(height, width, device=device)
 
         return rendered_rgb, rendered_depth, rendered_alpha
-
-    def _apply_sky_replacement(
-        self,
-        rendered_rgb: torch.Tensor,
-        sky_colors: torch.Tensor,
-        rendered_alphas: torch.Tensor,
-        opacity_threshold: float = 0.01
-    ) -> torch.Tensor:
-        """
-        对渲染图像的低opacity区域应用天空颜色替换
-
-        Args:
-            rendered_rgb: [3, H, W] 渲染的RGB图像
-            sky_colors: [H, W, 3] 天空颜色
-            rendered_alphas: [..., C, H, W, 1] 渲染的alpha值
-            opacity_threshold: opacity阈值，小于此值的区域将被替换
-
-        Returns:
-            torch.Tensor: [3, H, W] 替换天空后的RGB图像
-        """
-        try:
-            # 提取alpha通道 [..., C, H, W, 1] -> [H, W]
-            if len(rendered_alphas.shape) == 5:
-                alpha = rendered_alphas[0, 0, :, :, 0]  # [H, W]
-            elif len(rendered_alphas.shape) == 4:
-                alpha = rendered_alphas[0, :, :, 0]  # [H, W]
-            elif len(rendered_alphas.shape) == 3:
-                alpha = rendered_alphas[:, :, 0]  # [H, W]
-            else:
-                alpha = rendered_alphas.squeeze()  # 尝试去掉多余维度
-
-            # 确保alpha是[H, W]格式
-            if alpha.dim() != 2:
-                print(f"Warning: Unexpected alpha dimensions: {alpha.shape}")
-                return rendered_rgb
-
-            # 创建低opacity掩码
-            low_opacity_mask = alpha < opacity_threshold  # [H, W]
-
-            # 如果没有低opacity区域，直接返回原图
-            if not low_opacity_mask.any():
-                return rendered_rgb
-
-            # 转换天空颜色格式 [H, W, 3] -> [3, H, W]
-            sky_colors_chw = sky_colors.permute(2, 0, 1)  # [3, H, W]
-
-            # 确保在同一设备上
-            sky_colors_chw = sky_colors_chw.to(rendered_rgb.device)
-            low_opacity_mask = low_opacity_mask.to(rendered_rgb.device)
-
-            # 应用天空替换：在低opacity区域使用天空颜色
-            result = rendered_rgb.clone()
-            result[:, low_opacity_mask] = sky_colors_chw[:, low_opacity_mask]
-
-            # 统计替换的像素数量
-            replaced_pixels = low_opacity_mask.sum().item()
-            total_pixels = low_opacity_mask.numel()
-            replacement_ratio = replaced_pixels / total_pixels
-            print(f"  天空替换: {replaced_pixels}/{total_pixels} ({replacement_ratio:.3f}) 像素被替换 (opacity < {opacity_threshold})")
-
-            return result
-
-        except Exception as e:
-            print(f"Warning: Sky replacement failed: {e}")
-            return rendered_rgb
-
-    def _object_exists_in_frame(self, obj_data: Dict, frame_idx: int) -> bool:
-        """检查动态物体是否在指定帧中存在"""
-        if 'frame_transforms' in obj_data:
-            frame_transforms = obj_data['frame_transforms']
-            if frame_idx in frame_transforms:
-                return True
 
     def _get_object_transform_to_frame(self, obj_data: Dict, frame_idx: int) -> Optional[torch.Tensor]:
         """获取从canonical空间到指定帧的变换矩阵"""
@@ -683,89 +429,9 @@ class Stage2RenderLoss(nn.Module):
                         f"Warning: Failed to invert transform for frame {frame_idx}: {e}")
                     return None
 
-        # 方法2：从pose deltas构建变换（如果有的话）
-        if 'pose_deltas' in obj_data and obj_data['pose_deltas']:
-            pose_deltas = obj_data['pose_deltas']
-            if frame_idx < len(pose_deltas):
-                # [6] - rotation + translation
-                pose_delta = pose_deltas[frame_idx]
-                # 这里假设pose_delta也是从frame到canonical的增量
-                frame_to_canonical_delta = self._pose_delta_to_transform_matrix(
-                    pose_delta)
-                try:
-                    # 转换为float32以支持linalg.inv
-                    original_dtype = frame_to_canonical_delta.dtype
-                    canonical_to_frame = torch.linalg.inv(
-                        frame_to_canonical_delta.float()).to(original_dtype)
-                    return canonical_to_frame
-                except Exception:
-                    return None
-
         # 如果没有变换信息，返回None
         return None
 
-    def _pose_delta_to_transform_matrix(self, pose_delta: torch.Tensor) -> torch.Tensor:
-        """
-        将pose delta转换为4x4变换矩阵（使用6D旋转表示）
-
-        Args:
-            pose_delta: [9] - [6D rotation(6), translation(3)]
-
-        Returns:
-            transform: [4, 4] 变换矩阵
-        """
-        device = pose_delta.device
-
-        # 提取6D旋转和平移
-        rotation_6d = pose_delta[:6]  # [6]
-        translation = pose_delta[6:9]  # [3]
-
-        # 【安全性检查】如果pose_delta接近零（训练初期常见），返回单位矩阵
-        if torch.abs(rotation_6d).max() < 1e-6:
-            transform = torch.eye(4, device=device, dtype=pose_delta.dtype)
-            transform[:3, 3] = translation  # 仍然应用平移
-            return transform
-
-        # 6D旋转 → 旋转矩阵 (Gram-Schmidt正交化)
-        a1 = rotation_6d[:3]  # [3]
-        a2 = rotation_6d[3:6]  # [3]
-
-        # 【安全性检查】检查a1是否为零向量
-        a1_norm = torch.norm(a1)
-        if a1_norm < 1e-8:
-            # 如果a1接近零，使用单位矩阵
-            transform = torch.eye(4, device=device, dtype=pose_delta.dtype)
-            transform[:3, 3] = translation
-            return transform
-
-        # Gram-Schmidt正交化
-        import torch.nn.functional as F
-        b1 = F.normalize(a1, dim=0, eps=1e-8)
-
-        dot_product = (b1 * a2).sum()
-        b2 = a2 - dot_product * b1
-
-        # 【安全性检查】检查b2是否为零向量（a1和a2共线）
-        b2_norm = torch.norm(b2)
-        if b2_norm < 1e-8:
-            # 如果a1和a2共线，使用单位矩阵
-            transform = torch.eye(4, device=device, dtype=pose_delta.dtype)
-            transform[:3, 3] = translation
-            return transform
-
-        b2 = F.normalize(b2, dim=0, eps=1e-8)
-
-        b3 = torch.cross(b1, b2, dim=0)
-
-        # 构建旋转矩阵
-        R = torch.stack([b1, b2, b3], dim=1)  # [3, 3]
-
-        # 构建4x4变换矩阵
-        transform = torch.eye(4, device=device, dtype=pose_delta.dtype)
-        transform[:3, :3] = R
-        transform[:3, 3] = translation
-
-        return transform
 
     def _apply_transform_to_gaussians(
         self,
@@ -773,27 +439,8 @@ class Stage2RenderLoss(nn.Module):
         transform: torch.Tensor
     ) -> torch.Tensor:
         """将变换应用到Gaussian参数"""
-        # gaussians: [N, 14] - [xyz(3), scale(3), color(3), quat(4), opacity(1)]
-        # transform: [4, 4] 变换矩阵
-
-        # 检查变换矩阵是否异常
-        if torch.allclose(transform, torch.zeros_like(transform), atol=1e-6):
-            print(f"⚠️  检测到零变换矩阵！这会导致所有点聚集到原点形成大白球！")
-            print(f"变换矩阵:\n{transform}")
-            # 使用单位矩阵替代
-            print(f"使用单位矩阵替代异常变换")
-            transform = torch.eye(4, dtype=transform.dtype,
-                                  device=transform.device)
-        else:
-            # 转换为float32以支持torch.det
-            det_val = torch.det(transform[:3, :3].float()).abs()
-            if det_val < 1e-8:
-                print(f"⚠️  变换矩阵奇异(det={det_val:.2e})！")
-                print(f"变换矩阵:\n{transform}")
 
         transformed_gaussians = gaussians.clone()
-
-        # 变换位置
         positions = gaussians[:, :3]  # [N, 3]
         positions_homo = torch.cat([positions, torch.ones(
             positions.shape[0], 1, device=positions.device)], dim=1)  # [N, 4]
@@ -802,40 +449,6 @@ class Stage2RenderLoss(nn.Module):
         transformed_gaussians[:, :3] = transformed_positions
 
         return transformed_gaussians
-
-    def _rotation_matrix_to_quaternion(self, R: torch.Tensor) -> torch.Tensor:
-        """将旋转矩阵转换为四元数"""
-        # R: [3, 3] 旋转矩阵
-        # 返回: [4] 四元数 [w, x, y, z]
-
-        trace = R[0, 0] + R[1, 1] + R[2, 2]
-
-        if trace > 0:
-            s = torch.sqrt(trace + 1.0) * 2  # s = 4 * w
-            w = 0.25 * s
-            x = (R[2, 1] - R[1, 2]) / s
-            y = (R[0, 2] - R[2, 0]) / s
-            z = (R[1, 0] - R[0, 1]) / s
-        elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
-            s = torch.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2  # s = 4 * x
-            w = (R[2, 1] - R[1, 2]) / s
-            x = 0.25 * s
-            y = (R[0, 1] + R[1, 0]) / s
-            z = (R[0, 2] + R[2, 0]) / s
-        elif R[1, 1] > R[2, 2]:
-            s = torch.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2  # s = 4 * y
-            w = (R[0, 2] - R[2, 0]) / s
-            x = (R[0, 1] + R[1, 0]) / s
-            y = 0.25 * s
-            z = (R[1, 2] + R[2, 1]) / s
-        else:
-            s = torch.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2  # s = 4 * z
-            w = (R[1, 0] - R[0, 1]) / s
-            x = (R[0, 2] + R[2, 0]) / s
-            y = (R[1, 2] + R[2, 1]) / s
-            z = 0.25 * s
-
-        return torch.tensor([w, x, y, z], device=R.device)
 
 
 class Stage2CompleteLoss(nn.Module):
@@ -865,7 +478,6 @@ class Stage2CompleteLoss(nn.Module):
         intrinsics: torch.Tensor,
         extrinsics: torch.Tensor,
         sky_masks: Optional[torch.Tensor] = None,
-        original_dynamic_objects: Optional[list] = None,
         sky_colors: Optional[torch.Tensor] = None,
         sampled_frame_indices: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
@@ -880,7 +492,6 @@ class Stage2CompleteLoss(nn.Module):
             intrinsics: 相机内参
             extrinsics: 相机外参
             sky_masks: 天空区域掩码
-            original_dynamic_objects: 原始的dynamic_objects（包含frame_pixel_indices）
             sky_colors: [B, num_frames, 3, H, W] 天空颜色
             sampled_frame_indices: [num_frames] 采样帧索引
 
@@ -891,7 +502,6 @@ class Stage2CompleteLoss(nn.Module):
         render_loss_dict = self.render_loss(
             refined_scene, gt_images, gt_depths,
             intrinsics, extrinsics, sky_masks,
-            original_dynamic_objects,
             sky_colors, sampled_frame_indices
         )
 

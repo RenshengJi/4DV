@@ -23,12 +23,6 @@ from storm.models.decoder import ModulatedLinearLayer
 from storm.models.embedders import PluckerEmbedder
 
 from contextlib import contextmanager
-# from einops import reduce
-# from functools import cache
-# from jaxtyping import Float
-# from lpips import LPIPS
-# from skimage.metrics import structural_similarity
-# from torch import Tensor
 
 @contextmanager
 def tf32_off():

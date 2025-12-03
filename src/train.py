@@ -178,8 +178,6 @@ def train(args):
         'depth_weight': getattr(args, 'aggregator_all_render_depth_weight', 1.0),
         'lpips_weight': getattr(args, 'aggregator_all_render_lpips_weight', 0.1),
         'render_only_dynamic': getattr(args, 'stage2_render_only_dynamic', False),
-        'supervise_only_dynamic': getattr(args, 'stage2_supervise_only_dynamic', False),
-        'supervise_middle_frame_only': getattr(args, 'stage2_supervise_middle_frame_only', False),
     }
     stage2_criterion = Stage2CompleteLoss(render_loss_config=stage2_loss_config)
     stage2_criterion.to(device)
@@ -553,36 +551,21 @@ def train(args):
                     except Exception as e:
                         print(f"Error in optical flow computation: {e}")
 
-                # 1. Self Render Loss (训练gaussian head)
+                # 1. Self Render Loss
                 if loss_weights['self_render_weight'] > 0 and vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
                     try:
                         self_loss_dict, _ = self_render_and_loss(
-                            preds["depth"].detach(),
-                            preds["gaussian_params"],
-                            preds["pose_enc"].detach(),
-                            vggt_batch["extrinsics"],
-                            vggt_batch["intrinsics"],
-                            vggt_batch["images"],
-                            pred_sky_colors=preds.get("pred_sky_colors"),
-                            sky_masks=vggt_batch.get("sky_masks")
+                            vggt_batch=vggt_batch,
+                            preds=preds
                         )
                         # 将所有self_render损失加入到总loss中
                         self_render_rgb_loss = self_loss_dict.get("loss_self_render_rgb", 0.0)
                         self_render_lpips_loss = self_loss_dict.get("loss_self_render_lpips", 0.0)
                         self_render_depth_loss = self_loss_dict.get("loss_self_render_depth", 0.0)
 
-                        # 使用分别的权重加入总loss
-                        if loss_weights.get('self_render_rgb_weight') is not None:
-                            # 使用新的分项权重
-                            loss += (loss_weights.get('self_render_rgb_weight', 0.0) * self_render_rgb_loss +
-                                   loss_weights.get('self_render_lpips_weight', 0.0) * self_render_lpips_loss +
-                                   loss_weights.get('self_render_depth_weight', 0.0) * self_render_depth_loss)
-                        else:
-                            # 向后兼容：使用旧的总权重
-                            total_self_render_loss = (self_render_rgb_loss +
-                                                    self_render_lpips_loss +
-                                                    self_render_depth_loss)
-                            loss += loss_weights.get('self_render_weight', 0.0) * total_self_render_loss
+                        loss += (loss_weights.get('self_render_rgb_weight', 0.0) * self_render_rgb_loss +
+                                loss_weights.get('self_render_lpips_weight', 0.0) * self_render_lpips_loss +
+                                loss_weights.get('self_render_depth_weight', 0.0) * self_render_depth_loss)
 
                         # 将所有损失记录到loss_dict中
                         loss_dict.update(self_loss_dict)
@@ -835,25 +818,9 @@ def train(args):
                     current_iteration >= aggregator_all_start_iter):
                     try:
                         # Step 1: 处理动态物体 (使用OnlineDynamicProcessor)
-                        # 使用GT camera而不是预测的pose_enc
                         preds_for_dynamic = preds.copy()
-                        if 'pose_enc' in preds_for_dynamic:
-                            # 将GT的extrinsics和intrinsics转换为pose_enc格式
-                            gt_extrinsics = vggt_batch['extrinsics']  # [B, S, 4, 4]
-                            gt_intrinsics = vggt_batch['intrinsics']  # [B, S, 3, 3]
-                            image_size_hw = vggt_batch['images'].shape[-2:]
-
-                            gt_pose_enc = extri_intri_to_pose_encoding(
-                                gt_extrinsics, gt_intrinsics, image_size_hw, pose_encoding_type="absT_quaR_FoV"
-                            )
-                            preds_for_dynamic['pose_enc'] = gt_pose_enc
-
-                        # 根据配置选择是否detach velocity
-                        if args.aggregator_all_detach_velocity and 'velocity' in preds_for_dynamic:
-                            preds_for_dynamic['velocity'] = preds_for_dynamic['velocity'].detach()
                         if args.aggregator_all_detach_velocity and 'velocity_global' in preds_for_dynamic:
                             preds_for_dynamic['velocity_global'] = preds_for_dynamic['velocity_global'].detach()
-
                         dynamic_objects_data = dynamic_processor.process_dynamic_objects(
                             preds_for_dynamic, vggt_batch, auxiliary_models
                         )
@@ -880,9 +847,9 @@ def train(args):
                             gt_images = vggt_batch['images']
                             gt_depths = vggt_batch.get('depths', torch.ones(B, S, H, W, device=device) * 5.0)
 
-                            # 使用GT相机参数（从vggt_batch中获取）
-                            intrinsics = vggt_batch['intrinsics']  # [B, S, 3, 3]
-                            extrinsics = vggt_batch['extrinsics']  # [B, S, 4, 4]
+                            # 使用预测的相机参数（从preds中获取）
+                            intrinsics = preds['intrinsics']  # [B, S, 3, 3]
+                            extrinsics = preds['extrinsics']  # [B, S, 4, 4]
 
                             sky_masks = vggt_batch.get('sky_masks', None)
 
@@ -899,7 +866,6 @@ def train(args):
                                 intrinsics=intrinsics,
                                 extrinsics=extrinsics,
                                 sky_masks=sky_masks,
-                                original_dynamic_objects=dynamic_objects,
                                 sky_colors=sky_colors,
                                 sampled_frame_indices=sampled_frame_indices
                             )
