@@ -30,6 +30,8 @@ from dust3r.utils.misc import tf32_off
 from src.dust3r.inference import inference
 from src.train import cut3r_batch_to_vggt
 from src.online_dynamic_processor import OnlineDynamicProcessor
+from vggt.training.loss import self_render_and_loss
+from vggt.training.stage2_loss import prune_gaussians_by_voxel
 
 
 def parse_args():
@@ -168,11 +170,17 @@ def fix_views_data_types(views, device):
     return fixed_views
 
 
-def render_gaussians_with_sky(scene, intrinsics, extrinsics, sky_colors, sampled_frame_indices, H, W, device):
+def render_gaussians_with_sky(scene, intrinsics, extrinsics, sky_colors, sampled_frame_indices, H, W, device,
+                              enable_voxel_pruning=True, voxel_size=0.002, depth_scale_factor=None):
     """
     渲染gaussian场景（与train.py的Stage2RenderLoss相同逻辑）
     包括sky_color的alpha blending合成
     逐帧渲染以正确处理动态物体的变换
+
+    Args:
+        enable_voxel_pruning: bool 是否启用voxel剪枝
+        voxel_size: float voxel大小（metric尺度，单位米）
+        depth_scale_factor: float 深度缩放因子
     """
     from gsplat import rasterization
     import torch.nn.functional as F
@@ -244,6 +252,14 @@ def render_gaussians_with_sky(scene, intrinsics, extrinsics, sky_colors, sampled
         rotations = torch.cat(all_rotations, dim=0)  # [N, 4]
         opacities = torch.cat(all_opacities, dim=0)  # [N]
 
+        # Apply voxel pruning (如果启用)
+        if enable_voxel_pruning and means.shape[0] > 0:
+            means, scales, rotations, opacities, colors = prune_gaussians_by_voxel(
+                means, scales, rotations, opacities, colors,
+                voxel_size=voxel_size,
+                depth_scale_factor=depth_scale_factor
+            )
+
         # Fix NaN/Inf (参考stage2_loss.py line 550-555)
         means = torch.nan_to_num(means, nan=0.0, posinf=0.0, neginf=0.0)
         scales = torch.nan_to_num(scales, nan=0.01, posinf=1.0, neginf=0.01)
@@ -293,6 +309,30 @@ def render_gaussians_with_sky(scene, intrinsics, extrinsics, sky_colors, sampled
             rendered_depths.append(torch.zeros(H, W, device=device))
 
     return torch.stack(rendered_images, dim=0), torch.stack(rendered_depths, dim=0)
+
+
+def render_self(vggt_batch, preds, sh_degree=0, enable_voxel_pruning=True, voxel_size=0.002):
+    """
+    调用self_render_and_loss生成自渲染结果（用于可视化）
+
+    Returns:
+        rendered_rgb: [S, 3, H, W] 渲染的RGB图像
+        rendered_depth: [S, H, W] 渲染的深度图像
+    """
+    # 调用self_render_and_loss
+    _, img_dict = self_render_and_loss(
+        vggt_batch, preds,
+        sampled_frame_indices=None,  # 渲染所有帧
+        sh_degree=sh_degree,
+        enable_voxel_pruning=enable_voxel_pruning,
+        voxel_size=voxel_size
+    )
+
+    # 提取渲染结果
+    rendered_rgb = img_dict['self_rgb_pred']  # [S, 3, H, W]
+    rendered_depth = img_dict['self_depth_pred'].squeeze(1)  # [S, H, W]
+
+    return rendered_rgb, rendered_depth
 
 
 def _object_exists_in_frame(obj_data, frame_idx):
@@ -497,11 +537,13 @@ def create_clustering_visualization(matched_clustering_results, vggt_batch, fusi
 
 
 def create_visualization_grid(gt_rgb, rendered_rgb, gt_depth, rendered_depth,
-                              gt_velocity, pred_velocity, clustering_vis, velocity_alpha=0.5):
-    """创建4x2的可视化网格（Row 3右侧展示GT RGB和Pred Velocity的融合）
+                              gt_velocity, pred_velocity, clustering_vis,
+                              self_render_rgb=None, velocity_alpha=0.5):
+    """创建4x2的可视化网格（Row 3右侧展示GT RGB和Pred Velocity的融合，Row 4右侧展示self_render）
 
     Args:
         velocity_alpha: Pred velocity在融合中的权重 (0-1)，默认0.5表示各占50%
+        self_render_rgb: [S, 3, H, W] self_render的RGB渲染结果
     """
     S = gt_rgb.shape[0]
     _, H, W = gt_rgb.shape[1:]
@@ -522,14 +564,20 @@ def create_visualization_grid(gt_rgb, rendered_rgb, gt_depth, rendered_depth,
         fused_velocity_np = velocity_alpha * pred_velocity_np + (1 - velocity_alpha) * gt_rgb_np
         fused_velocity_np = np.clip(fused_velocity_np, 0, 1)
 
+        # 准备self_render可视化（如果提供）
+        if self_render_rgb is not None:
+            self_render_np = self_render_rgb[s].detach().permute(1, 2, 0).cpu().numpy()
+        else:
+            # 如果没有提供self_render，使用黑色占位符
+            self_render_np = np.zeros_like(gt_rgb_np)
+
         # Create grid: 4 rows x 2 columns
         row1 = np.concatenate([gt_rgb_np, rendered_rgb_np], axis=1)
         row2 = np.concatenate([gt_depth_np, rendered_depth_np], axis=1)
         # Row 3: GT Velocity | GT RGB + Pred Velocity 融合
         row3 = np.concatenate([gt_velocity_np, fused_velocity_np], axis=1)
-        # Row 4: Dynamic Clustering | Black placeholder
-        black_placeholder = np.zeros_like(clustering_vis_np)
-        row4 = np.concatenate([clustering_vis_np, black_placeholder], axis=1)
+        # Row 4: Dynamic Clustering | Self Render
+        row4 = np.concatenate([clustering_vis_np, self_render_np], axis=1)
 
         grid = np.concatenate([row1, row2, row3, row4], axis=0)
         grid = (np.clip(grid, 0, 1) * 255).astype(np.uint8)
@@ -632,16 +680,35 @@ def run_single_inference(model, dataset, dynamic_processor, idx, num_views, devi
         extrinsics = vggt_batch['extrinsics'][0]
 
         # Get sky colors
-        sky_colors = preds.get('sky_colors', None)
+        sky_colors_full = preds.get('sky_colors', None)  # [B, num_sampled, 3, H, W]
         sampled_frame_indices = preds.get('sampled_frame_indices', None)
 
-        if sky_colors is not None:
-            sky_colors = sky_colors[0]  # [num_sampled, 3, H, W]
+        # Extract sky colors for aggregator rendering (remove batch dimension)
+        if sky_colors_full is not None:
+            sky_colors = sky_colors_full[0]  # [num_sampled, 3, H, W]
+        else:
+            sky_colors = None
 
-        # Render
-        print("Rendering gaussians with sky...")
+        # Get depth_scale_factor for voxel pruning
+        depth_scale_factor = vggt_batch.get('depth_scale_factor', None)
+        if depth_scale_factor is not None and torch.is_tensor(depth_scale_factor):
+            depth_scale_factor = depth_scale_factor.item()
+
+        # Render aggregator (with voxel pruning)
+        print("Rendering gaussians with sky (aggregator render with voxel)...")
         rendered_rgb, rendered_depth = render_gaussians_with_sky(
-            scene, intrinsics, extrinsics, sky_colors, sampled_frame_indices, H, W, device
+            scene, intrinsics, extrinsics, sky_colors, sampled_frame_indices, H, W, device,
+            enable_voxel_pruning=True, voxel_size=0.05, depth_scale_factor=depth_scale_factor
+        )
+
+        # Render self (with voxel pruning)
+        # Note: preds still contains the full sky_colors [B, num_frames, 3, H, W] for self_render_and_loss
+        print("Rendering self...")
+        self_render_rgb, self_render_depth = render_self(
+            vggt_batch, preds,
+            sh_degree=args.sh_degree if hasattr(args, 'sh_degree') else 0,
+            enable_voxel_pruning=True,
+            voxel_size=0.05
         )
 
         # Visualize
@@ -663,6 +730,7 @@ def run_single_inference(model, dataset, dynamic_processor, idx, num_views, devi
             'gt_velocity': gt_velocity_vis,
             'pred_velocity': pred_velocity_vis,
             'clustering': clustering_vis,
+            'self_render_rgb': self_render_rgb,
             'num_objects': len(dynamic_objects),
             'success': True
         }
@@ -696,6 +764,7 @@ def run_batch_inference(model, dataset, dynamic_processor, args, device):
                 result['gt_depth'], result['rendered_depth'],
                 result['gt_velocity'], result['pred_velocity'],
                 result['clustering'],
+                result.get('self_render_rgb'),
                 velocity_alpha=args.velocity_alpha
             )
 
@@ -770,6 +839,7 @@ def main():
                     result['gt_depth'], result['rendered_depth'],
                     result['gt_velocity'], result['pred_velocity'],
                     result['clustering'],
+                    result.get('self_render_rgb'),
                     velocity_alpha=args.velocity_alpha
                 )
 

@@ -796,7 +796,7 @@ def self_render_and_loss(vggt_batch, preds, sampled_frame_indices=None, sh_degre
         pred_depth = render_colors_tensor[..., -1]  # [num_frames_to_render, H, W]
 
         # 如果有天空颜色预测，使用alpha通道进行加权平均（与stage2_loss.py保持一致）
-        if pred_sky_colors is not None and sky_masks is not None:
+        if pred_sky_colors is not None:
             # 创建一个新的tensor来避免inplace操作
             pred_rgb_with_sky = pred_rgb.clone()
             for render_idx, i in enumerate(sampled_frame_indices):
