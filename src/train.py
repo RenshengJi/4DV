@@ -480,6 +480,9 @@ def train(args):
                 # 获取损失权重配置
                 loss_weights = {
                     'self_render_weight': getattr(args, 'self_render_weight', 1.0),
+                    'self_render_rgb_weight': getattr(args, 'self_render_rgb_weight', 1.0),
+                    'self_render_lpips_weight': getattr(args, 'self_render_lpips_weight', 0.0),
+                    'self_render_depth_weight': getattr(args, 'self_render_depth_weight', 0.0),
                     'flow_loss_weight': getattr(args, 'flow_loss_weight', 1.0),
                     'conf_flow_loss_weight': getattr(args, 'conf_flow_loss_weight', 1.0),  # GT flowmap conf损失
                     'grad_flow_loss_weight': getattr(args, 'grad_flow_loss_weight', 1.0),  # GT flowmap grad损失
