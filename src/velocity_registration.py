@@ -145,6 +145,9 @@ class VelocityBasedRegistration:
             if not self._is_valid_rotation_matrix(R):
                 raise ValueError("计算得到的旋转矩阵无效")
 
+            # for debug: 设R为单位矩阵 FIXME:
+            R = torch.eye(3, device=self.device, dtype=torch.float32)
+
             # 计算平移向量
             t = centroid_dst - torch.matmul(R, centroid_src)
 

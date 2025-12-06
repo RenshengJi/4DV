@@ -29,7 +29,7 @@ def parse_args():
 
     # 基础参数
     parser.add_argument("--model_path", type=str, required=True, help="Path to model checkpoint")
-    parser.add_argument("--seq_dir", type=str, required=True, help="Path to sequence directory")
+    parser.add_argument("--dataset_root", type=str, required=True, help="Path to dataset root directory")
     parser.add_argument("--output_dir", type=str, default="./inference_velocity_outputs", help="Output directory")
     parser.add_argument("--idx", type=int, default=0, help="Sequence index (single mode)")
     parser.add_argument("--device", type=str, default="cuda", help="Device (cuda/cpu)")
@@ -85,12 +85,12 @@ def load_model(model_path, device, args):
     return model
 
 
-def load_dataset(seq_dir, num_views):
+def load_dataset(dataset_root, num_views):
     """加载数据集"""
     from src.dust3r.datasets.waymo import Waymo_Multi
 
-    seq_name = os.path.basename(seq_dir)
-    root_dir = os.path.dirname(seq_dir)
+    seq_name = os.path.basename(dataset_root)
+    root_dir = os.path.dirname(dataset_root)
 
     print(f"Loading dataset - Root: {root_dir}, Sequence: {seq_name}")
 
@@ -241,7 +241,7 @@ def run_batch_inference(model, dataset, args, device):
                 velocity_alpha=args.velocity_alpha
             )
 
-            seq_name = os.path.basename(args.seq_dir)
+            seq_name = os.path.basename(args.dataset_root)
             output_path = os.path.join(args.output_dir, f"{seq_name}_idx{idx}.mp4")
 
             save_video(grid_frames, output_path, fps=args.fps)
@@ -277,7 +277,7 @@ def main():
 
     # Load model and dataset
     model = load_model(args.model_path, device, args)
-    dataset = load_dataset(args.seq_dir, args.num_views)
+    dataset = load_dataset(args.dataset_root, args.num_views)
 
     # Create output dir
     os.makedirs(args.output_dir, exist_ok=True)
@@ -297,7 +297,7 @@ def main():
                     velocity_alpha=args.velocity_alpha
                 )
 
-                seq_name = os.path.basename(args.seq_dir)
+                seq_name = os.path.basename(args.dataset_root)
                 output_path = os.path.join(args.output_dir, f"{seq_name}_idx{args.idx}.mp4")
 
                 save_video(grid_frames, output_path, fps=args.fps)

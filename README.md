@@ -35,7 +35,7 @@ CUDA_VISIBLE_DEVICES=0 python inference.py \
     --batch_mode \
     --start_idx 100 --end_idx 100000 --step 100 \
     --model_path "src/checkpoints/waymo_stage1_online/fromaggregator_all_lr1e-5_procrustes_area500_velocityconstraint0.05_gtcamera_xyzgrad+fixdbscan+sky+fixepsmetric+noconf/checkpoint-epoch_0_37980.pth" \
-    --seq_dir "data/waymo/train_full/" \
+    --dataset_root "data/waymo/train_full/" \
     --output_dir "./results/no_conf" \
     --device cuda --num_views 8 --fps 10 \
     --sh_degree 0 --use_gs_head --use_gs_head_velocity \
@@ -59,7 +59,7 @@ CUDA_VISIBLE_DEVICES=0 python inference_velocity.py \
     --batch_mode \
     --start_idx 100 --end_idx 100000 --step 100 \
     --model_path "src/checkpoints/waymo_stage1_online/fromaggregator_all_lr1e-5_procrustes_area500_velocityconstraint0.05_gtcamera_xyzgrad+fixdbscan+sky+fixepsmetric+noconf/checkpoint-epoch_0_37980.pth" \
-    --seq_dir "data/waymo/train_full/" \
+    --dataset_root "data/waymo/train_full/" \
     --output_dir "./results/velocity_outputs" \
     --device cuda --num_views 8 --fps 10 \
     --sh_degree 0 --use_gs_head --use_gs_head_velocity --use_gt_camera \
@@ -72,7 +72,7 @@ CUDA_VISIBLE_DEVICES=0 python inference_velocity.py \
 python inference_velocity.py \
     --idx 1600 \
     --model_path "path/to/checkpoint.pth" \
-    --seq_dir "data/waymo/train_full/" \
+    --dataset_root "data/waymo/train_full/" \
     --velocity_alpha 0.5
 ```
 
@@ -85,7 +85,7 @@ CUDA_VISIBLE_DEVICES=0 python inference_nvs.py \
     --batch_mode \
     --start_idx 100 --end_idx 100000 --step 100 \
     --model_path "src/checkpoints/waymo_stage1_online/fromaggregator_all_lr1e-5_procrustes_area500_velocityconstraint0.05_gtcamera_xyzgrad+fixdbscan+sky+fixepsmetric+noconf/checkpoint-epoch_0_37980.pth" \
-    --seq_dir "data/waymo/train_full/" \
+    --dataset_root "data/waymo/train_full/" \
     --output_dir "./results/nvs_no_Conf" \
     --device cuda --num_views 8 --fps 10 \
     --sh_degree 0 --use_gs_head --use_gs_head_velocity \

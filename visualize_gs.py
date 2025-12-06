@@ -35,9 +35,9 @@ def parse_args():
     parser.add_argument("--model_path", type=str,
                        default="src/checkpoints/waymo_stage1_online/fromaggregator_all_lr1e-5_procrustes_area500_velocityconstraint0.05_gtcamera_xyzgrad+fixdbscan+sky+fixepsmetric+noconf/checkpoint-epoch_0_37980.pth",
                        help="Path to Stage1 model checkpoint")
-    parser.add_argument("--seq_dir", type=str,
+    parser.add_argument("--dataset_root", type=str,
                        default="data/waymo/train_full/",
-                       help="Path to sequence directory")
+                       help="Path to dataset root directory")
     parser.add_argument("--idx", type=int, default=0, help="Sequence index")
     parser.add_argument("--device", type=str, default="cuda", help="Device (cuda/cpu)")
     parser.add_argument("--num_views", type=int, default=8, help="Number of views")
@@ -93,12 +93,12 @@ def load_model(model_path, device):
     return model
 
 
-def load_dataset(seq_dir, num_views):
+def load_dataset(dataset_root, num_views):
     """加载数据集"""
     from src.dust3r.datasets.waymo import Waymo_Multi
 
-    seq_name = os.path.basename(seq_dir)
-    root_dir = os.path.dirname(seq_dir)
+    seq_name = os.path.basename(dataset_root)
+    root_dir = os.path.dirname(dataset_root)
 
     print(f"Loading dataset - Root: {root_dir}, Sequence: {seq_name}")
 
@@ -436,7 +436,7 @@ def run_inference(args):
 
     # Load model and dataset
     model = load_model(args.model_path, device)
-    dataset = load_dataset(args.seq_dir, args.num_views)
+    dataset = load_dataset(args.dataset_root, args.num_views)
 
     # Create dynamic processor
     dynamic_processor = OnlineDynamicProcessor(
