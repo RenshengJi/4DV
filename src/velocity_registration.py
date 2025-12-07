@@ -151,8 +151,9 @@ class VelocityBasedRegistration:
 
             # 处理反射情况
             if torch.linalg.det(R) < 0:
-                Vt[-1, :] *= -1
-                R = Vt.T @ U.T
+                Vt_corrected = Vt.clone()
+                Vt_corrected[-1, :] *= -1
+                R = Vt_corrected.T @ U.T
 
             if not self._is_valid_rotation_matrix(R):
                 raise ValueError("计算得到的旋转矩阵无效")
@@ -494,7 +495,7 @@ class VelocityBasedRegistration:
             try:
                 # 使用带权重的Procrustes（如果有depth_conf）
                 R, t, inlier_ratio = self.estimate_transformation_direct(
-                    points_src_object, points_dst_object, weights=object_weights
+                    points_src_object.detach(), points_dst_object.detach(), weights=object_weights
                 )
                 transformation = torch.eye(4, device=self.device, dtype=torch.float32)
                 transformation[:3, :3] = R

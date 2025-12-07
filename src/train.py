@@ -47,6 +47,7 @@ from raft import RAFT
 
 
 torch.backends.cuda.matmul.allow_tf32 = True  # for gpu >= Ampere and pytorch >= 1.12
+torch.autograd.set_detect_anomaly(True)
 
 from dust3r.datasets import get_data_loader
 from dust3r.utils.misc import tf32_off
