@@ -802,10 +802,10 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}\n")
 
-    # import debugpy
-    # debugpy.listen(5697)
-    # print("Waiting for debugger to attach...")
-    # debugpy.wait_for_client()
+    import debugpy
+    debugpy.listen(5697)
+    print("Waiting for debugger to attach...")
+    debugpy.wait_for_client()
 
     # Load model and dataset
     model = load_model(args.model_path, device, args)
