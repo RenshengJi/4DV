@@ -340,11 +340,12 @@ class VelocityBasedRegistration:
                 velocity_src = preds['velocity_global'][0, frame_idx]
                 velocity_dst = preds['velocity_global'][0, next_frame]
                 depth_conf_src = preds.get('depth_conf', [None])[0, frame_idx] if 'depth_conf' in preds else None
+                velocity_conf_src = preds.get('velocity_conf', [None])[0, frame_idx] if 'velocity_conf' in preds else None
 
                 # 计算单步变换
                 step_transformation = self.compute_single_step_transformation(
                     current_result, next_result, depth_src, depth_dst,
-                    velocity_src, velocity_dst, global_id, direction, depth_conf_src
+                    velocity_src, velocity_dst, global_id, direction, depth_conf_src, velocity_conf_src
                 )
 
                 if step_transformation is None:
@@ -369,7 +370,8 @@ class VelocityBasedRegistration:
                                            velocity_dst: Optional[torch.Tensor],
                                            global_id: int,
                                            direction: int = 1,
-                                           depth_conf_src: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
+                                           depth_conf_src: Optional[torch.Tensor] = None,
+                                           velocity_conf_src: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
         """
         计算单步变换（相邻两帧之间）
 
@@ -383,6 +385,7 @@ class VelocityBasedRegistration:
             global_id: 物体全局ID
             direction: 变换方向，1表示forward，-1表示backward
             depth_conf_src: 源帧深度置信度
+            velocity_conf_src: 源帧velocity置信度
 
         Returns:
             变换矩阵或None
@@ -419,14 +422,35 @@ class VelocityBasedRegistration:
         if object_velocities.device != torch.device(self.device):
             object_velocities = object_velocities.to(self.device)
 
-        # 提取depth_conf作为权重（不过滤）
+        # 提取并叠加depth_conf和velocity_conf作为权重（不过滤）
         object_weights = None
+
+        # 提取depth_conf权重
+        depth_weights = None
         if depth_conf_src is not None and isinstance(depth_conf_src, torch.Tensor):
             depth_conf_flat = depth_conf_src.reshape(H * W) if len(depth_conf_src.shape) == 2 else depth_conf_src
             if depth_conf_flat is not None and len(depth_conf_flat.shape) == 1:
-                object_weights = depth_conf_flat[object_indices].detach()
-                # 确保权重非负
-                object_weights = torch.clamp(object_weights, min=0.0)
+                depth_weights = depth_conf_flat[object_indices].detach()
+                depth_weights = torch.clamp(depth_weights, min=0.0)
+
+        # 提取velocity_conf权重
+        velocity_weights = None
+        if velocity_conf_src is not None and isinstance(velocity_conf_src, torch.Tensor):
+            velocity_conf_flat = velocity_conf_src.reshape(H * W) if len(velocity_conf_src.shape) == 2 else velocity_conf_src
+            if velocity_conf_flat is not None and len(velocity_conf_flat.shape) == 1:
+                velocity_weights = velocity_conf_flat[object_indices].detach()
+                velocity_weights = torch.clamp(velocity_weights, min=0.0)
+
+        # 叠加权重
+        if depth_weights is not None and velocity_weights is not None:
+            # 两个权重都存在，相乘或相加（这里使用相乘）
+            object_weights = depth_weights * velocity_weights
+        elif depth_weights is not None:
+            # 只有depth权重
+            object_weights = depth_weights
+        elif velocity_weights is not None:
+            # 只有velocity权重
+            object_weights = velocity_weights
 
         # Simple模式
         if self.velocity_transform_mode == "simple":
