@@ -1231,7 +1231,7 @@ def conf_loss(pts3d, pts3d_conf, gt_pts3d, valid_mask,  batch, normalize_gt=True
     else:
         conf_loss_first_frame = pts3d * 0
         conf_loss_other_frames = pts3d * 0
-        print("No valid conf loss", batch["seq_name"])
+        # print("No valid conf loss", batch["seq_name"])
 
     if all_mean and conf_loss_first_frame.numel() > 0 and conf_loss_other_frames.numel() > 0:
         all_conf_loss = torch.cat(
