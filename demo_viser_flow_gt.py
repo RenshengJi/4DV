@@ -735,7 +735,7 @@ def main():
     parser.add_argument(
         "--dataset_root",
         type=str,
-        default="/mnt/teams/algo-teams/yuxue.yang/4DVideo/preprocessed_dataset/waymo/train_full",
+        default="data/waymo/train_full",
         help="Path to dataset root directory"
     )
     parser.add_argument("--model_path", type=str, default=None, help="Path to model checkpoint (optional, for prediction)")
