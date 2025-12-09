@@ -413,6 +413,7 @@ def viser_wrapper_velocity_arrows(
     arrow_data: dict,
     port: int = 8080,
     init_display_ratio: float = 50.0,
+    init_velocity_threshold: float = 0.0,
     background_mode: bool = False,
 ):
     """
@@ -422,6 +423,7 @@ def viser_wrapper_velocity_arrows(
         arrow_data (dict): 包含frames_data等的字典
         port (int): 端口号
         init_display_ratio (float): 初始显示比例（百分比）
+        init_velocity_threshold (float): 初始速度阈值（m/s）
         background_mode (bool): 是否后台运行
     """
     print(f"Starting viser velocity arrows server on port {port}")
@@ -442,6 +444,14 @@ def viser_wrapper_velocity_arrows(
         "Select Frame",
         options=["All"] + [f"Frame {frame_data['frame_idx']}" for frame_data in frames_data],
         initial_value="All",
+    )
+
+    gui_velocity_threshold = server.gui.add_slider(
+        "Velocity Threshold (m/s)",
+        min=0.0,
+        max=max_magnitude,
+        step=0.001,
+        initial_value=init_velocity_threshold,
     )
 
     gui_display_ratio = server.gui.add_slider(
@@ -547,20 +557,37 @@ def viser_wrapper_velocity_arrows(
         if N == 0:
             return
 
-        # 计算要显示的箭头数量
+        # 首先根据velocity threshold过滤
+        velocity_threshold = gui_velocity_threshold.value
+        threshold_mask = velocity_magnitude >= velocity_threshold
+
+        if not np.any(threshold_mask):
+            # 如果没有任何点满足阈值，更新信息并返回
+            gui_info.value = f"Frame: {gui_frame_selector.value}\nNo arrows above threshold {velocity_threshold:.3f}m/s\nTotal points: {N}"
+            return
+
+        # 应用阈值过滤
+        filtered_starts = arrow_starts[threshold_mask]
+        filtered_ends = arrow_ends[threshold_mask]
+        filtered_colors = arrow_colors[threshold_mask]
+        filtered_magnitude = velocity_magnitude[threshold_mask]
+
+        N_filtered = len(filtered_starts)
+
+        # 计算要显示的箭头数量（从过滤后的数据中选择）
         display_ratio = gui_display_ratio.value / 100.0
-        num_display = max(1, int(N * display_ratio))
+        num_display = max(1, int(N_filtered * display_ratio))
 
         # 根据velocity magnitude选择要显示的箭头（显示magnitude较大的）
-        if num_display < N:
-            sorted_indices = np.argsort(velocity_magnitude)[::-1]  # 降序排列
+        if num_display < N_filtered:
+            sorted_indices = np.argsort(filtered_magnitude)[::-1]  # 降序排列
             display_indices = sorted_indices[:num_display]
         else:
-            display_indices = np.arange(N)
+            display_indices = np.arange(N_filtered)
 
-        display_starts = arrow_starts[display_indices]
-        display_ends = arrow_ends[display_indices]
-        display_colors = arrow_colors[display_indices]
+        display_starts = filtered_starts[display_indices]
+        display_ends = filtered_ends[display_indices]
+        display_colors = filtered_colors[display_indices]
 
         # 应用箭头长度缩放
         arrow_scale = gui_arrow_scale.value
@@ -602,12 +629,16 @@ def viser_wrapper_velocity_arrows(
         frame_info = f"Frame: {gui_frame_selector.value}"
         if gui_frame_selector.value != "All":
             frame_idx = int(gui_frame_selector.value.split()[-1])
-            frame_info += f" ({N} arrows)"
+            frame_info += f" ({N} total points)"
 
-        gui_info.value = f"{frame_info}\nDisplaying: {len(display_indices)}/{N} arrows\nMax Velocity: {max_magnitude:.6f}m/s\nArrow Scale: {arrow_scale:.1f}x"
+        gui_info.value = f"{frame_info}\nThreshold: {velocity_threshold:.3f}m/s\nAbove threshold: {N_filtered}/{N}\nDisplaying: {len(display_indices)}/{N_filtered} arrows\nMax Velocity: {max_magnitude:.3f}m/s"
 
     # GUI事件处理
     @gui_frame_selector.on_update
+    def _(_) -> None:
+        update_visualization()
+
+    @gui_velocity_threshold.on_update
     def _(_) -> None:
         update_visualization()
 
@@ -636,6 +667,7 @@ def viser_wrapper_velocity_arrows(
     def _(_) -> None:
         """重置视图"""
         gui_frame_selector.value = "All"
+        gui_velocity_threshold.value = 0.0
         gui_display_ratio.value = 50
         gui_arrow_scale.value = 1.0
         update_visualization()
@@ -675,6 +707,9 @@ def main():
     parser.add_argument("--port", type=int, default=8082, help="Port number for the viser server")
     parser.add_argument(
         "--display_ratio", type=float, default=50.0, help="Initial percentage of arrows to display"
+    )
+    parser.add_argument(
+        "--velocity_threshold", type=float, default=0.0, help="Initial velocity threshold in m/s (only show arrows with velocity above this threshold)"
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug mode for additional logging")
     parser.add_argument("--num_views", type=int, default=8, help="Number of views for inference")
@@ -800,6 +835,7 @@ def main():
         arrow_data,
         port=args.port,
         init_display_ratio=args.display_ratio,
+        init_velocity_threshold=args.velocity_threshold,
         background_mode=args.background_mode,
     )
     print("Velocity arrows visualization complete")
