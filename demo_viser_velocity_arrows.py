@@ -465,9 +465,9 @@ def viser_wrapper_velocity_arrows(
     gui_arrow_width = server.gui.add_slider(
         "Arrow Width",
         min=0.001,
-        max=0.05,
+        max=1.0,
         step=0.001,
-        initial_value=0.005,
+        initial_value=0.5,
     )
 
     gui_arrow_scale = server.gui.add_slider(
@@ -595,28 +595,32 @@ def viser_wrapper_velocity_arrows(
             # 计算scaled的终点：start + scale * (end - start)
             display_ends = display_starts + arrow_scale * (display_ends - display_starts)
 
-        # 将颜色转换为0-255范围
-        display_colors_uint8 = (display_colors * 255).astype(np.uint8)
+        # 将颜色转换为0-1范围（viser接受uint8和float，但使用float更安全）
+        display_colors_float = display_colors.astype(np.float32)  # 确保已经在[0,1]范围
 
-        # 添加箭头
+        # 批量添加箭头 - 使用add_line_segments API
         arrow_width = gui_arrow_width.value
-        for i in range(len(display_starts)):
-            start = display_starts[i]
-            end = display_ends[i]
-            color_rgb = tuple(display_colors_uint8[i])
+        num_arrows = len(display_starts)
 
-            # 使用viser添加箭头（使用线段来模拟箭头）
-            arrow_handle = server.scene.add_spline_catmull_rom(
-                f"/arrows/arrow_{i}",
-                positions=np.array([start, end]),
-                color=color_rgb,
-                line_width=arrow_width,
-                segments=1,
-            )
-            arrow_handles.append(arrow_handle)
+        # 构建线段数组：shape (N, 2, 3) - N条线段，每条2个点，每个点3个坐标
+        line_segments = np.stack([display_starts, display_ends], axis=1)  # [N, 2, 3]
+
+        # 构建颜色数组：shape (N, 2, 3) - 每条线段的起点和终点都用相同的颜色
+        line_colors = np.stack([display_colors_float, display_colors_float], axis=1)  # [N, 2, 3]
+
+        # 一次性添加所有线段
+        arrow_handle = server.scene.add_line_segments(
+            name="/arrows",
+            points=line_segments,
+            colors=line_colors,
+            line_width=arrow_width,
+        )
+        arrow_handles.append(arrow_handle)
 
         # 如果启用，显示起点
         if gui_show_points.value:
+            # 为点云使用uint8颜色（与demo_viser_flow_gt.py一致）
+            display_colors_uint8 = (display_colors * 255).astype(np.uint8)
             point_cloud_handle = server.scene.add_point_cloud(
                 name="/points/start_points",
                 points=display_starts,
