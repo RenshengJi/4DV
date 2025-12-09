@@ -18,4 +18,5 @@ h5py
 viser
 hydra-core
 imageio-ffmpeg
-tensorboard
+contextlib
+lpips

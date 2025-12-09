@@ -19,6 +19,9 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from copy import deepcopy
+from contextlib import contextmanager
+from lpips import LPIPS
+from skimage.metrics import structural_similarity
 
 # Add paths
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src/vggt'))
@@ -32,6 +35,90 @@ from src.train import cut3r_batch_to_vggt
 from src.online_dynamic_processor import OnlineDynamicProcessor
 from vggt.training.loss import self_render_and_loss
 from vggt.training.stage2_loss import prune_gaussians_by_voxel
+
+
+# ========== Metric Computation Functions (from NoPoSplat/evaluation/metrics.py) ==========
+
+@contextmanager
+def tf32_metric_off():
+    """Temporarily disable TF32 for metric computation"""
+    original = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = original
+
+
+_lpips_cache = {}
+
+def get_lpips(device: torch.device) -> LPIPS:
+    """Get or create LPIPS model"""
+    if device not in _lpips_cache:
+        _lpips_cache[device] = LPIPS(net="vgg").to(device)
+    return _lpips_cache[device]
+
+
+@torch.no_grad()
+def compute_psnr(ground_truth, predicted):
+    """
+    Compute PSNR between ground truth and predicted images
+
+    Args:
+        ground_truth: [batch, channel, height, width] tensor
+        predicted: [batch, channel, height, width] tensor
+
+    Returns:
+        [batch] tensor of PSNR values
+    """
+    ground_truth = ground_truth.clip(min=0, max=1)
+    predicted = predicted.clip(min=0, max=1)
+    mse = ((ground_truth - predicted) ** 2).mean(dim=[1, 2, 3])
+    return -10 * mse.log10()
+
+
+@torch.no_grad()
+def compute_lpips(ground_truth, predicted):
+    """
+    Compute LPIPS between ground truth and predicted images
+
+    Args:
+        ground_truth: [batch, channel, height, width] tensor
+        predicted: [batch, channel, height, width] tensor
+
+    Returns:
+        [batch] tensor of LPIPS values
+    """
+    value = get_lpips(predicted.device).forward(ground_truth, predicted, normalize=True)
+    return value[:, 0, 0, 0]
+
+
+@torch.no_grad()
+def compute_ssim(ground_truth, predicted):
+    """
+    Compute SSIM between ground truth and predicted images
+
+    Args:
+        ground_truth: [batch, channel, height, width] tensor
+        predicted: [batch, channel, height, width] tensor
+
+    Returns:
+        [batch] tensor of SSIM values
+    """
+    ssim = [
+        structural_similarity(
+            gt.detach().cpu().numpy(),
+            hat.detach().cpu().numpy(),
+            win_size=11,
+            gaussian_weights=True,
+            channel_axis=0,
+            data_range=1.0,
+        )
+        for gt, hat in zip(ground_truth, predicted)
+    ]
+    return torch.tensor(ssim, dtype=predicted.dtype, device=predicted.device)
+
+# ========== End of Metric Computation Functions ==========
 
 
 def parse_args():
@@ -587,6 +674,41 @@ def create_visualization_grid(gt_rgb, rendered_rgb, gt_depth, rendered_depth,
     return grid_frames
 
 
+def compute_metrics(gt_rgb, rendered_rgb):
+    """
+    计算 GT RGB 和 Rendered RGB 之间的 photometric 指标
+
+    Args:
+        gt_rgb: [S, 3, H, W] tensor, GT RGB images
+        rendered_rgb: [S, 3, H, W] tensor, Rendered RGB images
+
+    Returns:
+        dict with per-frame and average metrics
+    """
+    # Ensure inputs are in [0, 1] range
+    gt_rgb = torch.clamp(gt_rgb, 0, 1)
+    rendered_rgb = torch.clamp(rendered_rgb, 0, 1)
+
+    # Compute metrics (input format: [batch, channel, height, width])
+    psnr_values = compute_psnr(gt_rgb, rendered_rgb)  # [S]
+    ssim_values = compute_ssim(gt_rgb, rendered_rgb)  # [S]
+    lpips_values = compute_lpips(gt_rgb, rendered_rgb)  # [S]
+
+    # Convert to numpy for easier handling
+    psnr_values = psnr_values.detach().cpu().numpy()
+    ssim_values = ssim_values.detach().cpu().numpy()
+    lpips_values = lpips_values.detach().cpu().numpy()
+
+    return {
+        'psnr': psnr_values,
+        'ssim': ssim_values,
+        'lpips': lpips_values,
+        'psnr_mean': np.mean(psnr_values),
+        'ssim_mean': np.mean(ssim_values),
+        'lpips_mean': np.mean(lpips_values)
+    }
+
+
 def run_single_inference(model, dataset, dynamic_processor, idx, num_views, device, args=None):
     """运行单次推理"""
     print(f"\n{'='*60}")
@@ -711,6 +833,26 @@ def run_single_inference(model, dataset, dynamic_processor, idx, num_views, devi
             voxel_size=0.05
         )
 
+        # Compute photometric metrics
+        print("Computing photometric metrics...")
+        metrics = compute_metrics(gt_rgb, rendered_rgb)
+
+        # Print per-frame metrics
+        print(f"\n{'='*60}")
+        print("Per-frame Metrics (GT RGB vs Rendered RGB with sky):")
+        print(f"{'='*60}")
+        for i in range(len(metrics['psnr'])):
+            print(f"Frame {i:2d} - PSNR: {metrics['psnr'][i]:.4f}, SSIM: {metrics['ssim'][i]:.4f}, LPIPS: {metrics['lpips'][i]:.4f}")
+
+        # Print average metrics
+        print(f"\n{'='*60}")
+        print("Average Metrics:")
+        print(f"{'='*60}")
+        print(f"PSNR:  {metrics['psnr_mean']:.4f}")
+        print(f"SSIM:  {metrics['ssim_mean']:.4f}")
+        print(f"LPIPS: {metrics['lpips_mean']:.4f}")
+        print(f"{'='*60}\n")
+
         # Visualize
         print("Creating visualizations...")
         gt_velocity_vis = visualize_velocity(gt_velocity, scale=0.1)
@@ -732,6 +874,7 @@ def run_single_inference(model, dataset, dynamic_processor, idx, num_views, devi
             'clustering': clustering_vis,
             'self_render_rgb': self_render_rgb,
             'num_objects': len(dynamic_objects),
+            'metrics': metrics,
             'success': True
         }
 
@@ -751,6 +894,7 @@ def run_batch_inference(model, dataset, dynamic_processor, args, device):
 
     successful = []
     failed = []
+    all_metrics = []
 
     indices = range(args.start_idx, args.end_idx, args.step)
 
@@ -773,7 +917,8 @@ def run_batch_inference(model, dataset, dynamic_processor, args, device):
 
             save_video(grid_frames, output_path, fps=args.fps)
             successful.append(idx)
-            print(f"✓ idx {idx}: {result['num_objects']} objects")
+            all_metrics.append(result['metrics'])
+            print(f"✓ idx {idx}: {result['num_objects']} objects, PSNR: {result['metrics']['psnr_mean']:.4f}, SSIM: {result['metrics']['ssim_mean']:.4f}, LPIPS: {result['metrics']['lpips_mean']:.4f}")
         else:
             failed.append(idx)
             print(f"✗ idx {idx}: {result['error']}")
@@ -782,6 +927,16 @@ def run_batch_inference(model, dataset, dynamic_processor, args, device):
 
     print(f"\n{'='*60}")
     print(f"Batch complete: {len(successful)} successful, {len(failed)} failed")
+
+    # Compute overall average metrics
+    if all_metrics:
+        avg_psnr = np.mean([m['psnr_mean'] for m in all_metrics])
+        avg_ssim = np.mean([m['ssim_mean'] for m in all_metrics])
+        avg_lpips = np.mean([m['lpips_mean'] for m in all_metrics])
+        print(f"\nOverall Average Metrics across all sequences:")
+        print(f"PSNR:  {avg_psnr:.4f}")
+        print(f"SSIM:  {avg_ssim:.4f}")
+        print(f"LPIPS: {avg_lpips:.4f}")
     print(f"{'='*60}\n")
 
 
@@ -850,6 +1005,7 @@ def main():
 
                 print(f"\n{'='*60}")
                 print(f"Success! Objects: {result['num_objects']}")
+                print(f"Metrics - PSNR: {result['metrics']['psnr_mean']:.4f}, SSIM: {result['metrics']['ssim_mean']:.4f}, LPIPS: {result['metrics']['lpips_mean']:.4f}")
                 print(f"Output: {output_path}")
                 print(f"{'='*60}\n")
             else:

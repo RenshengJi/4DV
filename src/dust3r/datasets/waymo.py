@@ -175,6 +175,8 @@ class Waymo_Multi(BaseMultiViewDataset):
                 # Load compressed .npz format
                 flow_data = np.load(flow_path_npz)
                 flowmap = flow_data['data']
+                # flow_data = np.load(flow_path_npz)
+                # flowmap = flow_data['flow']
             elif osp.exists(flow_path_npy):
                 # Fallback to legacy .npy format
                 flowmap = np.load(flow_path_npy)

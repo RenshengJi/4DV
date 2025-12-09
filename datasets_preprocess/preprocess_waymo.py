@@ -781,7 +781,7 @@ def crop_one_seq(input_dir, output_dir, seq, enable_sam=False, sam_model_type="s
         flowmap = np.zeros((H, W, 4), dtype=np.float32)  # [x_flow, y_flow, z_flow, category]
         valid_mask = (x >= 0) & (x < W) & (y >= 0) & (y < H)
         flowmap[y[valid_mask], x[valid_mask]] = flows[valid_mask]
-        np.save(osp.join(out_dir, frame + "npy"), flowmap)
+        np.savez_compressed(osp.join(out_dir, frame[:-1] + "_flow.npz"), flow=flowmap)
 
         # Generate dynamic mask
         if 'labels_json' in data.files and 'vehicle_pose' in data.files and 'calibration_json' in data.files:
@@ -906,10 +906,10 @@ if __name__ == "__main__":
     parser = get_parser()
     args = parser.parse_args()
 
-    import debugpy
-    debugpy.listen(5697)
-    print("Waiting for debugger to attach...")
-    debugpy.wait_for_client()
+    # import debugpy
+    # debugpy.listen(5697)
+    # print("Waiting for debugger to attach...")
+    # debugpy.wait_for_client()
 
     main(args.waymo_dir, args.precomputed_pairs, args.output_dir, workers=args.workers,
          enable_sam=args.enable_sam, sam_model_type=args.sam_model_type, sam_device=args.sam_device,
