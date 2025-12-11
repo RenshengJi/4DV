@@ -1,10 +1,10 @@
 # Stage 1 Online Training Configuration for VGGT
 # 第一阶段在线训练配置 - 包含统一的损失权重管理
 
-# debug: true
+debug: true
 
 # =============== 模型配置 ===============
-model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=0, use_gs_head=True, use_gs_head_velocity=False, use_gt_camera=True, velocity_head_small_init=True)"
+model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=0, use_gs_head=True, use_gs_head_velocity=False, use_gs_head_segment=False, use_gt_camera=True, velocity_head_small_init=True)"
 # sh_degree: 球谐函数的阶数（0=只有DC分量3个参数，1=DC+方向性12个参数，2=27个参数，3=48个参数）
 # use_gs_head: 是否对gaussian_head使用DPTGSHead (True=DPTGSHead, False=DPTHead)
 #   - True: gaussian_head使用DPTGSHead (默认)
@@ -12,6 +12,9 @@ model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=0, use_gs_he
 # use_gs_head_velocity: 是否对velocity_head使用DPTGSHead (True=DPTGSHead, False=DPTHead)
 #   - True: velocity_head使用DPTGSHead
 #   - False: velocity_head使用普通DPTHead (默认)
+# use_gs_head_segment: 是否对segment_head使用DPTGSHead (True=DPTGSHead, False=DPTHead)
+#   - True: segment_head使用DPTGSHead
+#   - False: segment_head使用普通DPTHead (默认)
 # Gaussian head的output_dim会根据sh_degree自动计算：11 + 3*(sh_degree+1)^2
 # use_gt_camera: 是否在模型forward中使用GT相机参数来计算world_points
 #   - True: 使用GT的extrinsics和intrinsics
@@ -27,7 +30,7 @@ pretrained_velocity: False
 # VGGT冻结策略配置
 # 可选值: "none", "noap",
 # null表示不设置冻结策略（保持模型默认行为）
-vggt_freeze_strategy: "noap"
+vggt_freeze_strategy: "none"
 
 
 # =============== 辅助模型配置 ===============
@@ -88,13 +91,17 @@ sam2_velocity_weight: 0.0                  # SAM2掩码一致性监督
 use_preprocessed_sam: false                 # false=在线推理SAM2, true=使用预处理掩码
 
 # 5. Sky Opacity Loss (监督gaussian head的opacity参数)
-sky_opacity_weight: 1.0                    # 天空区域opacity约束
+sky_opacity_weight: 0.0                    # 天空区域opacity约束
 
 # 6. Sky Color Loss (监督sky token以及sky head学习)
 sky_color_weight: 0.0                      # 天空颜色预测监督 (已融合到self_render_loss中)
 
 # 7. Velocity Regularization Loss (约束velocity值)
 velocity_reg_weight: 0.0                 # 速度正则化约束
+
+# 7b. Segmentation Loss (监督segment head训练)
+segment_loss_weight: 1.0                  # 语义分割损失权重 (从flowmap第4维度提取GT labels)
+                                          # 4类: bg(0), vehicle(1), sign(2), pedestrian+cyclist(3)
 
 # 8. VGGT Distillation Loss (蒸馏损失，监督depth head、camera head等)
 vggt_distill_weight: 0.0                  # VGGT teacher蒸馏监督，防止unfreeze backbone时输出漂移
@@ -120,7 +127,7 @@ aggregator_frame_sample_ratio: 1.0         # Aggregator渲染时的帧采样比�
 
 # 13. Aggregator_all Render Loss (代替Stage2 refine网络的渲染loss)
 # 这个loss直接在Stage1中使用动态物体处理+渲染监督,跳过Stage2的refine网络
-aggregator_all_start_iter: 10000           # Aggregator_all loss开始计算的iteration (默认50k)
+aggregator_all_start_iter: 1000000           # Aggregator_all loss开始计算的iteration (默认50k)
 aggregator_all_render_rgb_weight: 1.0      # Aggregator_all RGB渲染损失权重
 aggregator_all_render_depth_weight: 1.0    # Aggregator_all depth渲染损失权重
 aggregator_all_render_lpips_weight: 0.1    # Aggregator_all LPIPS渲染损失权重

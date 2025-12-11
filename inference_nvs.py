@@ -56,7 +56,7 @@ def parse_args():
     parser.add_argument("--continue_on_error", action="store_true", help="Continue on error in batch mode")
 
     # Novel View Synthesis参数
-    parser.add_argument("--translation_offset", type=float, default=1.0,
+    parser.add_argument("--translation_offset", type=float, default=3.0,
                        help="Translation offset in meters for NVS")
 
     # Dynamic processor参数

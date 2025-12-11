@@ -43,7 +43,7 @@ def freeze_all_params(modules):
 
 
 class VGGT(nn.Module, PyTorchModelHubMixin):
-    def __init__(self, img_size=518, patch_size=14, embed_dim=1024, use_sky_token=True, use_scale_token=True, memory_efficient=True, sh_degree=0, use_gs_head=True, use_gs_head_velocity=False, use_gt_camera=False, velocity_head_small_init=False):
+    def __init__(self, img_size=518, patch_size=14, embed_dim=1024, use_sky_token=True, use_scale_token=True, memory_efficient=True, sh_degree=0, use_gs_head=True, use_gs_head_velocity=False, use_gs_head_segment=False, use_gt_camera=False, velocity_head_small_init=False):
         super().__init__()
         # Store sh_degree for use in forward and other methods
         self.sh_degree = sh_degree
@@ -51,6 +51,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         self.use_gs_head = use_gs_head
         # Store use_gs_head_velocity for determining velocity head type
         self.use_gs_head_velocity = use_gs_head_velocity
+        # Store use_gs_head_segment for determining segmentation head type
+        self.use_gs_head_segment = use_gs_head_segment
         # Store use_gt_camera for determining which camera parameters to use
         self.use_gt_camera = use_gt_camera
 
@@ -84,6 +86,11 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         # Apply small initialization to velocity_head if requested
         if velocity_head_small_init:
             self._apply_small_init_to_velocity_head()
+
+        # Choose head type based on use_gs_head_segment flag for segmentation head
+        # Output: 4 classes (bg, vehicle, sign, pedestrian+cyclist) + 1 confidence channel = 5
+        SegmentHeadClass = DPTGSHead if use_gs_head_segment else DPTHead
+        self.segment_head = SegmentHeadClass(dim_in=2 * embed_dim, output_dim=5, activation="linear", conf_activation="expp1")
 
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size)
 
@@ -374,6 +381,15 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                     velocity_global = velocity_global.reshape(B_v, S_v, H_v, W_v, 3)
 
                     predictions["velocity_global"] = velocity_global  # World frame velocity (for downstream use)
+
+            if self.segment_head is not None:
+                segment_logits, segment_conf = self.segment_head(
+                    aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
+                )
+                # segment_logits shape: [B, S, H, W, 4] - raw logits for 4 classes
+                # segment_conf shape: [B, S, H, W] - confidence scores
+                predictions["segment_logits"] = segment_logits  # Raw logits for cross-entropy loss
+                predictions["segment_conf"] = segment_conf
 
         if self.track_head is not None and query_points is not None:
             track_list, vis, conf = self.track_head(

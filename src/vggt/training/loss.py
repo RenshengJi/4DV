@@ -1663,6 +1663,62 @@ def scale_loss(predicted_scale, gt_scale):
         }
 
 
+def segment_loss(segment_logits, segment_conf, vggt_batch, gamma=1.0, disable_conf=False, class_weights=None):
+    """
+    Compute cross-entropy loss for semantic segmentation.
+
+    Args:
+        segment_logits: [B, S, H, W, 4] - Predicted logits for 4 classes (bg, vehicle, sign, pedestrian+cyclist)
+        segment_conf: [B, S, H, W] - Confidence scores for segmentation predictions (unused, kept for API compatibility)
+        vggt_batch: Batch dict containing 'segment_label' [B, S, H, W] and 'segment_mask' [B, S, H, W]
+        gamma: float - Unused, kept for API compatibility
+        disable_conf: bool - Unused, kept for API compatibility
+        class_weights: Optional[Tensor] - Class weights for imbalanced classes, shape [4]
+
+    Returns:
+        dict: Loss dictionary containing segmentation loss
+    """
+    with tf32_off():
+        # Extract GT labels and masks from batch
+        if 'segment_label' not in vggt_batch or 'segment_mask' not in vggt_batch:
+            # No segmentation GT available, return zero loss
+            return {
+                "segment_loss": torch.tensor(0.0, device=segment_logits.device),
+            }
+
+        gt_labels = vggt_batch['segment_label']  # [B, S, H, W] with class indices (0-3)
+        gt_mask = vggt_batch['segment_mask']  # [B, S, H, W] binary mask (1=valid, 0=invalid)
+
+        B, S, H, W, num_classes = segment_logits.shape
+        assert num_classes == 4, f"Expected 4 classes, got {num_classes}"
+
+        # Reshape for loss computation
+        segment_logits_flat = segment_logits.reshape(B * S * H * W, num_classes)  # [B*S*H*W, 4]
+        gt_labels_flat = gt_labels.reshape(B * S * H * W).long()  # [B*S*H*W]
+        gt_mask_flat = gt_mask.reshape(B * S * H * W)  # [B*S*H*W]
+
+        # Apply mask to filter out invalid pixels
+        valid_indices = gt_mask_flat > 0.5
+        if valid_indices.sum() == 0:
+            # No valid pixels, return zero loss
+            return {
+                "segment_loss": torch.tensor(0.0, device=segment_logits.device),
+            }
+
+        segment_logits_valid = segment_logits_flat[valid_indices]  # [N_valid, 4]
+        gt_labels_valid = gt_labels_flat[valid_indices]  # [N_valid]
+
+        # Compute cross-entropy loss
+        if class_weights is not None:
+            class_weights = class_weights.to(segment_logits.device)
+        ce_loss = F.cross_entropy(segment_logits_valid, gt_labels_valid, weight=class_weights, reduction='mean')
+        ce_loss = check_and_fix_inf_nan(ce_loss, "segment_ce_loss")
+
+        return {
+            "segment_loss": ce_loss,
+        }
+
+
 def voxel_quantize_random_sampling(xyz, attributes_dict, sky_mask=None, voxel_size=0.05, gt_scale=1.0):
     """
     体素量化with随机采样 - 每个体素随机选择一个pixel

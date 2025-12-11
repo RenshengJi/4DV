@@ -201,6 +201,30 @@ class Waymo_Multi(BaseMultiViewDataset):
                     image, depthmap, intrinsics, resolution, rng, info=(scene_dir, impath)
                 )
 
+            # Extract segmentation labels from flowmap's 4th dimension (AFTER crop/resize)
+            # flowmap shape: [H, W, 4] where channel 3 contains segmentation labels
+            # Label mapping (from Waymo scene flow):
+            #  0: no-flow-label (no flow information) -> use as mask (invalid)
+            #  1: unlabeled/background -> class 0 (bg)
+            #  2: vehicle -> class 1 (vehicle)
+            #  3: pedestrian -> class 3 (pedestrian+cyclist)
+            #  4: sign -> class 2 (sign)
+            #  5: cyclist -> class 3 (pedestrian+cyclist)
+            segment_label = None
+            segment_mask = None
+            if flowmap is not None and flowmap.shape[-1] >= 4:
+                raw_labels = flowmap[..., 3]  # [H, W]
+
+                # Create validity mask: 0 means no segmentation annotation
+                segment_mask = (raw_labels != 0).astype(np.float32)  # [H, W]
+
+                # Map raw labels to 4 classes: [bg, vehicle, sign, pedestrian+cyclist]
+                segment_label = np.zeros_like(raw_labels, dtype=np.int64)  # [H, W]
+                segment_label[raw_labels == 1] = 0  # background/unlabeled
+                segment_label[raw_labels == 2] = 1  # vehicle
+                segment_label[raw_labels == 4] = 2  # sign
+                segment_label[(raw_labels == 3) | (raw_labels == 5)] = 3  # pedestrian + cyclist
+
             # Apply semantic segmentation to zero out velocity on road and sidewalk
             if self.zero_ground_velocity and seg_mask is not None and flowmap is not None:
                 # Cityscapes color palette: road=[128,64,128], sidewalk=[244,35,232]
@@ -219,6 +243,12 @@ class Waymo_Multi(BaseMultiViewDataset):
                     static_ground_mask_expanded = np.expand_dims(static_ground_mask, axis=-1)
                     static_ground_mask_velocity = np.tile(static_ground_mask_expanded, (1, 1, 3))
                     flowmap[..., :3][static_ground_mask_velocity] = 0.0
+
+                    # Set segmentation labels to background (0) for static ground regions with non-zero labels
+                    if segment_label is not None:
+                        # Only modify pixels that are: 1) in static_ground_mask AND 2) have non-zero labels
+                        modify_mask = static_ground_mask & (segment_label != 0)
+                        segment_label[modify_mask] = 0  # Set to class 0 (background)
 
             # generate img mask and raymap mask
             img_mask, ray_mask = self.get_img_and_ray_masks(
@@ -249,6 +279,12 @@ class Waymo_Multi(BaseMultiViewDataset):
                 reset=False,
                 flowmap=flowmap,
             )
+
+            # Add segmentation labels if available
+            if segment_label is not None:
+                view_dict["segment_label"] = segment_label  # [H, W] with class indices (0-3)
+            if segment_mask is not None:
+                view_dict["segment_mask"] = segment_mask  # [H, W] binary mask (1=valid, 0=invalid)
 
             # 如果加载了SAM掩码，添加到view_dict中
             if sam_masks is not None:

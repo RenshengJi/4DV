@@ -26,7 +26,7 @@ import sys
 # 添加vggt路径
 sys.path.append(os.path.join(os.path.dirname(__file__), 'vggt'))
 from vggt.vggt.models.vggt import VGGT
-from vggt.training.loss import camera_loss, depth_loss, point_loss, cross_render_and_loss, flow_loss, gt_flow_loss, gt_flow_loss_ours, self_render_and_loss, velocity_loss, sky_opacity_loss, sky_color_loss, vggt_distillation_loss, scale_loss, aggregator_render_loss
+from vggt.training.loss import camera_loss, depth_loss, point_loss, cross_render_and_loss, flow_loss, gt_flow_loss, gt_flow_loss_ours, self_render_and_loss, velocity_loss, sky_opacity_loss, sky_color_loss, vggt_distillation_loss, scale_loss, aggregator_render_loss, segment_loss
 from vggt.utils.auxiliary import RAFTCfg, calc_flow
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri, extri_intri_to_pose_encoding
 
@@ -498,6 +498,7 @@ def train(args):
                     'grad_depth_loss_weight': getattr(args, 'grad_depth_loss_weight', 1.0),
                     'reg_depth_loss_weight': getattr(args, 'reg_depth_loss_weight', 1.0),
                     'scale_loss_weight': getattr(args, 'scale_loss_weight', 1.0),
+                    'segment_loss_weight': getattr(args, 'segment_loss_weight', 1.0),  # Segmentation loss
                     'aggregator_render_rgb_weight': getattr(args, 'aggregator_render_rgb_weight', 1.0),
                     'aggregator_render_depth_weight': getattr(args, 'aggregator_render_depth_weight', 1.0),
                     'aggregator_render_lpips_weight': getattr(args, 'aggregator_render_lpips_weight', 0.0),
@@ -687,6 +688,20 @@ def train(args):
                         loss_dict.update({"loss_velocity": velocity_loss_value})
                     except Exception as e:
                         print(f"Error in velocity regularization loss computation: {e}")
+
+                # 6b. Segmentation Loss (监督segment head训练)
+                if loss_weights['segment_loss_weight'] > 0 and preds.get("segment_logits") is not None and preds.get("segment_conf") is not None:
+                    try:
+                        segment_loss_dict = segment_loss(
+                            preds["segment_logits"],
+                            preds["segment_conf"],
+                            vggt_batch
+                        )
+                        segment_loss_value = segment_loss_dict.get("segment_loss", 0.0)
+                        loss += loss_weights['segment_loss_weight'] * segment_loss_value
+                        loss_dict.update(segment_loss_dict)
+                    except Exception as e:
+                        print(f"Error in segmentation loss computation: {e}")
 
                 # 7. VGGT Distillation Loss (蒸馏损失，监督depth head、camera head等)
                 if loss_weights['vggt_distill_weight'] > 0 and teacher_preds is not None and student_preds_original is not None:
@@ -1077,6 +1092,8 @@ def cut3r_batch_to_vggt(views):
         'point_masks': torch.stack([v['valid_mask'] for v in views], dim=0) if 'valid_mask' in views[0] else None,
         'world_points': torch.stack([v['pts3d'] for v in views], dim=0) if 'pts3d' in views[0] else None,
         'flowmap': torch.stack([torch.from_numpy(v['flowmap']).float() if isinstance(v['flowmap'], np.ndarray) else v['flowmap'].float() for v in views], dim=0) if 'flowmap' in views[0] and views[0]['flowmap'] is not None else None,
+        'segment_label': torch.stack([torch.from_numpy(v['segment_label']).long() if isinstance(v['segment_label'], np.ndarray) else v['segment_label'].long() for v in views], dim=0) if 'segment_label' in views[0] and views[0]['segment_label'] is not None else None,
+        'segment_mask': torch.stack([torch.from_numpy(v['segment_mask']).float() if isinstance(v['segment_mask'], np.ndarray) else v['segment_mask'].float() for v in views], dim=0) if 'segment_mask' in views[0] and views[0]['segment_mask'] is not None else None,
     }
 
     with tf32_off(), torch.amp.autocast("cuda", enabled=False):
@@ -1123,6 +1140,10 @@ def cut3r_batch_to_vggt(views):
     vggt_batch['extrinsics'] = vggt_batch['extrinsics'].permute(1, 0, 2, 3).contiguous() if vggt_batch['extrinsics'] is not None else None
     vggt_batch['point_masks'] = vggt_batch['point_masks'].permute(1, 0, 2, 3).contiguous() if vggt_batch['point_masks'] is not None else None
     vggt_batch['world_points'] = vggt_batch['world_points'].permute(1, 0, 2, 3, 4).contiguous() if vggt_batch['world_points'] is not None else None
+
+    # # Segmentation labels处理: [S, B, H, W] -> [B, S, H, W]
+    # vggt_batch['segment_label'] = vggt_batch['segment_label'].permute(1, 0, 2, 3).contiguous() if vggt_batch['segment_label'] is not None else None
+    # vggt_batch['segment_mask'] = vggt_batch['segment_mask'].permute(1, 0, 2, 3).contiguous() if vggt_batch['segment_mask'] is not None else None
 
     # flowmap处理：根据维度判断是否需要permute
     if vggt_batch['flowmap'] is not None:
