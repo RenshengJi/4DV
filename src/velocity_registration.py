@@ -79,8 +79,6 @@ class VelocityBasedRegistration:
                 R, t = self._trimmed_procrustes(points_3d_src, points_3d_dst, weights,
                                                 trim_ratio=trim_ratio,
                                                 max_iterations=trim_iterations)
-            elif weights is not None:
-                R, t = self._weighted_procrustes(points_3d_src, points_3d_dst, weights)
             else:
                 R, t = self._procrustes_algorithm(points_3d_src, points_3d_dst)
             inlier_ratio = self._compute_inlier_ratio(points_3d_src, points_3d_dst, R, t)
@@ -131,10 +129,7 @@ class VelocityBasedRegistration:
         # 迭代Trim过程
         for iteration in range(max_iterations):
             # Step 1: 估计当前的R, t
-            if current_weights is not None:
-                R, t = self._weighted_procrustes(current_src, current_dst, current_weights)
-            else:
-                R, t = self._procrustes_algorithm(current_src, current_dst)
+            R, t = self._procrustes_algorithm(current_src, current_dst)
 
             # 如果是最后一次迭代，直接返回结果
             if iteration == max_iterations - 1:
@@ -166,65 +161,6 @@ class VelocityBasedRegistration:
 
         return R, t
 
-    def _weighted_procrustes(self, pts_src: torch.Tensor, pts_dst: torch.Tensor, weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        带权重的Procrustes/Kabsch算法：计算3D点云之间的最优刚体变换
-
-        Args:
-            pts_src: 源点云 [N, 3]
-            pts_dst: 目标点云 [N, 3]
-            weights: 权重 [N], 要求非负
-
-        Returns:
-            R: 旋转矩阵 [3, 3]
-            t: 平移向量 [3]
-        """
-        with tf32_off():
-
-            # 归一化权重
-            weights = weights / (weights.sum() + 1e-8)
-
-            # 计算加权质心
-            centroid_src = (pts_src * weights[:, None]).sum(dim=0)
-            centroid_dst = (pts_dst * weights[:, None]).sum(dim=0)
-
-            # 去中心化
-            src_centered = pts_src - centroid_src
-            dst_centered = pts_dst - centroid_dst
-
-            # 检查点是否共线
-            if torch.allclose(src_centered, torch.zeros_like(src_centered)) or \
-               torch.allclose(dst_centered, torch.zeros_like(dst_centered)):
-                return torch.eye(3, device=self.device, dtype=torch.float32), centroid_dst - centroid_src
-
-            # 带权协方差矩阵
-            H = src_centered.mul(weights[:, None]).T @ dst_centered
-
-            if torch.allclose(H, torch.zeros_like(H)):
-                return torch.eye(3, device=self.device, dtype=torch.float32), centroid_dst - centroid_src
-
-            # SVD分解
-            try:
-                U, S, Vt = torch.linalg.svd(H)
-            except RuntimeError as e:
-                raise RuntimeError(f"SVD分解失败: {str(e)}")
-
-            # 计算旋转矩阵
-            R = Vt.T @ U.T
-
-            # 处理反射情况
-            if torch.linalg.det(R) < 0:
-                Vt_corrected = Vt.clone()
-                Vt_corrected[-1, :] *= -1
-                R = Vt_corrected.T @ U.T
-
-            if not self._is_valid_rotation_matrix(R):
-                raise ValueError("计算得到的旋转矩阵无效")
-
-            # 计算平移向量
-            t = centroid_dst - R @ centroid_src
-
-        return R, t
 
     def _procrustes_algorithm(self, points_src: torch.Tensor, points_dst: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -486,36 +422,6 @@ class VelocityBasedRegistration:
         if object_velocities.device != torch.device(self.device):
             object_velocities = object_velocities.to(self.device)
 
-        # 提取并叠加depth_conf和velocity_conf作为权重（不过滤）
-        object_weights = None
-
-        # 提取depth_conf权重
-        depth_weights = None
-        if depth_conf_src is not None and isinstance(depth_conf_src, torch.Tensor):
-            depth_conf_flat = depth_conf_src.reshape(H * W) if len(depth_conf_src.shape) == 2 else depth_conf_src
-            if depth_conf_flat is not None and len(depth_conf_flat.shape) == 1:
-                depth_weights = depth_conf_flat[object_indices].detach()
-                depth_weights = torch.clamp(depth_weights, min=0.0)
-
-        # 提取velocity_conf权重
-        velocity_weights = None
-        if velocity_conf_src is not None and isinstance(velocity_conf_src, torch.Tensor):
-            velocity_conf_flat = velocity_conf_src.reshape(H * W) if len(velocity_conf_src.shape) == 2 else velocity_conf_src
-            if velocity_conf_flat is not None and len(velocity_conf_flat.shape) == 1:
-                velocity_weights = velocity_conf_flat[object_indices].detach()
-                velocity_weights = torch.clamp(velocity_weights, min=0.0)
-
-        # 叠加权重
-        if depth_weights is not None and velocity_weights is not None:
-            # 两个权重都存在，相乘或相加（这里使用相乘）
-            object_weights = depth_weights * velocity_weights
-        elif depth_weights is not None:
-            # 只有depth权重
-            object_weights = depth_weights
-        elif velocity_weights is not None:
-            # 只有velocity权重
-            object_weights = velocity_weights
-
         # Simple模式
         if self.velocity_transform_mode == "simple":
             mean_velocity = object_velocities.mean(dim=0)
@@ -550,15 +456,13 @@ class VelocityBasedRegistration:
                     return transformation
                 object_velocities = object_velocities[:min_len]
                 points_src_object = points_src_object[:min_len]
-                if object_weights is not None:
-                    object_weights = object_weights[:min_len]
 
             points_dst_object = points_src_object + object_velocities * direction
 
             try:
-                # 使用带权重的Procrustes（如果有depth_conf）
+                # 使用Procrustes算法估计变换
                 R, t, inlier_ratio = self.estimate_transformation_direct(
-                    points_src_object.detach(), points_dst_object.detach(), weights=object_weights
+                    points_src_object.detach(), points_dst_object.detach(), weights=None
                 )
                 transformation = torch.eye(4, device=self.device, dtype=torch.float32)
                 transformation[:3, :3] = R
