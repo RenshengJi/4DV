@@ -498,7 +498,7 @@ def train(args):
                     'grad_depth_loss_weight': getattr(args, 'grad_depth_loss_weight', 1.0),
                     'reg_depth_loss_weight': getattr(args, 'reg_depth_loss_weight', 1.0),
                     'scale_loss_weight': getattr(args, 'scale_loss_weight', 1.0),
-                    'segment_loss_weight': getattr(args, 'segment_loss_weight', 1.0),  # Segmentation loss
+                    'segment_loss_weight': getattr(args, 'segment_loss_weight', 0.0),  # Segmentation loss
                     'aggregator_render_rgb_weight': getattr(args, 'aggregator_render_rgb_weight', 1.0),
                     'aggregator_render_depth_weight': getattr(args, 'aggregator_render_depth_weight', 1.0),
                     'aggregator_render_lpips_weight': getattr(args, 'aggregator_render_lpips_weight', 0.0),
