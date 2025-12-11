@@ -49,7 +49,10 @@ class VelocityBasedRegistration:
     def estimate_transformation_direct(self,
                                        points_3d_src: torch.Tensor,
                                        points_3d_dst: torch.Tensor,
-                                       weights: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, float]:
+                                       weights: Optional[torch.Tensor] = None,
+                                       use_trimmed: bool = True,
+                                       trim_ratio: float = 0.8,
+                                       trim_iterations: int = 2) -> Tuple[torch.Tensor, torch.Tensor, float]:
         """
         使用Procrustes算法计算3D-3D点对应的刚体变换
 
@@ -57,6 +60,9 @@ class VelocityBasedRegistration:
             points_3d_src: 源帧3D点 [N, 3]
             points_3d_dst: 目标帧3D点 [N, 3]
             weights: 可选的权重 [N], 用于加权Procrustes
+            use_trimmed: 是否使用trimmed方法（去除离群点）
+            trim_ratio: 保留的点的比例（例如0.8表示保留残差最小的80%的点）
+            trim_iterations: trim迭代次数
 
         Returns:
             R: 旋转矩阵 [3, 3]
@@ -67,24 +73,13 @@ class VelocityBasedRegistration:
             return torch.eye(3, device=self.device, dtype=torch.float32), \
                    torch.zeros(3, device=self.device, dtype=torch.float32), 0.0
 
-        if len(points_3d_src) != len(points_3d_dst):
-            print(f"警告: 3D点对应数量不匹配 - src: {len(points_3d_src)}, dst: {len(points_3d_dst)}")
-            return torch.eye(3, device=self.device, dtype=torch.float32), \
-                   torch.zeros(3, device=self.device, dtype=torch.float32), 0.0
-
-        if torch.any(torch.isnan(points_3d_src)) or torch.any(torch.isnan(points_3d_dst)):
-            print("警告: 3D点包含NaN值")
-            return torch.eye(3, device=self.device, dtype=torch.float32), \
-                   torch.zeros(3, device=self.device, dtype=torch.float32), 0.0
-
-        if torch.any(torch.isinf(points_3d_src)) or torch.any(torch.isinf(points_3d_dst)):
-            print("警告: 3D点包含无限值")
-            return torch.eye(3, device=self.device, dtype=torch.float32), \
-                   torch.zeros(3, device=self.device, dtype=torch.float32), 0.0
-
         try:
-            # 使用带权重的Procrustes或普通Procrustes
-            if weights is not None:
+            # 使用trimmed Procrustes（鲁棒版本）或普通Procrustes
+            if use_trimmed:
+                R, t = self._trimmed_procrustes(points_3d_src, points_3d_dst, weights,
+                                                trim_ratio=trim_ratio,
+                                                max_iterations=trim_iterations)
+            elif weights is not None:
                 R, t = self._weighted_procrustes(points_3d_src, points_3d_dst, weights)
             else:
                 R, t = self._procrustes_algorithm(points_3d_src, points_3d_dst)
@@ -94,6 +89,82 @@ class VelocityBasedRegistration:
             print(f"变换估计失败: {str(e)}")
             return torch.eye(3, device=self.device, dtype=torch.float32), \
                    torch.zeros(3, device=self.device, dtype=torch.float32), 0.0
+
+    def _trimmed_procrustes(self,
+                            pts_src: torch.Tensor,
+                            pts_dst: torch.Tensor,
+                            weights: Optional[torch.Tensor] = None,
+                            trim_ratio: float = 0.8,
+                            max_iterations: int = 2) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        带Trim操作的鲁棒Procrustes算法：迭代式去除离群点
+
+        流程：
+        1. 先估计一个初始的R, t（使用普通或加权Kabsch）
+        2. 计算所有点的残差
+        3. 只保留残差最小的前k%（例如80%）的点
+        4. 在这些点上重新做Kabsch
+        5. 可多次迭代：Trim → Kabsch → Trim → ...
+
+        Args:
+            pts_src: 源点云 [N, 3]
+            pts_dst: 目标点云 [N, 3]
+            weights: 可选的初始权重 [N]
+            trim_ratio: 保留的点的比例，范围(0, 1]，例如0.8表示保留80%
+            max_iterations: 最大迭代次数
+
+        Returns:
+            R: 旋转矩阵 [3, 3]
+            t: 平移向量 [3]
+        """
+        if len(pts_src) < 3:
+            raise ValueError(f"点数不足，至少需要3个点，实际有{len(pts_src)}个")
+
+        # 确保trim_ratio在合理范围内
+        trim_ratio = max(0.1, min(1.0, trim_ratio))
+
+        # 当前使用的点集（初始时全部使用）
+        current_src = pts_src
+        current_dst = pts_dst
+        current_weights = weights
+
+        # 迭代Trim过程
+        for iteration in range(max_iterations):
+            # Step 1: 估计当前的R, t
+            if current_weights is not None:
+                R, t = self._weighted_procrustes(current_src, current_dst, current_weights)
+            else:
+                R, t = self._procrustes_algorithm(current_src, current_dst)
+
+            # 如果是最后一次迭代，直接返回结果
+            if iteration == max_iterations - 1:
+                break
+
+            # Step 2: 计算所有原始点的残差
+            # 将源点通过当前的R, t变换
+            pts_src_transformed = torch.matmul(pts_src, R.T) + t
+
+            # 计算残差（欧氏距离）
+            residuals = torch.norm(pts_src_transformed - pts_dst, dim=1)
+
+            # Step 3: 只保留残差最小的前k%的点
+            num_points = len(pts_src)
+            num_keep = max(3, int(num_points * trim_ratio))  # 至少保留3个点
+
+            # 获取残差最小的点的索引
+            _, inlier_indices = torch.topk(residuals, k=num_keep, largest=False, sorted=False)
+
+            # Step 4: 更新当前点集
+            current_src = pts_src[inlier_indices]
+            current_dst = pts_dst[inlier_indices]
+
+            # 如果有权重，也需要更新
+            if weights is not None:
+                current_weights = weights[inlier_indices]
+            else:
+                current_weights = None
+
+        return R, t
 
     def _weighted_procrustes(self, pts_src: torch.Tensor, pts_dst: torch.Tensor, weights: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -109,14 +180,6 @@ class VelocityBasedRegistration:
             t: 平移向量 [3]
         """
         with tf32_off():
-            if len(pts_src) != len(pts_dst):
-                raise ValueError(f"点云大小不匹配: {len(pts_src)} vs {len(pts_dst)}")
-
-            if len(pts_src) != len(weights):
-                raise ValueError(f"权重数量不匹配: {len(weights)} vs {len(pts_src)}")
-
-            if len(pts_src) < 3:
-                raise ValueError(f"点数不足，至少需要3个点，实际有{len(pts_src)}个")
 
             # 归一化权重
             weights = weights / (weights.sum() + 1e-8)
