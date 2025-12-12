@@ -849,20 +849,23 @@ def train(args):
                         )
 
                         # 检查是否有有效的动态物体（注意：即使没有动态物体，也要计算静态物体的loss）
-                        num_objects = len(dynamic_objects_data['dynamic_objects']) if dynamic_objects_data else 0
-                        has_valid_dynamic = num_objects > 0
+                        num_cars = len(dynamic_objects_data.get('dynamic_objects_cars', [])) if dynamic_objects_data else 0
+                        num_people = len(dynamic_objects_data.get('dynamic_objects_people', [])) if dynamic_objects_data else 0
+                        has_valid_dynamic = (num_cars + num_people) > 0
 
                         # 无论是否有动态物体，都需要计算loss（因为有静态物体）
                         if dynamic_objects_data is not None:
                             # Step 2: 跳过Stage2 refine网络,直接构建场景
                             # 不调用 stage2_model()，直接使用原始的canonical gaussians
-                            dynamic_objects = dynamic_objects_data['dynamic_objects'] if has_valid_dynamic else []
+                            dynamic_objects_cars = dynamic_objects_data.get('dynamic_objects_cars', []) if has_valid_dynamic else []
+                            dynamic_objects_people = dynamic_objects_data.get('dynamic_objects_people', []) if has_valid_dynamic else []
                             static_gaussians = dynamic_objects_data.get('static_gaussians')
 
                             # 构建"refined"场景 (实际上是未refine的原始数据)
                             aggregator_all_scene = {
                                 'static_gaussians': static_gaussians,
-                                'dynamic_objects': dynamic_objects  # 可能为空列表，但静态物体仍然存在
+                                'dynamic_objects_cars': dynamic_objects_cars,  # 车辆（使用刚体假设聚合）
+                                'dynamic_objects_people': dynamic_objects_people  # 行人（每帧单独）
                             }
 
                             # Step 3: 计算渲染loss (使用Stage2的loss函数)
@@ -882,7 +885,10 @@ def train(args):
 
                             # 使用Stage2的criterion计算loss
                             aggregator_all_loss_dict = stage2_criterion(
-                                refinement_results={'refined_dynamic_objects': dynamic_objects},  # 无refine结果
+                                refinement_results={
+                                    'refined_dynamic_objects_cars': dynamic_objects_cars,
+                                    'refined_dynamic_objects_people': dynamic_objects_people
+                                },  # 无refine结果
                                 refined_scene=aggregator_all_scene,
                                 gt_images=gt_images,
                                 gt_depths=gt_depths,
@@ -916,7 +922,9 @@ def train(args):
                                 'aggregator_all_rgb_loss': float(aggregator_all_rgb_loss) if isinstance(aggregator_all_rgb_loss, torch.Tensor) else aggregator_all_rgb_loss,
                                 'aggregator_all_depth_loss': float(aggregator_all_depth_loss) if isinstance(aggregator_all_depth_loss, torch.Tensor) else aggregator_all_depth_loss,
                                 'aggregator_all_lpips_loss': float(aggregator_all_lpips_loss) if isinstance(aggregator_all_lpips_loss, torch.Tensor) else aggregator_all_lpips_loss,
-                                'aggregator_all_num_objects': num_objects
+                                'aggregator_all_num_objects': num_cars + num_people,
+                                'aggregator_all_num_cars': num_cars,
+                                'aggregator_all_num_people': num_people
                             }
 
                             # 添加可视化指标 (如果存在)

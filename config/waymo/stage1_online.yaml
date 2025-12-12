@@ -1,7 +1,7 @@
 # Stage 1 Online Training Configuration for VGGT
 # 第一阶段在线训练配置 - 包含统一的损失权重管理
 
-# debug: true
+debug: true
 
 # =============== 模型配置 ===============
 model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=0, use_gs_head=True, use_gs_head_velocity=True, use_gs_head_segment=False, use_gt_camera=True, velocity_head_small_init=False)"
@@ -25,7 +25,7 @@ model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=0, use_gs_he
 
 # pretrained: model.pt
 # pretrained_velocity: False
-pretrained_velocity: "checkpoints/waymo_new/segmetation+degree0+lr5e-5forreusme_resumefrombefore/checkpoint-epoch_0_13020.pth"
+pretrained_velocity: "checkpoints/new/start/checkpoint-epoch_0_19533.pth"
 
 # VGGT冻结策略配置
 # 可选值: "none", "noap",
@@ -127,7 +127,7 @@ aggregator_frame_sample_ratio: 1.0         # Aggregator渲染时的帧采样比�
 
 # 13. Aggregator_all Render Loss (代替Stage2 refine网络的渲染loss)
 # 这个loss直接在Stage1中使用动态物体处理+渲染监督,跳过Stage2的refine网络
-aggregator_all_start_iter: 1000000           # Aggregator_all loss开始计算的iteration (默认50k)
+aggregator_all_start_iter: 0           # Aggregator_all loss开始计算的iteration (默认50k)
 aggregator_all_render_rgb_weight: 1.0      # Aggregator_all RGB渲染损失权重
 aggregator_all_render_depth_weight: 1.0    # Aggregator_all depth渲染损失权重
 aggregator_all_render_lpips_weight: 0.1    # Aggregator_all LPIPS渲染损失权重

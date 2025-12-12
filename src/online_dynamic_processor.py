@@ -194,6 +194,108 @@ def dynamic_object_clustering(xyz, velocity, velocity_threshold=0.01, eps=0.02, 
     return clustering_results
 
 
+def classify_dynamic_objects(
+    matched_clustering_results: List[Dict],
+    segment_logits: torch.Tensor,
+    H: int,
+    W: int
+) -> Dict[int, str]:
+    """
+    对跨帧追踪后的每个动态物体进行分类（车辆 vs 行人）
+
+    利用预测的语义分割信息，对每个物体所有帧中的所有像素的分割logits求和，
+    然后统一softmax，实现分类。
+
+    Waymo segmentation classes:
+    - 0: background
+    - 1: vehicle (car)
+    - 2: sign
+    - 3: pedestrian + cyclist (people)
+
+    Args:
+        matched_clustering_results: 跨帧追踪后的聚类结果
+        segment_logits: [B, S, H, W, 4] 语义分割预测logits
+        H, W: 图像高宽
+
+    Returns:
+        object_classes: {global_id: 'car' or 'people'} 每个物体的类别
+    """
+    device = segment_logits.device
+    object_classes = {}
+
+    # 收集所有全局物体ID
+    all_global_ids = set()
+    for result in matched_clustering_results:
+        all_global_ids.update(result.get('global_ids', []))
+
+    # 对每个全局物体进行分类
+    for global_id in all_global_ids:
+        # 收集该物体在所有帧中的像素索引
+        all_pixel_logits = []
+
+        for frame_idx, result in enumerate(matched_clustering_results):
+            global_ids = result.get('global_ids', [])
+            if global_id not in global_ids:
+                continue
+
+            # 找到该物体在当前帧的聚类索引
+            cluster_idx = global_ids.index(global_id)
+
+            # 获取该聚类的像素索引
+            cluster_indices = result.get('cluster_indices', [])
+            if cluster_idx >= len(cluster_indices):
+                continue
+
+            pixel_indices = cluster_indices[cluster_idx]
+            if not pixel_indices:
+                continue
+
+            # 获取当前帧的分割logits: [H, W, 4]
+            frame_logits = segment_logits[0, frame_idx]  # [H, W, 4]
+
+            # 将pixel_indices转换为2D坐标
+            pixel_indices_tensor = torch.tensor(pixel_indices, dtype=torch.long, device=device)
+            v_coords = pixel_indices_tensor // W  # 行坐标
+            u_coords = pixel_indices_tensor % W   # 列坐标
+
+            # 过滤在图像范围内的坐标
+            valid = (v_coords >= 0) & (v_coords < H) & (u_coords >= 0) & (u_coords < W)
+            v_valid = v_coords[valid]
+            u_valid = u_coords[valid]
+
+            # 提取这些像素的logits
+            pixel_logits = frame_logits[v_valid, u_valid]  # [N_pixels, 4]
+            all_pixel_logits.append(pixel_logits.detach())  # detach以避免影响segmentation训练
+
+        if not all_pixel_logits:
+            # 没有像素数据，默认为car
+            object_classes[global_id] = 'car'
+            continue
+
+        # 合并所有帧的logits并求和
+        all_pixel_logits = torch.cat(all_pixel_logits, dim=0)  # [Total_pixels, 4]
+        summed_logits = all_pixel_logits.sum(dim=0)  # [4]
+
+        # Softmax得到概率分布
+        probs = torch.softmax(summed_logits, dim=0)  # [4]
+
+        # 分类决策：
+        # - 如果vehicle (class 1) 概率最高 -> 'car'
+        # - 如果pedestrian+cyclist (class 3) 概率最高 -> 'people'
+        # - 其他情况默认为'car'
+        pred_class = torch.argmax(probs).item()  # 转换为1-based class
+
+        if pred_class == 1:  # vehicle
+            object_classes[global_id] = 'car'
+        elif pred_class == 3:  # pedestrian + cyclist
+            object_classes[global_id] = 'people'
+        else:
+            # background或sign，默认为car
+            object_classes[global_id] = 'car'
+
+    return object_classes
+
+
 def match_objects_across_frames(clustering_results, position_threshold=0.5, velocity_threshold=0.2):
     """
     跨帧匹配动态物体（使用匈牙利算法）
@@ -590,34 +692,73 @@ class OnlineDynamicProcessor:
             )
             stage_times['tracking'] = time.time() - tracking_start
 
-            # ========== Stage 4: 动态物体聚合 ==========
+            # ========== Stage 3.5: 物体分类（车辆 vs 行人）==========
+            classification_start = time.time()
+            segment_logits = preds.get('segment_logits')  # [B, S, H, W, 4]
+
+            if segment_logits is not None:
+                object_classes = classify_dynamic_objects(
+                    matched_clustering_results, segment_logits, H, W
+                )
+            else:
+                # 如果没有分割信息，所有物体默认为car
+                all_global_ids = set()
+                for result in matched_clustering_results:
+                    all_global_ids.update(result.get('global_ids', []))
+                object_classes = {gid: 'car' for gid in all_global_ids}
+
+            stage_times['classification'] = time.time() - classification_start
+
+            # ========== Stage 4: 动态物体聚合（仅对车辆）==========
             aggregation_start = time.time()
-            dynamic_objects = self._aggregate_dynamic_objects(
-                matched_clustering_results, preds, vggt_batch
+
+            # 分离车辆和行人的ID
+            car_ids = [gid for gid, cls in object_classes.items() if cls == 'car']
+            people_ids = [gid for gid, cls in object_classes.items() if cls == 'people']
+
+            # 只对车辆进行聚合
+            dynamic_objects_cars = self._aggregate_dynamic_objects(
+                matched_clustering_results, preds, vggt_batch, object_ids_to_process=car_ids
             )
+
+            # 对行人，提取每帧单独的Gaussians（不进行聚合）
+            dynamic_objects_people = self._extract_people_objects(
+                matched_clustering_results, preds, vggt_batch, object_ids_to_process=people_ids
+            )
+
             stage_times['aggregation'] = time.time() - aggregation_start
 
             # 计算总时间和统计
             total_time = time.time() - start_time
-            self._update_stats(len(dynamic_objects), total_time)
+            total_objects = len(dynamic_objects_cars) + len(dynamic_objects_people)
+            self._update_stats(total_objects, total_time)
 
             if self.memory_efficient:
                 torch.cuda.empty_cache()
 
             return {
-                'dynamic_objects': dynamic_objects,
+                'dynamic_objects_cars': dynamic_objects_cars,
+                'dynamic_objects_people': dynamic_objects_people,
                 'static_gaussians': static_gaussians,
                 'processing_time': total_time,
-                'num_objects': len(dynamic_objects),
+                'num_objects': total_objects,
+                'num_cars': len(dynamic_objects_cars),
+                'num_people': len(dynamic_objects_people),
                 'stage_times': stage_times,
-                'matched_clustering_results': matched_clustering_results
+                'matched_clustering_results': matched_clustering_results,
+                'object_classes': object_classes
             }
 
         except Exception as e:
             _print_main(f"❌ 动态物体处理失败: {e}")
             import traceback
             traceback.print_exc()
-            return {'dynamic_objects': [], 'static_gaussians': None, 'stage_times': {}}
+            return {
+                'dynamic_objects_cars': [],
+                'dynamic_objects_people': [],
+                'static_gaussians': None,
+                'stage_times': {}
+            }
 
     def _preprocess_predictions(
         self,
@@ -656,9 +797,17 @@ class OnlineDynamicProcessor:
         self,
         matched_clustering_results: List[Dict],
         preds: Dict[str, Any],
-        vggt_batch: Dict[str, Any]
+        vggt_batch: Dict[str, Any],
+        object_ids_to_process: Optional[List[int]] = None
     ) -> List[Dict]:
-        """聚合动态物体（必须使用velocity配准）"""
+        """聚合动态物体（必须使用velocity配准）
+
+        Args:
+            matched_clustering_results: 跨帧追踪后的聚类结果
+            preds: VGGT模型预测结果
+            vggt_batch: VGGT批次数据
+            object_ids_to_process: 要处理的物体ID列表，如果为None则处理所有物体
+        """
         if not matched_clustering_results:
             return []
 
@@ -667,7 +816,7 @@ class OnlineDynamicProcessor:
             raise RuntimeError("Velocity registration is not initialized! Must use velocity-based aggregation.")
 
         dynamic_objects, _ = self._aggregate_with_existing_optical_flow_method(
-            matched_clustering_results, preds, vggt_batch
+            matched_clustering_results, preds, vggt_batch, object_ids_to_process
         )
         return dynamic_objects
 
@@ -732,9 +881,17 @@ class OnlineDynamicProcessor:
         self,
         clustering_results: List[Dict],
         preds: Dict[str, Any],
-        vggt_batch: Dict[str, Any]
+        vggt_batch: Dict[str, Any],
+        object_ids_to_process: Optional[List[int]] = None
     ) -> tuple[List[Dict], Dict[str, float]]:
-        """使用velocity_registration.py中的聚合方法，返回结果和详细时间统计"""
+        """使用velocity_registration.py中的聚合方法，返回结果和详细时间统计
+
+        Args:
+            clustering_results: 聚类结果
+            preds: 预测结果
+            vggt_batch: 批次数据
+            object_ids_to_process: 要处理的物体ID列表，如果为None则处理所有物体
+        """
         import time
         method_start = time.time()
         detailed_times = {}
@@ -745,6 +902,11 @@ class OnlineDynamicProcessor:
             all_global_ids = set()
             for result in clustering_results:
                 all_global_ids.update(result.get('global_ids', []))
+
+            # 如果指定了要处理的ID，则过滤
+            if object_ids_to_process is not None:
+                all_global_ids = all_global_ids & set(object_ids_to_process)
+
             ids_time = time.time() - ids_start
             detailed_times['1. 获取全局ID'] = ids_time
 
@@ -856,6 +1018,118 @@ class OnlineDynamicProcessor:
             import traceback
             traceback.print_exc()
             return [], detailed_times
+
+    def _extract_people_objects(
+        self,
+        matched_clustering_results: List[Dict],
+        preds: Dict[str, Any],
+        vggt_batch: Dict[str, Any],
+        object_ids_to_process: Optional[List[int]] = None
+    ) -> List[Dict]:
+        """
+        提取行人物体的每帧Gaussians（不进行聚合）
+
+        对于行人，我们不使用刚体假设，因此不进行跨帧聚合。
+        而是直接提取每帧中该物体的Gaussian参数。
+
+        Args:
+            matched_clustering_results: 跨帧追踪后的聚类结果
+            preds: VGGT模型预测结果
+            vggt_batch: VGGT批次数据
+            object_ids_to_process: 要处理的行人物体ID列表
+
+        Returns:
+            people_objects: 行人物体列表，每个包含每帧的Gaussians
+        """
+        if not matched_clustering_results:
+            return []
+
+        # 获取批次维度信息
+        batch_dims = preds['batch_dims']
+        H = batch_dims['H']
+        W = batch_dims['W']
+        S = batch_dims['S']
+
+        # 获取gaussian参数 [B, S, H, W, gaussian_output_dim]
+        gaussian_params = preds['gaussian_params'][0]  # [S, H, W, gaussian_output_dim]
+
+        # 获取所有全局物体ID
+        all_global_ids = set()
+        for result in matched_clustering_results:
+            all_global_ids.update(result.get('global_ids', []))
+
+        # 如果指定了要处理的ID，则过滤
+        if object_ids_to_process is not None:
+            all_global_ids = all_global_ids & set(object_ids_to_process)
+
+        people_objects = []
+
+        # 对每个行人物体
+        for global_id in all_global_ids:
+            # 存储每帧的Gaussians
+            frame_gaussians = {}
+            frame_pixel_indices = {}
+            object_frames = []
+
+            # 遍历所有帧
+            for frame_idx, result in enumerate(matched_clustering_results):
+                global_ids = result.get('global_ids', [])
+                if global_id not in global_ids:
+                    continue
+
+                # 找到该物体在当前帧的聚类索引
+                cluster_idx = global_ids.index(global_id)
+
+                # 获取该聚类的像素索引
+                cluster_indices = result.get('cluster_indices', [])
+                if cluster_idx >= len(cluster_indices):
+                    continue
+
+                pixel_indices = cluster_indices[cluster_idx]
+                if not pixel_indices:
+                    continue
+
+                # 记录该物体在当前帧存在
+                object_frames.append(frame_idx)
+
+                # 将pixel_indices转换为2D坐标
+                pixel_indices_tensor = torch.tensor(pixel_indices, dtype=torch.long, device=self.device)
+                v_coords = pixel_indices_tensor // W  # 行坐标
+                u_coords = pixel_indices_tensor % W   # 列坐标
+
+                # 过滤在图像范围内的坐标
+                valid = (v_coords >= 0) & (v_coords < H) & (u_coords >= 0) & (u_coords < W)
+                v_valid = v_coords[valid]
+                u_valid = u_coords[valid]
+
+                # 提取当前帧该物体的Gaussian参数
+                frame_gaussian_params = gaussian_params[frame_idx]  # [H, W, gaussian_output_dim]
+                object_gaussians = frame_gaussian_params[v_valid, u_valid]  # [N_points, gaussian_output_dim]
+
+                # 存储该帧的Gaussians
+                frame_gaussians[frame_idx] = object_gaussians
+                frame_pixel_indices[frame_idx] = pixel_indices
+
+            if not object_frames:
+                continue
+
+            # 创建frame_existence标记
+            max_frame = max(object_frames)
+            frame_existence = []
+            for frame_idx in range(max_frame + 1):
+                frame_existence.append(frame_idx in object_frames)
+
+            # 构建行人物体数据结构
+            people_objects.append({
+                'object_id': global_id,
+                'frame_gaussians': frame_gaussians,  # {frame_idx: gaussians} 每帧独立的Gaussians
+                'frame_pixel_indices': frame_pixel_indices,  # {frame_idx: [pixel_idx1, ...]}
+                'frame_existence': torch.tensor(frame_existence, dtype=torch.bool, device=self.device),
+                'object_frames': object_frames,
+                'is_people': True  # 标记为行人物体
+            })
+
+        return people_objects
 
     def _points_to_gaussian_params(self, aggregated_object, preds=None) -> Optional[torch.Tensor]:
         """将聚合物体转换为Gaussian参数，使用真实的VGGT预测参数"""

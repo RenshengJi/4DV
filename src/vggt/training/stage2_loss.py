@@ -305,10 +305,22 @@ class Stage2RenderLoss(nn.Module):
         # 如果没有渲染任何帧，返回零损失
         if len(rendered_images) == 0:
             dummy_param = None
-            if 'dynamic_objects' in refined_scene and len(refined_scene['dynamic_objects']) > 0:
-                for obj_data in refined_scene['dynamic_objects']:
+            # 尝试从车辆物体获取dummy参数
+            if 'dynamic_objects_cars' in refined_scene and len(refined_scene['dynamic_objects_cars']) > 0:
+                for obj_data in refined_scene['dynamic_objects_cars']:
                     if 'canonical_gaussians' in obj_data and obj_data['canonical_gaussians'] is not None:
                         dummy_param = obj_data['canonical_gaussians']
+                        break
+
+            # 如果车辆没有，尝试从行人物体获取dummy参数
+            if dummy_param is None and 'dynamic_objects_people' in refined_scene and len(refined_scene['dynamic_objects_people']) > 0:
+                for obj_data in refined_scene['dynamic_objects_people']:
+                    frame_gaussians = obj_data.get('frame_gaussians', {})
+                    for frame_idx, gaussians in frame_gaussians.items():
+                        if gaussians is not None and gaussians.requires_grad:
+                            dummy_param = gaussians
+                            break
+                    if dummy_param is not None:
                         break
 
             if dummy_param is not None and dummy_param.requires_grad:
@@ -433,9 +445,9 @@ class Stage2RenderLoss(nn.Module):
                 all_rotations.append(static_gaussians[:, 9:13])
                 all_opacities.append(static_gaussians[:, 13])
 
-        # 动态Gaussian：只处理在当前帧存在的物体
-        dynamic_objects_data = refined_scene.get('dynamic_objects', [])
-        for obj_data in dynamic_objects_data:
+        # 动态Gaussian：处理车辆（使用canonical空间+变换）
+        dynamic_objects_cars = refined_scene.get('dynamic_objects_cars', [])
+        for obj_data in dynamic_objects_cars:
             # 检查物体是否在当前帧存在
             if 'frame_transforms' not in obj_data or frame_idx not in obj_data['frame_transforms']:
                 continue
@@ -465,6 +477,26 @@ class Stage2RenderLoss(nn.Module):
                 all_colors.append(transformed_gaussians[:, 6:9].unsqueeze(-2))
                 all_rotations.append(transformed_gaussians[:, 9:13])
                 all_opacities.append(transformed_gaussians[:, 13])
+
+        # 动态Gaussian：处理行人（每帧单独的Gaussians，不使用变换）
+        dynamic_objects_people = refined_scene.get('dynamic_objects_people', [])
+        for obj_data in dynamic_objects_people:
+            # 检查物体是否在当前帧存在
+            frame_gaussians = obj_data.get('frame_gaussians', {})
+            if frame_idx not in frame_gaussians:
+                continue
+
+            # 直接使用当前帧的Gaussians（不进行变换）
+            current_frame_gaussians = frame_gaussians[frame_idx]  # [N, 14]
+            if current_frame_gaussians is None or current_frame_gaussians.shape[0] == 0:
+                continue
+
+            # 添加到渲染列表
+            all_means.append(current_frame_gaussians[:, :3])
+            all_scales.append(current_frame_gaussians[:, 3:6])
+            all_colors.append(current_frame_gaussians[:, 6:9].unsqueeze(-2))
+            all_rotations.append(current_frame_gaussians[:, 9:13])
+            all_opacities.append(current_frame_gaussians[:, 13])
 
         if not all_means:
             # 如果没有Gaussian，返回空图像
