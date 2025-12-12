@@ -1141,9 +1141,6 @@ def cut3r_batch_to_vggt(views):
     vggt_batch['point_masks'] = vggt_batch['point_masks'].permute(1, 0, 2, 3).contiguous() if vggt_batch['point_masks'] is not None else None
     vggt_batch['world_points'] = vggt_batch['world_points'].permute(1, 0, 2, 3, 4).contiguous() if vggt_batch['world_points'] is not None else None
 
-    # # Segmentation labels处理: [S, B, H, W] -> [B, S, H, W]
-    # vggt_batch['segment_label'] = vggt_batch['segment_label'].permute(1, 0, 2, 3).contiguous() if vggt_batch['segment_label'] is not None else None
-    # vggt_batch['segment_mask'] = vggt_batch['segment_mask'].permute(1, 0, 2, 3).contiguous() if vggt_batch['segment_mask'] is not None else None
 
     # flowmap处理：根据维度判断是否需要permute
     if vggt_batch['flowmap'] is not None:
