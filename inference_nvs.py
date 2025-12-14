@@ -242,9 +242,9 @@ def render_gaussians_with_sky(scene, intrinsics, extrinsics, sky_colors, sampled
                 all_rotations.append(static_gaussians[:, 9:13])
                 all_opacities.append(static_gaussians[:, 13])
 
-        # Dynamic objects
-        dynamic_objects_data = scene.get('dynamic_objects', [])
-        for obj_data in dynamic_objects_data:
+        # Dynamic objects - Cars (使用canonical空间+变换)
+        dynamic_objects_cars = scene.get('dynamic_objects_cars', [])
+        for obj_data in dynamic_objects_cars:
             # 检查物体是否在当前帧存在
             if not _object_exists_in_frame(obj_data, frame_idx):
                 continue
@@ -270,6 +270,26 @@ def render_gaussians_with_sky(scene, intrinsics, extrinsics, sky_colors, sampled
                 all_colors.append(transformed_gaussians[:, 6:9].unsqueeze(-2))
                 all_rotations.append(transformed_gaussians[:, 9:13])
                 all_opacities.append(transformed_gaussians[:, 13])
+
+        # Dynamic objects - People (每帧单独的Gaussians，不使用变换)
+        dynamic_objects_people = scene.get('dynamic_objects_people', [])
+        for obj_data in dynamic_objects_people:
+            # 检查物体是否在当前帧存在
+            frame_gaussians = obj_data.get('frame_gaussians', {})
+            if frame_idx not in frame_gaussians:
+                continue
+
+            # 直接使用当前帧的Gaussians（不进行变换）
+            current_frame_gaussians = frame_gaussians[frame_idx]  # [N, 14]
+            if current_frame_gaussians is None or current_frame_gaussians.shape[0] == 0:
+                continue
+
+            # 添加到渲染列表
+            all_means.append(current_frame_gaussians[:, :3])
+            all_scales.append(current_frame_gaussians[:, 3:6])
+            all_colors.append(current_frame_gaussians[:, 6:9].unsqueeze(-2))
+            all_rotations.append(current_frame_gaussians[:, 9:13])
+            all_opacities.append(current_frame_gaussians[:, 13])
 
         if len(all_means) == 0:
             # 如果没有Gaussian，返回空图像
@@ -479,14 +499,18 @@ def run_single_inference(model, dataset, dynamic_processor, idx, num_views, devi
         # Extract data
         B, S, C, H, W = vggt_batch['images'].shape
 
-        # Build scene
-        dynamic_objects = dynamic_objects_data.get('dynamic_objects', []) if dynamic_objects_data is not None else []
+        # Build scene (updated to support cars and people separately)
+        dynamic_objects_cars = dynamic_objects_data.get('dynamic_objects_cars', []) if dynamic_objects_data is not None else []
+        dynamic_objects_people = dynamic_objects_data.get('dynamic_objects_people', []) if dynamic_objects_data is not None else []
         static_gaussians = dynamic_objects_data.get('static_gaussians') if dynamic_objects_data is not None else None
 
         scene = {
             'static_gaussians': static_gaussians,
-            'dynamic_objects': dynamic_objects
+            'dynamic_objects_cars': dynamic_objects_cars,
+            'dynamic_objects_people': dynamic_objects_people
         }
+
+        print(f"[INFO] Detected {len(dynamic_objects_cars)} cars, {len(dynamic_objects_people)} people")
 
         # Get camera parameters
         intrinsics = vggt_batch['intrinsics'][0]  # [S, 3, 3]

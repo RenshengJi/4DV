@@ -5,7 +5,8 @@ Complete Stage1 Inference Script
 - Row 1: GT RGB | Rendered RGB (with sky)
 - Row 2: GT Depth | Rendered Depth
 - Row 3: GT Velocity | GT RGB + Pred Velocity 融合 (加权叠加)
-- Row 4: Dynamic Clustering (full width)
+- Row 4: GT Segmentation | Pred Segmentation
+- Row 5: Dynamic Clustering (full width)
 """
 
 import os
@@ -295,9 +296,9 @@ def render_gaussians_with_sky(scene, intrinsics, extrinsics, sky_colors, sampled
                 all_rotations.append(static_gaussians[:, 9:13])
                 all_opacities.append(static_gaussians[:, 13])
 
-        # Dynamic objects (参考stage2_loss.py line 502-532)
-        dynamic_objects_data = scene.get('dynamic_objects', [])
-        for obj_data in dynamic_objects_data:
+        # Dynamic objects - Cars (使用canonical空间+变换，参考stage2_loss.py line 436-467)
+        dynamic_objects_cars = scene.get('dynamic_objects_cars', [])
+        for obj_data in dynamic_objects_cars:
             # 检查物体是否在当前帧存在
             if not _object_exists_in_frame(obj_data, frame_idx):
                 continue
@@ -325,6 +326,26 @@ def render_gaussians_with_sky(scene, intrinsics, extrinsics, sky_colors, sampled
                 all_colors.append(transformed_gaussians[:, 6:9].unsqueeze(-2))
                 all_rotations.append(transformed_gaussians[:, 9:13])
                 all_opacities.append(transformed_gaussians[:, 13])
+
+        # Dynamic objects - People (每帧单独的Gaussians，不使用变换，参考stage2_loss.py line 469-487)
+        dynamic_objects_people = scene.get('dynamic_objects_people', [])
+        for obj_data in dynamic_objects_people:
+            # 检查物体是否在当前帧存在
+            frame_gaussians = obj_data.get('frame_gaussians', {})
+            if frame_idx not in frame_gaussians:
+                continue
+
+            # 直接使用当前帧的Gaussians（不进行变换）
+            current_frame_gaussians = frame_gaussians[frame_idx]  # [N, 14]
+            if current_frame_gaussians is None or current_frame_gaussians.shape[0] == 0:
+                continue
+
+            # 添加到渲染列表
+            all_means.append(current_frame_gaussians[:, :3])
+            all_scales.append(current_frame_gaussians[:, 3:6])
+            all_colors.append(current_frame_gaussians[:, 6:9].unsqueeze(-2))
+            all_rotations.append(current_frame_gaussians[:, 9:13])
+            all_opacities.append(current_frame_gaussians[:, 13])
 
         if len(all_means) == 0:
             # 如果没有Gaussian，返回空图像
@@ -623,14 +644,92 @@ def create_clustering_visualization(matched_clustering_results, vggt_batch, fusi
         return vggt_batch["images"][0]  # [S, 3, H, W]
 
 
+def get_segmentation_colormap(num_classes=4):
+    """生成分割颜色映射表（基于 Waymo 类别和 Cityscapes 风格）
+
+    Waymo 类别定义（4类）:
+        0: background/unlabeled
+        1: vehicle
+        2: sign
+        3: pedestrian + cyclist
+
+    Args:
+        num_classes: 类别数量（默认4）
+
+    Returns:
+        colormap: [num_classes, 3] numpy array of RGB colors
+    """
+    colormap = np.zeros((num_classes, 3), dtype=np.uint8)
+
+    # 基于 Cityscapes 风格的颜色方案
+    colormap[0] = [255, 255, 255]     # background/unlabeled - 白色
+    colormap[1] = [0, 0, 142]         # vehicle - 深蓝色（Cityscapes car color）
+    colormap[2] = [220, 220, 0]       # sign - 黄色（Cityscapes traffic sign color）
+    colormap[3] = [220, 20, 60]       # pedestrian+cyclist - 红色（Cityscapes person color）
+
+    return colormap
+
+
+def visualize_segmentation(seg_labels, seg_mask=None, num_classes=4):
+    """将分割标签可视化为RGB图像
+
+    Args:
+        seg_labels: [S, H, W] or [H, W] - Segmentation labels (class indices)
+        seg_mask: [S, H, W] or [H, W] - Optional validity mask (1=valid, 0=invalid)
+        num_classes: Number of segmentation classes (default 4 for Waymo)
+
+    Returns:
+        seg_rgb: [S, 3, H, W] - RGB visualization
+    """
+    colormap = get_segmentation_colormap(num_classes)
+
+    # Convert labels to numpy if needed
+    if isinstance(seg_labels, torch.Tensor):
+        seg_labels = seg_labels.cpu().numpy()
+
+    if seg_mask is not None and isinstance(seg_mask, torch.Tensor):
+        seg_mask = seg_mask.cpu().numpy()
+
+    # Handle both [S, H, W] and [H, W] shapes
+    if seg_labels.ndim == 2:
+        # [H, W] -> add batch dimension -> [1, H, W]
+        seg_labels = seg_labels[np.newaxis, ...]
+        if seg_mask is not None:
+            seg_mask = seg_mask[np.newaxis, ...]
+    elif seg_labels.ndim != 3:
+        raise ValueError(f"Expected seg_labels to have 2 or 3 dimensions, got {seg_labels.ndim} (shape: {seg_labels.shape})")
+
+    S, H, W = seg_labels.shape
+    seg_rgb = np.zeros((S, H, W, 3), dtype=np.float32)
+
+    # Map each class to its color
+    for s in range(S):
+        for class_id in range(num_classes):
+            mask = (seg_labels[s] == class_id)
+            seg_rgb[s][mask] = colormap[class_id] / 255.0
+
+        # Set invalid regions to gray if mask is provided
+        if seg_mask is not None:
+            invalid_mask = (seg_mask[s] == 0)
+            seg_rgb[s][invalid_mask] = [0.5, 0.5, 0.5]  # Gray for invalid regions
+
+    # Convert to [S, 3, H, W] format
+    seg_rgb = torch.from_numpy(seg_rgb).permute(0, 3, 1, 2)
+
+    return seg_rgb
+
+
 def create_visualization_grid(gt_rgb, rendered_rgb, gt_depth, rendered_depth,
                               gt_velocity, pred_velocity, clustering_vis,
+                              gt_seg=None, pred_seg=None,
                               self_render_rgb=None, velocity_alpha=0.5):
-    """创建4x2的可视化网格（Row 3右侧展示GT RGB和Pred Velocity的融合，Row 4右侧展示self_render）
+    """创建5行可视化网格
 
     Args:
         velocity_alpha: Pred velocity在融合中的权重 (0-1)，默认0.5表示各占50%
         self_render_rgb: [S, 3, H, W] self_render的RGB渲染结果
+        gt_seg: [S, 3, H, W] GT segmentation可视化
+        pred_seg: [S, 3, H, W] Pred segmentation可视化
     """
     S = gt_rgb.shape[0]
     _, H, W = gt_rgb.shape[1:]
@@ -651,6 +750,15 @@ def create_visualization_grid(gt_rgb, rendered_rgb, gt_depth, rendered_depth,
         fused_velocity_np = velocity_alpha * pred_velocity_np + (1 - velocity_alpha) * gt_rgb_np
         fused_velocity_np = np.clip(fused_velocity_np, 0, 1)
 
+        # 准备segmentation可视化（如果提供）
+        if gt_seg is not None and pred_seg is not None:
+            gt_seg_np = gt_seg[s].detach().permute(1, 2, 0).cpu().numpy()
+            pred_seg_np = pred_seg[s].detach().permute(1, 2, 0).cpu().numpy()
+        else:
+            # 如果没有提供segmentation，使用黑色占位符
+            gt_seg_np = np.zeros_like(gt_rgb_np)
+            pred_seg_np = np.zeros_like(gt_rgb_np)
+
         # 准备self_render可视化（如果提供）
         if self_render_rgb is not None:
             self_render_np = self_render_rgb[s].detach().permute(1, 2, 0).cpu().numpy()
@@ -658,15 +766,17 @@ def create_visualization_grid(gt_rgb, rendered_rgb, gt_depth, rendered_depth,
             # 如果没有提供self_render，使用黑色占位符
             self_render_np = np.zeros_like(gt_rgb_np)
 
-        # Create grid: 4 rows x 2 columns
+        # Create grid: 5 rows x 2 columns
         row1 = np.concatenate([gt_rgb_np, rendered_rgb_np], axis=1)
         row2 = np.concatenate([gt_depth_np, rendered_depth_np], axis=1)
         # Row 3: GT Velocity | GT RGB + Pred Velocity 融合
         row3 = np.concatenate([gt_velocity_np, fused_velocity_np], axis=1)
-        # Row 4: Dynamic Clustering | Self Render
-        row4 = np.concatenate([clustering_vis_np, self_render_np], axis=1)
+        # Row 4: GT Segmentation | Pred Segmentation
+        row4 = np.concatenate([gt_seg_np, pred_seg_np], axis=1)
+        # Row 5: Dynamic Clustering | Self Render
+        row5 = np.concatenate([clustering_vis_np, self_render_np], axis=1)
 
-        grid = np.concatenate([row1, row2, row3, row4], axis=0)
+        grid = np.concatenate([row1, row2, row3, row4, row5], axis=0)
         grid = (np.clip(grid, 0, 1) * 255).astype(np.uint8)
 
         grid_frames.append(grid)
@@ -788,14 +898,19 @@ def run_single_inference(model, dataset, dynamic_processor, idx, num_views, devi
         pred_velocity = pred_velocity[:, :, :, [2, 0, 1]]
         pred_velocity[:, :, :, 2] = -pred_velocity[:, :, :, 2]
 
-        # Build scene
-        dynamic_objects = dynamic_objects_data.get('dynamic_objects', []) if dynamic_objects_data is not None else []
+        # Build scene (updated to support cars and people separately)
+        dynamic_objects_cars = dynamic_objects_data.get('dynamic_objects_cars', []) if dynamic_objects_data is not None else []
+        dynamic_objects_people = dynamic_objects_data.get('dynamic_objects_people', []) if dynamic_objects_data is not None else []
         static_gaussians = dynamic_objects_data.get('static_gaussians') if dynamic_objects_data is not None else None
 
         scene = {
             'static_gaussians': static_gaussians,
-            'dynamic_objects': dynamic_objects
+            'dynamic_objects_cars': dynamic_objects_cars,
+            'dynamic_objects_people': dynamic_objects_people
         }
+
+        # Log object counts
+        print(f"[INFO] Detected {len(dynamic_objects_cars)} cars, {len(dynamic_objects_people)} people")
 
         # Get camera parameters
         intrinsics = vggt_batch['intrinsics'][0]
@@ -860,6 +975,32 @@ def run_single_inference(model, dataset, dynamic_processor, idx, num_views, devi
         gt_depth_vis = visualize_depth(gt_depth)  # gt_depth is already [S, H, W]
         rendered_depth_vis = visualize_depth(rendered_depth)
 
+        # Create Segmentation visualization
+        print("Creating segmentation visualizations...")
+        # Get GT segmentation
+        gt_seg_labels = vggt_batch.get('segment_label', None)
+        gt_seg_mask = vggt_batch.get('segment_mask', None)
+
+        # Get predicted segmentation
+        pred_seg_logits = preds.get('segment_logits', None)
+
+        if gt_seg_labels is not None and pred_seg_logits is not None:
+            # Visualize GT segmentation
+            gt_seg_vis = visualize_segmentation(gt_seg_labels, gt_seg_mask, num_classes=4)
+
+            # Visualize predicted segmentation
+            pred_seg_probs = torch.softmax(pred_seg_logits[0], dim=-1)  # [S, H, W, 4]
+            pred_seg_labels = torch.argmax(pred_seg_probs, dim=-1)  # [S, H, W]
+            pred_seg_vis = visualize_segmentation(pred_seg_labels, num_classes=4)
+        else:
+            # If segmentation not available, set to None
+            gt_seg_vis = None
+            pred_seg_vis = None
+            if gt_seg_labels is None:
+                print("Warning: No GT segmentation found")
+            if pred_seg_logits is None:
+                print("Warning: No predicted segmentation found")
+
         # Create Dynamic Clustering visualization（参考demo_stage2_inference.py）
         matched_clustering_results = dynamic_objects_data.get('matched_clustering_results', []) if dynamic_objects_data is not None else []
         clustering_vis = create_clustering_visualization(matched_clustering_results, vggt_batch)
@@ -871,9 +1012,13 @@ def run_single_inference(model, dataset, dynamic_processor, idx, num_views, devi
             'rendered_depth': rendered_depth_vis,
             'gt_velocity': gt_velocity_vis,
             'pred_velocity': pred_velocity_vis,
+            'gt_seg': gt_seg_vis,
+            'pred_seg': pred_seg_vis,
             'clustering': clustering_vis,
             'self_render_rgb': self_render_rgb,
-            'num_objects': len(dynamic_objects),
+            'num_objects': len(dynamic_objects_cars) + len(dynamic_objects_people),
+            'num_cars': len(dynamic_objects_cars),
+            'num_people': len(dynamic_objects_people),
             'metrics': metrics,
             'success': True
         }
@@ -908,7 +1053,9 @@ def run_batch_inference(model, dataset, dynamic_processor, args, device):
                 result['gt_depth'], result['rendered_depth'],
                 result['gt_velocity'], result['pred_velocity'],
                 result['clustering'],
-                result.get('self_render_rgb'),
+                gt_seg=result.get('gt_seg'),
+                pred_seg=result.get('pred_seg'),
+                self_render_rgb=result.get('self_render_rgb'),
                 velocity_alpha=args.velocity_alpha
             )
 
@@ -994,7 +1141,9 @@ def main():
                     result['gt_depth'], result['rendered_depth'],
                     result['gt_velocity'], result['pred_velocity'],
                     result['clustering'],
-                    result.get('self_render_rgb'),
+                    gt_seg=result.get('gt_seg'),
+                    pred_seg=result.get('pred_seg'),
+                    self_render_rgb=result.get('self_render_rgb'),
                     velocity_alpha=args.velocity_alpha
                 )
 

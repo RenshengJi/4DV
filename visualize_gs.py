@@ -137,7 +137,8 @@ class GaussianViewer:
 
         # 提取场景信息
         self.static_gaussians = scene.get('static_gaussians')  # [N, 14]
-        self.dynamic_objects = scene.get('dynamic_objects', [])
+        self.dynamic_objects_cars = scene.get('dynamic_objects_cars', [])
+        self.dynamic_objects_people = scene.get('dynamic_objects_people', [])
 
         # 相机参数
         self.intrinsics = vggt_batch['intrinsics'][0]  # [S, 3, 3]
@@ -146,7 +147,8 @@ class GaussianViewer:
 
         print(f"Scene info:")
         print(f"  - Static gaussians: {self.static_gaussians.shape[0] if self.static_gaussians is not None else 0}")
-        print(f"  - Dynamic objects: {len(self.dynamic_objects)}")
+        print(f"  - Dynamic objects (cars): {len(self.dynamic_objects_cars)}")
+        print(f"  - Dynamic objects (people): {len(self.dynamic_objects_people)}")
         print(f"  - Number of frames: {self.num_frames}")
 
         # 启动Viser服务器
@@ -230,7 +232,8 @@ class GaussianViewer:
 
         # Dynamic objects
         if self.show_dynamic_checkbox.value:
-            for obj_data in self.dynamic_objects:
+            # Cars (使用canonical空间+变换)
+            for obj_data in self.dynamic_objects_cars:
                 # 检查物体是否在当前帧存在
                 if not self._object_exists_in_frame(obj_data, frame_idx):
                     continue
@@ -256,6 +259,25 @@ class GaussianViewer:
                     all_colors.append(transformed_gaussians[:, 6:9].unsqueeze(-2))
                     all_rotations.append(transformed_gaussians[:, 9:13])
                     all_opacities.append(transformed_gaussians[:, 13])
+
+            # People (每帧单独的Gaussians，不使用变换)
+            for obj_data in self.dynamic_objects_people:
+                # 检查物体是否在当前帧存在
+                frame_gaussians = obj_data.get('frame_gaussians', {})
+                if frame_idx not in frame_gaussians:
+                    continue
+
+                # 直接使用当前帧的Gaussians（不进行变换）
+                current_frame_gaussians = frame_gaussians[frame_idx]  # [N, 14]
+                if current_frame_gaussians is None or current_frame_gaussians.shape[0] == 0:
+                    continue
+
+                # 添加到渲染列表
+                all_means.append(current_frame_gaussians[:, :3])
+                all_scales.append(current_frame_gaussians[:, 3:6])
+                all_colors.append(current_frame_gaussians[:, 6:9].unsqueeze(-2))
+                all_rotations.append(current_frame_gaussians[:, 9:13])
+                all_opacities.append(current_frame_gaussians[:, 13])
 
         if len(all_means) == 0:
             return None
@@ -497,14 +519,18 @@ def run_inference(args):
         preds_for_dynamic, vggt_batch, auxiliary_models
     )
 
-    # Build scene
-    dynamic_objects = dynamic_objects_data.get('dynamic_objects', []) if dynamic_objects_data is not None else []
+    # Build scene (updated to support cars and people separately)
+    dynamic_objects_cars = dynamic_objects_data.get('dynamic_objects_cars', []) if dynamic_objects_data is not None else []
+    dynamic_objects_people = dynamic_objects_data.get('dynamic_objects_people', []) if dynamic_objects_data is not None else []
     static_gaussians = dynamic_objects_data.get('static_gaussians') if dynamic_objects_data is not None else None
 
     scene = {
         'static_gaussians': static_gaussians,
-        'dynamic_objects': dynamic_objects
+        'dynamic_objects_cars': dynamic_objects_cars,
+        'dynamic_objects_people': dynamic_objects_people
     }
+
+    print(f"[INFO] Detected {len(dynamic_objects_cars)} cars, {len(dynamic_objects_people)} people")
 
     return scene, vggt_batch, device
 
