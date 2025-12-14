@@ -51,7 +51,7 @@ class VelocityBasedRegistration:
                                        points_3d_dst: torch.Tensor,
                                        weights: Optional[torch.Tensor] = None,
                                        use_trimmed: bool = True,
-                                       trim_ratio: float = 0.8,
+                                       trim_ratio: float = 0.95,
                                        trim_iterations: int = 2) -> Tuple[torch.Tensor, torch.Tensor, float]:
         """
         使用Procrustes算法计算3D-3D点对应的刚体变换
