@@ -49,9 +49,8 @@ from raft import RAFT
 torch.backends.cuda.matmul.allow_tf32 = True  # for gpu >= Ampere and pytorch >= 1.12
 torch.autograd.set_detect_anomaly(True)
 
-from dust3r.datasets import get_data_loader
+from dataset import get_data_loader  # Use our simplified dataset system
 from dust3r.utils.misc import tf32_off
-import dust3r.utils.path_to_croco  # noqa: F401
 import croco.utils.misc as misc  # noqa
 from croco.utils.misc import NativeScalerWithGradNormCount as NativeScaler  # noqa
 
@@ -452,7 +451,8 @@ def train(args):
                 epoch_f = epoch + data_iter_step / len(data_loader_train)
                 if data_iter_step % args.accum_iter == 0:
                     misc.adjust_learning_rate(optimizer, epoch_f, args)
-                vggt_batch = cut3r_batch_to_vggt(batch)
+                # batch is already in VGGT format from the dataset
+                vggt_batch = batch
 
                 # 初始化sky_masks
                 sky_masks = None
@@ -1084,83 +1084,6 @@ def dam2_sky_mask_generation(images, dam2_model, device):
                 sky_masks[b, s] = sky_mask
     
     return sky_masks
-
-
-def cut3r_batch_to_vggt(views):
-    # views: List[Dict], 长度为num_views
-    # 目标: [1, S, 3, H, W] (B=1, S=num_views)
-    imgs = [v['img'] for v in views]  # List of [B,3,H,W]
-    imgs = torch.stack(imgs, dim=0)  # [S,B,3,H,W]
-
-    vggt_batch = {
-        'images': imgs * 0.5 + 0.5,  # [S,B,3,H,W], 归一化到[0,1]
-        'depths': torch.stack([v['depthmap'] for v in views], dim=0) if 'depthmap' in views[0] else None,
-        'intrinsics': torch.stack([v['camera_intrinsics'] for v in views], dim=0) if 'camera_intrinsics' in views[0] else None,
-        'extrinsics': torch.stack([v['camera_pose'] for v in views], dim=0) if 'camera_pose' in views[0] else None,
-        'point_masks': torch.stack([v['valid_mask'] for v in views], dim=0) if 'valid_mask' in views[0] else None,
-        'world_points': torch.stack([v['pts3d'] for v in views], dim=0) if 'pts3d' in views[0] else None,
-        'flowmap': torch.stack([torch.from_numpy(v['flowmap']).float() if isinstance(v['flowmap'], np.ndarray) else v['flowmap'].float() for v in views], dim=0) if 'flowmap' in views[0] and views[0]['flowmap'] is not None else None,
-        'segment_label': torch.stack([torch.from_numpy(v['segment_label']).long() if isinstance(v['segment_label'], np.ndarray) else v['segment_label'].long() for v in views], dim=0) if 'segment_label' in views[0] and views[0]['segment_label'] is not None else None,
-        'segment_mask': torch.stack([torch.from_numpy(v['segment_mask']).float() if isinstance(v['segment_mask'], np.ndarray) else v['segment_mask'].float() for v in views], dim=0) if 'segment_mask' in views[0] and views[0]['segment_mask'] is not None else None,
-    }
-
-    with tf32_off(), torch.amp.autocast("cuda", enabled=False):
-        B, S, H, W, _ = vggt_batch['world_points'].shape
-        world_points = vggt_batch['world_points'].reshape(B, S, H*W, 3)
-        # world_points from world to cam0
-        world_points = torch.matmul(torch.linalg.inv(vggt_batch['extrinsics'][0])[:, :3, :3], world_points.transpose(-1, -2)).transpose(-1, -2) + \
-                                    torch.linalg.inv(vggt_batch['extrinsics'][0])[:, :3, 3:4].transpose(-1, -2)
-        vggt_batch['world_points'] = world_points.reshape(B, S, H, W, 3)
-
-        # 处理flowmap
-        if vggt_batch['flowmap'] is not None:
-            vggt_batch['flowmap'][..., :3] *=  0.1
-
-        # extrinsics from (cam to world) to (cam0 to cam), 即以第一个视角为参考系
-        vggt_batch['extrinsics'] = torch.matmul(
-                torch.linalg.inv(vggt_batch['extrinsics']),
-                vggt_batch['extrinsics'][0]
-            )
-
-        # 将extrinsics(中的T)以及world_points、depth进行非metric化
-        world_points_flatten = vggt_batch['world_points'].reshape(-1, 3)
-        world_points_mask_flatten = vggt_batch['point_masks'].reshape(-1) if vggt_batch['point_masks'] is not None else torch.ones_like(world_points_flatten[:, 0], dtype=torch.bool)
-        dist_avg = world_points_flatten[world_points_mask_flatten].norm(dim=-1).mean()
-        depth_scale_factor = 1 / dist_avg
-        pose_scale_factor = depth_scale_factor
-
-        # 保存depth_scale_factor到batch中用于scale loss监督
-        vggt_batch['depth_scale_factor'] = depth_scale_factor
-
-        # 应用非metric化
-        vggt_batch['depths'] = vggt_batch['depths'] * depth_scale_factor
-        vggt_batch['extrinsics'][:, :, :3, 3] = vggt_batch['extrinsics'][:, :, :3, 3] * pose_scale_factor
-        vggt_batch['world_points'] = vggt_batch['world_points'] * depth_scale_factor
-
-        # 对flowmap应用非metric化：只对velocity magnitude进行缩放
-        if vggt_batch['flowmap'] is not None:
-            vggt_batch['flowmap'][..., :3] = vggt_batch['flowmap'][..., :3] * depth_scale_factor
-
-
-    vggt_batch['images'] = vggt_batch['images'].permute(1, 0, 2, 3, 4).contiguous()
-    vggt_batch['depths'] = vggt_batch['depths'].permute(1, 0, 2, 3).contiguous() if vggt_batch['depths'] is not None else None
-    vggt_batch['intrinsics'] = vggt_batch['intrinsics'].permute(1, 0, 2, 3).contiguous() if vggt_batch['intrinsics'] is not None else None
-    vggt_batch['extrinsics'] = vggt_batch['extrinsics'].permute(1, 0, 2, 3).contiguous() if vggt_batch['extrinsics'] is not None else None
-    vggt_batch['point_masks'] = vggt_batch['point_masks'].permute(1, 0, 2, 3).contiguous() if vggt_batch['point_masks'] is not None else None
-    vggt_batch['world_points'] = vggt_batch['world_points'].permute(1, 0, 2, 3, 4).contiguous() if vggt_batch['world_points'] is not None else None
-
-
-    # flowmap处理：根据维度判断是否需要permute
-    if vggt_batch['flowmap'] is not None:
-        if vggt_batch['flowmap'].dim() == 5:
-            # 5维: [S, B, H, W, C] -> [B, S, H, W, C]
-            vggt_batch['flowmap'] = vggt_batch['flowmap'].permute(1, 0, 2, 3, 4).contiguous()
-        elif vggt_batch['flowmap'].dim() == 4:
-            # 4维: [S, H, W, C] -> [1, S, H, W, C] (添加batch维度)
-            vggt_batch['flowmap'] = vggt_batch['flowmap'].unsqueeze(0).contiguous()
-        # 其他维度保持不变
-
-    return vggt_batch
 
 
 @hydra.main(

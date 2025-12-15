@@ -277,12 +277,14 @@ def inference(groups, model, device, verbose=True):
                 view[name] = view[name].to(device, non_blocking=True)
             if name in unsqueeze_keys:
                 view[name] = view[name].unsqueeze(0)
-            
+
 
     if verbose:
         print(f">> Inference with model on {len(groups)} image/raymaps")
 
-    vggt_batch = cut3r_batch_to_vggt(groups)
+    # groups is already in VGGT format from dataset, need to batch it
+    from dataset import vggt_collate_fn
+    vggt_batch = vggt_collate_fn([groups])
 
     preds = model(vggt_batch['images'])
 

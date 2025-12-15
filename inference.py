@@ -13,7 +13,6 @@ import os
 import sys
 import numpy as np
 import torch
-import argparse
 import cv2
 import imageio.v2 as iio
 from tqdm import tqdm
@@ -23,6 +22,8 @@ from copy import deepcopy
 from contextlib import contextmanager
 from lpips import LPIPS
 from skimage.metrics import structural_similarity
+import hydra
+from omegaconf import OmegaConf
 
 # Add paths
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src/vggt'))
@@ -32,7 +33,6 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 from vggt.models.vggt import VGGT
 from dust3r.utils.misc import tf32_off
 from src.dust3r.inference import inference
-from src.train import cut3r_batch_to_vggt
 from src.online_dynamic_processor import OnlineDynamicProcessor
 from vggt.training.loss import self_render_and_loss
 from vggt.training.stage2_loss import prune_gaussians_by_voxel
@@ -122,72 +122,13 @@ def compute_ssim(ground_truth, predicted):
 # ========== End of Metric Computation Functions ==========
 
 
-def parse_args():
-    """解析命令行参数"""
-    parser = argparse.ArgumentParser(description="Complete Stage1 Inference with Visualization")
-
-    # 基础参数
-    parser.add_argument("--model_path", type=str, required=True, help="Path to Stage1 model checkpoint")
-    parser.add_argument("--dataset_root", type=str, required=True, help="Path to dataset root directory")
-    parser.add_argument("--output_dir", type=str, default="./inference_outputs", help="Output directory")
-    parser.add_argument("--idx", type=int, default=0, help="Sequence index (single mode)")
-    parser.add_argument("--device", type=str, default="cuda", help="Device (cuda/cpu)")
-    parser.add_argument("--num_views", type=int, default=8, help="Number of views")
-    parser.add_argument("--fps", type=int, default=10, help="Output video FPS")
-
-    # 批量推理参数
-    parser.add_argument("--batch_mode", action="store_true", help="Enable batch inference mode")
-    parser.add_argument("--start_idx", type=int, default=150, help="Start index for batch mode")
-    parser.add_argument("--end_idx", type=int, default=200, help="End index for batch mode")
-    parser.add_argument("--step", type=int, default=5, help="Step size for batch mode")
-    parser.add_argument("--continue_on_error", action="store_true", help="Continue on error in batch mode")
-
-    # Dynamic processor参数
-    parser.add_argument("--velocity_transform_mode", type=str, default="procrustes",
-                       choices=["simple", "procrustes"], help="Velocity transformation mode")
-
-    # 聚类参数
-    parser.add_argument("--velocity_threshold", type=float, default=0.1,
-                       help="Velocity threshold for clustering")
-    parser.add_argument("--clustering_eps", type=float, default=0.3,
-                       help="DBSCAN eps parameter (meters)")
-    parser.add_argument("--clustering_min_samples", type=int, default=10,
-                       help="DBSCAN min_samples parameter")
-    parser.add_argument("--min_object_size", type=int, default=500,
-                       help="Minimum object size (points)")
-    parser.add_argument("--tracking_position_threshold", type=float, default=2.0,
-                       help="Position threshold for tracking")
-    parser.add_argument("--tracking_velocity_threshold", type=float, default=0.2,
-                       help="Velocity threshold for tracking")
-
-    # 可视化参数
-    parser.add_argument("--velocity_alpha", type=float, default=1.0,
-                       help="Weight for pred velocity in fusion (0-1), default 0.5 means 50% each")
-
-    # VGGT模型配置参数
-    parser.add_argument("--sh_degree", type=int, default=0, help="Spherical harmonics degree")
-    parser.add_argument("--use_gs_head", action="store_true", default=True, help="Use DPTGSHead for gaussian_head")
-    parser.add_argument("--use_gs_head_velocity", action="store_true", default=False, help="Use DPTGSHead for velocity_head")
-    parser.add_argument("--use_gt_camera", action="store_true", help="Use GT camera parameters")
-
-    return parser.parse_args()
-
-
-def load_model(model_path, device, args):
+def load_model(model_path, device, cfg):
     """加载Stage1模型（参考demo_stage2_inference.py）"""
     print(f"Loading model from: {model_path}")
-    print(f"Model config: sh_degree={args.sh_degree}, use_gs_head={args.use_gs_head}, use_gs_head_velocity={args.use_gs_head_velocity}")
+    print(f"Model config: sh_degree={cfg.sh_degree}")
 
-    model = VGGT(
-        img_size=518,
-        patch_size=14,
-        embed_dim=1024,
-        use_sky_token=True,
-        sh_degree=args.sh_degree,
-        use_gs_head=args.use_gs_head,
-        use_gs_head_velocity=args.use_gs_head_velocity,
-        use_gt_camera=args.use_gt_camera
-    )
+    # 使用eval()解析模型配置字符串
+    model = eval(cfg.model)
 
     checkpoint = torch.load(model_path, map_location="cpu")
     ckpt = checkpoint.get('model', checkpoint)
@@ -200,29 +141,19 @@ def load_model(model_path, device, args):
     return model
 
 
-def load_dataset(dataset_root, num_views):
+def load_dataset(dataset_cfg):
     """加载数据集"""
-    from src.dust3r.datasets.waymo import Waymo_Multi
+    from dataset import WaymoDataset, Waymo_Multi, ImgNorm
 
-    seq_name = os.path.basename(dataset_root)
-    root_dir = os.path.dirname(dataset_root)
+    print(f"Loading dataset from config...")
 
-    print(f"Loading dataset - Root: {root_dir}, Sequence: {seq_name}")
+    # 使用eval()解析数据集配置字符串（类似train.py）
+    dataset = eval(dataset_cfg)
 
-    dataset = Waymo_Multi(
-        split=None,
-        ROOT=root_dir,
-        img_ray_mask_p=[1.0, 0.0, 0.0],
-        valid_camera_id_list=["1", "2", "3"],
-        resolution=[(518, 378), (518, 336), (518, 294), (518, 252), (518, 210),
-                    (518, 140), (378, 518), (336, 518), (294, 518), (252, 518)],
-        num_views=num_views,  
-        seed=42,
-        n_corres=0,
-        seq_aug_crop=True
-    )
+    print(f"Dataset loaded successfully! Total scenes: {len(dataset)}")
 
     return dataset
+
 
 
 def ensure_tensor(data, device):
@@ -819,26 +750,28 @@ def compute_metrics(gt_rgb, rendered_rgb):
     }
 
 
-def run_single_inference(model, dataset, dynamic_processor, idx, num_views, device, args=None):
+def run_single_inference(model, dataset, dynamic_processor, idx, num_views, device, cfg=None):
     """运行单次推理"""
     print(f"\n{'='*60}")
     print(f"Processing sequence index: {idx}")
     print(f"{'='*60}\n")
 
     try:
-        # Load data（参考demo_stage2_inference.py）
-        views = dataset.__getitem__((idx, 2, num_views))
+        # Load data - dataset returns list of view dicts in VGGT format
+        views = dataset[idx]
 
-        # 运行Stage1推理（参考demo_stage2_inference.py）
-        with torch.no_grad():
-            outputs, batch = inference(views, model, device)
+        # Convert to batch format using collate function
+        from dataset import vggt_collate_fn
+        vggt_batch = vggt_collate_fn([views])  # [B=1, S, ...]
 
-        # 转换为vggt batch（参考demo_stage2_inference.py）
-        vggt_batch = cut3r_batch_to_vggt(views)
+        # Move to device
+        for key in vggt_batch:
+            if isinstance(vggt_batch[key], torch.Tensor):
+                vggt_batch[key] = vggt_batch[key].to(device)
 
-        # Vggt forward（参考demo_stage2_inference.py）
-        # 为了获取sky_colors，需要传入gt_extrinsics和gt_intrinsics
-        # 同时设置frame_sample_ratio=1确保所有帧都被采样
+        print(f"Loaded batch: images shape = {vggt_batch['images'].shape}")
+
+        # Vggt forward
         with torch.no_grad():
             preds = model(
                 vggt_batch['images'],
@@ -847,9 +780,9 @@ def run_single_inference(model, dataset, dynamic_processor, idx, num_views, devi
                 frame_sample_ratio=1.0
             )
 
-        # 处理use_gt_camera参数（参考demo_stage2_inference.py）
+        # 处理use_gt_camera参数
         preds_for_dynamic = preds.copy() if isinstance(preds, dict) else preds
-        if hasattr(args, 'use_gt_camera') and args.use_gt_camera and 'pose_enc' in preds_for_dynamic:
+        if hasattr(cfg, 'use_gt_camera') and cfg.use_gt_camera and 'pose_enc' in preds_for_dynamic:
             # 使用GT相机参数替换预测的pose_enc
             from vggt.utils.pose_enc import extri_intri_to_pose_encoding
             gt_extrinsics = vggt_batch['extrinsics']  # [B, S, 4, 4]
@@ -943,7 +876,7 @@ def run_single_inference(model, dataset, dynamic_processor, idx, num_views, devi
         print("Rendering self...")
         self_render_rgb, self_render_depth = render_self(
             vggt_batch, preds,
-            sh_degree=args.sh_degree if hasattr(args, 'sh_degree') else 0,
+            sh_degree=cfg.sh_degree if hasattr(cfg, 'sh_degree') else 0,
             enable_voxel_pruning=True,
             voxel_size=0.05
         )
@@ -985,8 +918,8 @@ def run_single_inference(model, dataset, dynamic_processor, idx, num_views, devi
         pred_seg_logits = preds.get('segment_logits', None)
 
         if gt_seg_labels is not None and pred_seg_logits is not None:
-            # Visualize GT segmentation
-            gt_seg_vis = visualize_segmentation(gt_seg_labels, gt_seg_mask, num_classes=4)
+            # Visualize GT segmentation - remove batch dimension [B=1, S, H, W] -> [S, H, W]
+            gt_seg_vis = visualize_segmentation(gt_seg_labels[0], gt_seg_mask[0] if gt_seg_mask is not None else None, num_classes=4)
 
             # Visualize predicted segmentation
             pred_seg_probs = torch.softmax(pred_seg_logits[0], dim=-1)  # [S, H, W, 4]
@@ -1030,21 +963,21 @@ def run_single_inference(model, dataset, dynamic_processor, idx, num_views, devi
         return {'success': False, 'error': str(e)}
 
 
-def run_batch_inference(model, dataset, dynamic_processor, args, device):
+def run_batch_inference(model, dataset, dynamic_processor, cfg, device):
     """运行批量推理"""
     print(f"\n{'='*60}")
     print(f"Batch Inference Mode")
-    print(f"Range: {args.start_idx} to {args.end_idx}, step {args.step}")
+    print(f"Range: {cfg.start_idx} to {cfg.end_idx}, step {cfg.step}")
     print(f"{'='*60}\n")
 
     successful = []
     failed = []
     all_metrics = []
 
-    indices = range(args.start_idx, args.end_idx, args.step)
+    indices = range(cfg.start_idx, cfg.end_idx, cfg.step)
 
     for idx in tqdm(indices, desc="Batch processing"):
-        result = run_single_inference(model, dataset, dynamic_processor, idx, args.num_views, device, args)
+        result = run_single_inference(model, dataset, dynamic_processor, idx, cfg.num_views, device, cfg)
 
         if result['success']:
             # Save video
@@ -1056,20 +989,20 @@ def run_batch_inference(model, dataset, dynamic_processor, args, device):
                 gt_seg=result.get('gt_seg'),
                 pred_seg=result.get('pred_seg'),
                 self_render_rgb=result.get('self_render_rgb'),
-                velocity_alpha=args.velocity_alpha
+                velocity_alpha=1.0  # Default value
             )
 
-            seq_name = os.path.basename(args.dataset_root)
-            output_path = os.path.join(args.output_dir, f"{seq_name}_idx{idx}.mp4")
+            output_prefix = cfg.output_prefix if hasattr(cfg, 'output_prefix') else "infer"
+            output_path = os.path.join(cfg.output_dir, f"{output_prefix}_idx{idx}.mp4")
 
-            save_video(grid_frames, output_path, fps=args.fps)
+            save_video(grid_frames, output_path, fps=cfg.fps)
             successful.append(idx)
             all_metrics.append(result['metrics'])
             print(f"✓ idx {idx}: {result['num_objects']} objects, PSNR: {result['metrics']['psnr_mean']:.4f}, SSIM: {result['metrics']['ssim_mean']:.4f}, LPIPS: {result['metrics']['lpips_mean']:.4f}")
         else:
             failed.append(idx)
             print(f"✗ idx {idx}: {result['error']}")
-            if not args.continue_on_error:
+            if not cfg.continue_on_error:
                 break
 
     print(f"\n{'='*60}")
@@ -1098,10 +1031,13 @@ def save_video(grid_frames, output_path, fps=10):
     print(f"Video saved! Frames: {len(grid_frames)}")
 
 
-def main():
-    args = parse_args()
-
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+@hydra.main(
+    version_base=None,
+    config_path="config/waymo",
+    config_name="infer",
+)
+def main(cfg: OmegaConf):
+    device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}\n")
 
     # import debugpy
@@ -1110,30 +1046,30 @@ def main():
     # debugpy.wait_for_client()
 
     # Load model and dataset
-    model = load_model(args.model_path, device, args)
-    dataset = load_dataset(args.dataset_root, args.num_views)
+    model = load_model(cfg.model_path, device, cfg)
+    dataset = load_dataset(cfg.infer_dataset)
 
     # Create dynamic processor
     dynamic_processor = OnlineDynamicProcessor(
         device=device,
-        velocity_transform_mode=args.velocity_transform_mode,
-        velocity_threshold=args.velocity_threshold,
-        clustering_eps=args.clustering_eps,
-        clustering_min_samples=args.clustering_min_samples,
-        min_object_size=args.min_object_size,
-        tracking_position_threshold=args.tracking_position_threshold,
-        tracking_velocity_threshold=args.tracking_velocity_threshold
+        velocity_transform_mode=cfg.velocity_transform_mode,
+        velocity_threshold=cfg.velocity_threshold,
+        clustering_eps=cfg.clustering_eps,
+        clustering_min_samples=cfg.clustering_min_samples,
+        min_object_size=cfg.min_object_size,
+        tracking_position_threshold=cfg.tracking_position_threshold,
+        tracking_velocity_threshold=cfg.tracking_velocity_threshold
     )
 
     # Create output dir
-    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(cfg.output_dir, exist_ok=True)
 
     # Run inference
     with tf32_off():
-        if args.batch_mode:
-            run_batch_inference(model, dataset, dynamic_processor, args, device)
+        if cfg.batch_mode:
+            run_batch_inference(model, dataset, dynamic_processor, cfg, device)
         else:
-            result = run_single_inference(model, dataset, dynamic_processor, args.idx, args.num_views, device, args)
+            result = run_single_inference(model, dataset, dynamic_processor, cfg.single_idx, cfg.num_views, device, cfg)
 
             if result['success']:
                 grid_frames = create_visualization_grid(
@@ -1144,13 +1080,13 @@ def main():
                     gt_seg=result.get('gt_seg'),
                     pred_seg=result.get('pred_seg'),
                     self_render_rgb=result.get('self_render_rgb'),
-                    velocity_alpha=args.velocity_alpha
+                    velocity_alpha=1.0  # Default value
                 )
 
-                seq_name = os.path.basename(args.dataset_root)
-                output_path = os.path.join(args.output_dir, f"{seq_name}_idx{args.idx}.mp4")
+                output_prefix = cfg.output_prefix if hasattr(cfg, 'output_prefix') else "infer"
+                output_path = os.path.join(cfg.output_dir, f"{output_prefix}_idx{cfg.single_idx}.mp4")
 
-                save_video(grid_frames, output_path, fps=args.fps)
+                save_video(grid_frames, output_path, fps=cfg.fps)
 
                 print(f"\n{'='*60}")
                 print(f"Success! Objects: {result['num_objects']}")
