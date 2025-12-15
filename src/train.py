@@ -26,7 +26,7 @@ import sys
 # 添加vggt路径
 sys.path.append(os.path.join(os.path.dirname(__file__), 'vggt'))
 from vggt.vggt.models.vggt import VGGT
-from vggt.training.loss import camera_loss, depth_loss, point_loss, cross_render_and_loss, flow_loss, gt_flow_loss, gt_flow_loss_ours, self_render_and_loss, velocity_loss, sky_opacity_loss, sky_color_loss, vggt_distillation_loss, scale_loss, aggregator_render_loss, segment_loss
+from vggt.training.loss import camera_loss, depth_loss, point_loss, gt_flow_loss_ours, self_render_and_loss, velocity_loss, sky_opacity_loss, scale_loss, segment_loss
 from vggt.utils.auxiliary import RAFTCfg, calc_flow
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri, extri_intri_to_pose_encoding
 
@@ -484,81 +484,24 @@ def train(args):
                     'self_render_rgb_weight': getattr(args, 'self_render_rgb_weight', 1.0),
                     'self_render_lpips_weight': getattr(args, 'self_render_lpips_weight', 0.0),
                     'self_render_depth_weight': getattr(args, 'self_render_depth_weight', 0.0),
-                    'flow_loss_weight': getattr(args, 'flow_loss_weight', 1.0),
-                    'conf_flow_loss_weight': getattr(args, 'conf_flow_loss_weight', 1.0),  # GT flowmap conf损失
-                    'grad_flow_loss_weight': getattr(args, 'grad_flow_loss_weight', 1.0),  # GT flowmap grad损失
-                    'reg_flow_loss_weight': getattr(args, 'reg_flow_loss_weight', 1.0),   # GT flowmap reg损失
                     'gt_flow_loss_ours_weight': getattr(args, 'gt_flow_loss_ours_weight', 0.0),  # GT flowmap ours损失
                     'sky_opacity_weight': getattr(args, 'sky_opacity_weight', 1.0),
-                    'sky_color_weight': getattr(args, 'sky_color_weight', 1.0),
                     'velocity_reg_weight': getattr(args, 'velocity_reg_weight', 0.001),
-                    'vggt_distill_weight': getattr(args, 'vggt_distill_weight', 1.0),
                     'camera_loss_weight': getattr(args, 'camera_loss_weight', 1.0),
                     'conf_depth_loss_weight': getattr(args, 'conf_depth_loss_weight', 1.0),
                     'grad_depth_loss_weight': getattr(args, 'grad_depth_loss_weight', 1.0),
                     'reg_depth_loss_weight': getattr(args, 'reg_depth_loss_weight', 1.0),
                     'scale_loss_weight': getattr(args, 'scale_loss_weight', 1.0),
                     'segment_loss_weight': getattr(args, 'segment_loss_weight', 0.0),  # Segmentation loss
-                    'aggregator_render_rgb_weight': getattr(args, 'aggregator_render_rgb_weight', 1.0),
-                    'aggregator_render_depth_weight': getattr(args, 'aggregator_render_depth_weight', 1.0),
-                    'aggregator_render_lpips_weight': getattr(args, 'aggregator_render_lpips_weight', 0.0),
                     'aggregator_all_render_rgb_weight': getattr(args, 'aggregator_all_render_rgb_weight', 0.0),
                     'aggregator_all_render_depth_weight': getattr(args, 'aggregator_all_render_depth_weight', 0.0),
                     'aggregator_all_render_lpips_weight': getattr(args, 'aggregator_all_render_lpips_weight', 0.0),
                 }
 
-                # VGGT teacher predictions
-                # 只要teacher存在就执行替换，确保其他损失计算使用稳定的teacher预测值
-                teacher_preds = None
-                student_preds_original = None
-                if "vggt_teacher" in auxiliary_models and vggt_batch.get("images") is not None:
-                    try:
-                        with torch.no_grad():
-                            teacher_preds = auxiliary_models["vggt_teacher"](
-                                vggt_batch["images"],
-                                compute_sky_color_loss=False,
-                                sky_masks=vggt_batch.get("sky_masks"),
-                                gt_images=vggt_batch["images"],
-                            )
-
-                        # 保存原始student预测值用于蒸馏损失
-                        student_preds_original = {
-                            'depth': preds["depth"].clone() if preds.get("depth") is not None else None,
-                            'pose_enc': preds["pose_enc"].clone() if preds.get("pose_enc") is not None else None,
-                            'depth_conf': preds["depth_conf"].clone() if preds.get("depth_conf") is not None else None
-                        }
-
-                        # 强制替换：无论蒸馏权重如何，都使用teacher预测值进行其他损失计算
-                        # 这确保了即使unfreeze backbone时，其他损失仍使用稳定的预测值
-                        if teacher_preds.get("depth") is not None:
-                            preds["depth"] = teacher_preds["depth"]
-                        if teacher_preds.get("pose_enc") is not None:
-                            preds["pose_enc"] = teacher_preds["pose_enc"]
-                        if teacher_preds.get("depth_conf") is not None:
-                            preds["depth_conf"] = teacher_preds["depth_conf"]
-
-                    except Exception as e:
-                        print(f"Error in VGGT teacher inference: {e}")
-                        teacher_preds = None
-
-                # 计算光流（flow_loss需要）
+                # 计算光流（已删除flow_loss，不再需要）
                 interval = getattr(args, 'flow_interval', 2)
-                forward_flow = backward_flow = forward_consist_mask = backward_consist_mask = None
 
-                if loss_weights['flow_loss_weight'] > 0 and "flow" in auxiliary_models:
-                    try:
-                        forward_flow, backward_flow, _, _, forward_consist_mask, backward_consist_mask, _, _ = calc_flow(
-                            vggt_batch["images"], auxiliary_models["flow"],
-                            check_consistency=True,
-                            geo_thresh=auxiliary_models["flow"].args.geo_thresh,
-                            photo_thresh=auxiliary_models["flow"].args.photo_thresh,
-                            interval=interval,
-                            return_heatmap=True
-                        )
-                    except Exception as e:
-                        print(f"Error in optical flow computation: {e}")
-
-                # 1. Self Render Loss
+                # Self Render Loss
                 if loss_weights['self_render_weight'] > 0 and vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
                     try:
                         self_loss_dict, _ = self_render_and_loss(
@@ -581,56 +524,7 @@ def train(args):
                     except Exception as e:
                         print(f"Error in self render loss computation: {e}")
 
-                # 2. Flow Loss (训练velocity head)
-                if loss_weights['flow_loss_weight'] > 0 and forward_flow is not None and vggt_batch.get("images") is not None:
-                    try:
-                        conf = preds["depth_conf"] > 2
-                        flow_loss_dict = flow_loss(
-                            conf, interval, forward_flow, backward_flow,
-                            forward_consist_mask, backward_consist_mask,
-                            preds["depth"], preds["velocity"], preds["pose_enc"],
-                            vggt_batch["extrinsics"], vggt_batch["intrinsics"], vggt_batch["images"],
-                            vggt_batch
-                        )
-                        flow_loss_value = flow_loss_dict.get("forward_loss", 0.0)
-                        loss += loss_weights['flow_loss_weight'] * flow_loss_value
-                        loss_dict.update(flow_loss_dict)
-                    except Exception as e:
-                        print(f"Error in flow loss computation: {e}")
-
-                # 3. GT Flow Loss (直接使用GT flowmap监督velocity head)
-                # 返回三个损失：loss_conf_flow, loss_reg_flow, loss_grad_flow
-                if (loss_weights['conf_flow_loss_weight'] > 0 or
-                    loss_weights['grad_flow_loss_weight'] > 0 or
-                    loss_weights['reg_flow_loss_weight'] > 0) and \
-                   preds.get("velocity") is not None and \
-                   preds.get("velocity_conf") is not None and \
-                   vggt_batch.get("flowmap") is not None:
-                    try:
-                        gt_flow_loss_dict = gt_flow_loss(
-                            preds["velocity"],
-                            preds["velocity_conf"],
-                            vggt_batch,
-                            gradient_loss="grad",
-                            valid_range=0.98
-                        )
-
-                        # 分别计算三个损失
-                        conf_flow_loss = gt_flow_loss_dict.get("loss_conf_flow", 1.0)
-                        reg_flow_loss = gt_flow_loss_dict.get("loss_reg_flow", 1.0)
-                        grad_flow_loss = gt_flow_loss_dict.get("loss_grad_flow", 1.0)
-
-                        loss += loss_weights['conf_flow_loss_weight'] * conf_flow_loss
-                        loss += loss_weights['reg_flow_loss_weight'] * reg_flow_loss
-                        loss += loss_weights['grad_flow_loss_weight'] * grad_flow_loss
-
-                        loss_dict.update(gt_flow_loss_dict)
-                    except Exception as e:
-                        print(f"Error in GT flow loss computation: {e}")
-                        import traceback
-                        traceback.print_exc()
-
-                # 3b. GT Flow Loss Ours
+                # GT Flow Loss Ours
                 if loss_weights['gt_flow_loss_ours_weight'] > 0 and \
                    preds.get("velocity") is not None and \
                    vggt_batch.get("flowmap") is not None:
@@ -651,7 +545,7 @@ def train(args):
                         import traceback
                         traceback.print_exc()
 
-                # 4. Sky Opacity Loss (监督gaussian head的opacity参数)
+                # Sky Opacity Loss (监督gaussian head的opacity参数)
                 if loss_weights['sky_opacity_weight'] > 0 and preds.get("gaussian_params") is not None and sky_masks is not None:
                     try:
                         sky_opacity_loss_dict = sky_opacity_loss(
@@ -665,22 +559,7 @@ def train(args):
                     except Exception as e:
                         print(f"Error in sky opacity loss computation: {e}")
 
-                # 5. Sky Color Loss (监督sky token以及sky head学习)
-                if loss_weights['sky_color_weight'] > 0 and preds.get("pred_sky_colors") is not None and sky_masks is not None:
-                    try:
-                        sky_color_loss_dict = sky_color_loss(
-                            preds["pred_sky_colors"],
-                            vggt_batch["images"],
-                            sky_masks,
-                            weight=1.0
-                        )
-                        sky_color_loss_value = sky_color_loss_dict.get("sky_color_loss", 0.0)
-                        loss += loss_weights['sky_color_weight'] * sky_color_loss_value
-                        loss_dict.update(sky_color_loss_dict)
-                    except Exception as e:
-                        print(f"Error in sky color loss computation: {e}")
-
-                # 6. Velocity Regularization Loss (约束velocity值)
+                # Velocity Regularization Loss (约束velocity值)
                 if loss_weights['velocity_reg_weight'] > 0 and preds.get("velocity") is not None:
                     try:
                         velocity_loss_value = velocity_loss(preds["velocity"])
@@ -689,7 +568,7 @@ def train(args):
                     except Exception as e:
                         print(f"Error in velocity regularization loss computation: {e}")
 
-                # 6b. Segmentation Loss (监督segment head训练)
+                # Segmentation Loss (监督segment head训练)
                 if loss_weights['segment_loss_weight'] > 0 and preds.get("segment_logits") is not None and preds.get("segment_conf") is not None:
                     try:
                         segment_loss_dict = segment_loss(
@@ -703,30 +582,7 @@ def train(args):
                     except Exception as e:
                         print(f"Error in segmentation loss computation: {e}")
 
-                # 7. VGGT Distillation Loss (蒸馏损失，监督depth head、camera head等)
-                if loss_weights['vggt_distill_weight'] > 0 and teacher_preds is not None and student_preds_original is not None:
-                    try:
-                        # 构建原始student预测字典用于蒸馏损失计算
-                        student_preds_for_distill = preds.copy()
-                        # 使用原始student预测值进行蒸馏
-                        if student_preds_original['depth'] is not None:
-                            student_preds_for_distill['depth'] = student_preds_original['depth']
-                        if student_preds_original['pose_enc'] is not None:
-                            student_preds_for_distill['pose_enc'] = student_preds_original['pose_enc']
-                        if student_preds_original['depth_conf'] is not None:
-                            student_preds_for_distill['depth_conf'] = student_preds_original['depth_conf']
-
-                        distill_loss_dict = vggt_distillation_loss(
-                            student_preds=student_preds_for_distill,
-                            teacher_preds=teacher_preds
-                        )
-                        distill_loss_value = distill_loss_dict.get("loss_distillation", 0.0)
-                        loss += loss_weights['vggt_distill_weight'] * distill_loss_value
-                        loss_dict.update(distill_loss_dict)
-                    except Exception as e:
-                        print(f"Error in VGGT distillation loss computation: {e}")
-
-                # 8. Camera Loss (监督camera head训练)
+                # Camera Loss (监督camera head训练)
                 if loss_weights['camera_loss_weight'] > 0 and preds.get("pose_enc") is not None and vggt_batch.get("extrinsics") is not None and vggt_batch.get("intrinsics") is not None:
                     try:
                         camera_loss_dict = camera_loss(
@@ -739,7 +595,7 @@ def train(args):
                     except Exception as e:
                         print(f"Error in camera loss computation: {e}")
 
-                # 9. Depth Loss (监督depth head训练)
+                # Depth Loss (监督depth head训练)
                 if loss_weights['conf_depth_loss_weight'] > 0 and preds.get("depth") is not None and preds.get("depth_conf") is not None and vggt_batch.get("depths") is not None:
                     try:
                         depth_loss_dict = depth_loss(
@@ -757,7 +613,7 @@ def train(args):
                     except Exception as e:
                         print(f"Error in depth loss computation: {e}")
 
-                # 10. Scale Loss (监督scale head训练，使用depth_scale_factor作为GT)
+                # Scale Loss (监督scale head训练，使用depth_scale_factor作为GT)
                 if loss_weights['scale_loss_weight'] > 0 and preds.get("scale") is not None and vggt_batch.get("depth_scale_factor") is not None:
                     try:
                         scale_loss_dict = scale_loss(
@@ -770,62 +626,7 @@ def train(args):
                     except Exception as e:
                         print(f"Error in scale loss computation: {e}")
 
-                # 11. Aggregator Render Loss (监督gaussian_head，辅助监督depth和velocity)
-                if (loss_weights['aggregator_render_rgb_weight'] > 0 or
-                    loss_weights['aggregator_render_depth_weight'] > 0 or
-                    loss_weights['aggregator_render_lpips_weight'] > 0) and \
-                   preds.get("gaussian_params") is not None and \
-                   preds.get("depth") is not None and \
-                   preds.get("velocity") is not None and \
-                   vggt_batch.get("depth_scale_factor") is not None:
-                    try:
-                        # Get sky masks if available
-                        sky_masks = vggt_batch.get("sky_masks")  # [B, S, H, W]
-
-                        # Get voxel size from config
-                        voxel_size = getattr(args, 'aggregator_voxel_size', 0.05)
-
-                        # Get GT scale factor
-                        gt_scale_factor = vggt_batch["depth_scale_factor"]
-
-                        # Get pre-computed sky colors and sampled frame indices from model forward
-                        sky_colors = preds.get("sky_colors")  # [B, num_frames, 3, H, W] or None
-                        sampled_frame_indices = preds.get("sampled_frame_indices")  # list or None
-
-                        # Compute aggregator render loss
-                        aggregator_loss_dict = aggregator_render_loss(
-                            gaussian_params=preds["gaussian_params"],
-                            depth=preds["depth"],
-                            velocity=preds["velocity"],  # velocity不参与梯度计算
-                            sky_masks=sky_masks,
-                            gt_extrinsic=vggt_batch["extrinsics"],
-                            gt_intrinsic=vggt_batch["intrinsics"],
-                            gt_rgb=vggt_batch["images"],
-                            gt_depth=vggt_batch["depths"],
-                            gt_depth_mask=vggt_batch.get("point_masks"),
-                            voxel_size=voxel_size,
-                            gt_scale=gt_scale_factor,
-                            sky_colors=sky_colors,
-                            sampled_frame_indices=sampled_frame_indices,
-                            use_lpips=(loss_weights['aggregator_render_lpips_weight'] > 0),
-                            dynamic_threshold=getattr(args, 'aggregator_dynamic_threshold', 0.1)
-                        )
-
-                        # Add weighted losses
-                        if aggregator_loss_dict.get("aggregator_render_rgb_loss") is not None:
-                            loss += loss_weights['aggregator_render_rgb_weight'] * aggregator_loss_dict["aggregator_render_rgb_loss"]
-                        if aggregator_loss_dict.get("aggregator_render_depth_loss") is not None:
-                            loss += loss_weights['aggregator_render_depth_weight'] * aggregator_loss_dict["aggregator_render_depth_loss"]
-                        if aggregator_loss_dict.get("aggregator_render_lpips_loss") is not None:
-                            loss += loss_weights['aggregator_render_lpips_weight'] * aggregator_loss_dict["aggregator_render_lpips_loss"]
-
-                        loss_dict.update(aggregator_loss_dict)
-                    except Exception as e:
-                        print(f"Error in aggregator render loss computation: {e}")
-                        import traceback
-                        traceback.print_exc()
-
-                # 12. Aggregator_all Render Loss (代替Stage2 refine网络的渲染loss)
+                # Aggregator_all Render Loss (代替Stage2 refine网络的渲染loss)
                 # 这个loss直接在Stage1中使用动态物体处理+渲染监督,跳过Stage2的refine网络
                 aggregator_all_rgb_weight = loss_weights.get('aggregator_all_render_rgb_weight', 0.0)
                 aggregator_all_depth_weight = loss_weights.get('aggregator_all_render_depth_weight', 0.0)
