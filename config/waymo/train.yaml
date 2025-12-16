@@ -1,7 +1,7 @@
 # Stage 1 Online Training Configuration for VGGT
 # 第一阶段在线训练配置 - 包含统一的损失权重管理
 
-# debug: true
+debug: true
 
 # =============== 模型配置 ===============
 model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=0, use_gs_head=True, use_gs_head_velocity=True, use_gs_head_segment=False, use_gt_camera=True, velocity_head_small_init=False)"
@@ -35,8 +35,8 @@ vggt_freeze_strategy: "none"
 
 # =============== 辅助模型配置 ===============
 auxiliary_models:
-  # DAM2模型 (用于生成sky masks)
-  dam2: DepthAnythingV2(encoder="vitb", offload=${offload_auxiliary})
+  # # DAM2模型 (用于生成sky masks)
+  # dam2: DepthAnythingV2(encoder="vitb", offload=${offload_auxiliary})
 
 offload_auxiliary: False
 

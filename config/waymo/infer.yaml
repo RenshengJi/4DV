@@ -56,7 +56,7 @@ tracking_position_threshold: 2.0  # 位置匹配阈值 (米)
 tracking_velocity_threshold: 0.2  # 速度匹配阈值 (m/s)
 
 # =============== 输出配置 ===============
-output_dir: "./results/seperate"
+output_dir: "./results/test_new"
 output_prefix: "waymo_train"        # 输出文件名前缀
 continue_on_error: true          # 遇到错误时继续处理下一个样本
 

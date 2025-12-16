@@ -211,11 +211,16 @@ class WaymoDataset(BaseDataset):
                 segment_label[raw_labels == 4] = 2  # sign
                 segment_label[(raw_labels == 3) | (raw_labels == 5)] = 3  # pedestrian + cyclist
 
+            # Extract sky mask from semantic segmentation
+            sky_mask = None
+            if seg_mask is not None:
+                sky_color = np.array([70, 130, 180])
+                sky_mask = np.all(seg_mask == sky_color, axis=-1).astype(np.float32)  # [H, W]
+
             # Apply semantic segmentation to zero out velocity on road and sidewalk
             if self.zero_ground_velocity and seg_mask is not None and flowmap is not None:
-                # Cityscapes color palette (BGR format from imread_cv2)
-                road_color = np.array([128, 64, 128])[::-1]
-                sidewalk_color = np.array([244, 35, 232])[::-1]
+                road_color = np.array([128, 64, 128])
+                sidewalk_color = np.array([244, 35, 232])
 
                 road_mask = np.all(seg_mask == road_color, axis=-1)
                 sidewalk_mask = np.all(seg_mask == sidewalk_color, axis=-1)
@@ -268,6 +273,11 @@ class WaymoDataset(BaseDataset):
             else:
                 segment_mask_tensor = None
 
+            if sky_mask is not None:
+                sky_mask_tensor = torch.from_numpy(sky_mask).float()
+            else:
+                sky_mask_tensor = None
+
             # Construct view dictionary in VGGT format
             view_dict = dict(
                 idx=(idx, 0, v),
@@ -293,6 +303,8 @@ class WaymoDataset(BaseDataset):
                 view_dict["segment_label"] = segment_label_tensor
             if segment_mask_tensor is not None:
                 view_dict["segment_mask"] = segment_mask_tensor
+            if sky_mask_tensor is not None:
+                view_dict["sky_mask"] = sky_mask_tensor
 
             views.append(view_dict)
 
@@ -312,7 +324,9 @@ class WaymoDataset(BaseDataset):
             view['pts3d'] = pts3d_cam0.reshape(H, W, 3)
 
             cam_pose = view['camera_pose']
-            view['camera_pose'] = torch.matmul(first_cam_pose_inv, cam_pose)
+            # Compute cam0 to cam: inv(cam_to_cam0) = inv(world_to_cam0 @ cam_to_world)
+            cam_to_cam0 = torch.matmul(first_cam_pose_inv, cam_pose)
+            view['camera_pose'] = torch.linalg.inv(cam_to_cam0)
 
         # ============ Depth scale normalization (make non-metric) ============
 

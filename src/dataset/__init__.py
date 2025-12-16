@@ -36,6 +36,7 @@ def vggt_collate_fn(batch):
         - flowmap: [B, S, H, W, C] (optional)
         - segment_label: [B, S, H, W] (optional)
         - segment_mask: [B, S, H, W] (optional)
+        - sky_masks: [B, S, H, W] (optional)
         - depth_scale_factor: [B] (optional)
     """
     # batch is a list of samples
@@ -54,7 +55,7 @@ def vggt_collate_fn(batch):
     tensor_keys = {
         'img', 'depthmap', 'camera_intrinsics', 'camera_pose',
         'valid_mask', 'pts3d', 'flowmap', 'segment_label',
-        'segment_mask', 'depth_scale_factor'
+        'segment_mask', 'depth_scale_factor', 'sky_mask'
     }
 
     # Keys to skip (metadata)
@@ -108,6 +109,7 @@ def vggt_collate_fn(batch):
         'segment_label': output.get('segment_label'),
         'segment_mask': output.get('segment_mask'),
         'depth_scale_factor': output.get('depth_scale_factor'),
+        'sky_masks': output.get('sky_mask'),
     }
 
     return vggt_batch

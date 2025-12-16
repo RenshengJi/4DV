@@ -326,65 +326,6 @@ def train(args):
                 except Exception as e:
                     printer.warning(f"Failed to load DAM2 model {model_name}: {e}")
                     printer.info("Skipping DAM2 model loading due to error")
-            # 检查是否是VGGT teacher模型
-            elif "VGGT" in model_config:
-                try:
-                    # 解析VGGT配置
-                    path_match = re.search(r"path\s*=\s*\"([^\"]+)\"", model_config)
-                    offload_match = re.search(r"offload\s*=\s*(\"True\"|False)\b", model_config, re.IGNORECASE)
-                    
-                    if path_match:
-                        ckpt_path = path_match.group(1)
-                        offload = offload_match.group(1).lower() == "true" if offload_match else False
-                        
-                        # 构建VGGT teacher模型
-                        teacher_model = VGGT(img_size=518, patch_size=14, embed_dim=1024, use_sky_token=False)
-                        
-                        # 加载checkpoint
-                        state_dict = torch.load(ckpt_path, map_location="cpu" if offload else device)
-                        if "model" in state_dict:
-                            state_dict = state_dict["model"]
-                        state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-                        
-                        missing_keys, unexpected_keys = teacher_model.load_state_dict(state_dict, strict=False)
-                        printer.info(f"Unexpected key numbers in VGGT teacher {model_name}: {len(unexpected_keys)}")
-                        printer.info(f"Missing key numbers in VGGT teacher {model_name}: {len(missing_keys)}")
-                        
-                        if not offload:
-                            teacher_model.to(device)
-                        
-                        teacher_model.eval()
-                        teacher_model.requires_grad_(False)
-                        
-                        auxiliary_models[model_name] = teacher_model
-                        printer.info(f"successfully load VGGT teacher model: {model_name}")
-                    else:
-                        printer.warning(f"Missing path for VGGT teacher model: {model_name}")
-                except Exception as e:
-                    printer.warning(f"Failed to load VGGT teacher model {model_name}: {e}")
-                    printer.info("Skipping VGGT teacher model loading due to error")
-            else:
-                # 原有的RAFT模型加载逻辑
-                auxiliary_model = eval(model_config)
-                offload_match = re.search(r"offload\s*=\s*(\"True\"|False)\b", model_config, re.IGNORECASE)
-                if offload_match:
-                    offload = offload_match.group(1).lower() == "true"
-                else:
-                    offload = False
-                if not offload:
-                    auxiliary_model.to(device)
-                # capture the model checkpoint path from the config string
-                model_ckpt_match = re.search(r"path\s*=\s*\"([^\"]+)\"", model_config)
-                if model_ckpt_match:
-                    model_ckpt = model_ckpt_match.group(1)
-                    state_dict = torch.load(model_ckpt, map_location="cpu" if offload else device, weights_only=True)
-                    missing_keys, unexpected_keys = auxiliary_model.load_state_dict(state_dict, strict=False)
-                    printer.info(f"Unexpected key numbers in {model_name}: {len(unexpected_keys)}")
-                    printer.info(f"Missing key numbers in {model_name}: {len(missing_keys)}")
-                auxiliary_model.eval()
-                auxiliary_model.requires_grad_(False)
-                auxiliary_models[model_name] = auxiliary_model
-                printer.info(f"successfully load auxiliary model: {model_name}")
 
 
 
@@ -446,24 +387,11 @@ def train(args):
         metric_logger = misc.MetricLogger(delimiter="	")
         header = f"Epoch: [{epoch}]"
         optimizer.zero_grad()
-        for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader_train, args.print_freq, accelerator, header)):
+        for data_iter_step, vggt_batch in enumerate(metric_logger.log_every(data_loader_train, args.print_freq, accelerator, header)):
             with accelerator.accumulate(model):
                 epoch_f = epoch + data_iter_step / len(data_loader_train)
                 if data_iter_step % args.accum_iter == 0:
                     misc.adjust_learning_rate(optimizer, epoch_f, args)
-                # batch is already in VGGT format from the dataset
-                vggt_batch = batch
-
-                # 初始化sky_masks
-                sky_masks = None
-                if "dam2" in auxiliary_models and vggt_batch.get("images") is not None:
-                    sky_masks = dam2_sky_mask_generation(
-                        vggt_batch["images"], 
-                        auxiliary_models["dam2"],
-                        device=device
-                    )
-                # 将sky masks添加到vggt_batch中，供后续使用
-                vggt_batch["sky_masks"] = sky_masks
 
                 # For VGGT model
                 frame_sample_ratio = getattr(args, 'aggregator_frame_sample_ratio', 1.0)
@@ -546,11 +474,11 @@ def train(args):
                         traceback.print_exc()
 
                 # Sky Opacity Loss (监督gaussian head的opacity参数)
-                if loss_weights['sky_opacity_weight'] > 0 and preds.get("gaussian_params") is not None and sky_masks is not None:
+                if loss_weights['sky_opacity_weight'] > 0 and preds.get("gaussian_params") is not None and vggt_batch.get("sky_masks") is not None:
                     try:
                         sky_opacity_loss_dict = sky_opacity_loss(
                             preds["gaussian_params"],
-                            sky_masks,
+                            vggt_batch["sky_masks"],
                             weight=1.0
                         )
                         sky_opacity_loss_value = sky_opacity_loss_dict.get("sky_opacity_loss", 0.0)
@@ -832,59 +760,6 @@ def build_dataset(dataset, batch_size, num_workers, accelerator, test=False, fix
         fixed_length=fixed_length
     )
     return loader
-
-
-def dam2_sky_mask_generation(images, dam2_model, device):
-    """
-    Generate sky masks using DAM2 depth predictions.
-    
-    Args:
-        images: [B, S, 3, H, W] - input images in range [0, 1]
-        dam2_model: DepthAnythingV2 model instance
-        device: torch device
-    
-    Returns:
-        torch.Tensor: [B, S, H, W] - sky masks where 1 indicates sky (depth=0) regions
-    """
-    B, S, C, H, W = images.shape
-    sky_masks = torch.zeros(B, S, H, W, device=device)
-    
-    with torch.no_grad():
-        for b in range(B):
-            for s in range(S):
-                # 获取单张图片
-                img = images[b, s]  # [3, H, W]
-                
-                # 转换为numpy格式用于DAM2推理
-                img_np = (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-                img_np = np.clip(img_np, 0, 255)
-                
-                # 使用DAM2预测深度
-                depth = dam2_model.infer_image(img_np, input_size=518)
-                
-                # 将深度转换为tensor
-                depth_tensor = torch.from_numpy(depth).to(device)
-                
-                # 调整深度图尺寸以匹配原图
-                if depth_tensor.shape != (H, W):
-                    depth_tensor = F.interpolate(
-                        depth_tensor.unsqueeze(0).unsqueeze(0), 
-                        size=(H, W), 
-                        mode='bilinear', 
-                        align_corners=True
-                    ).squeeze(0).squeeze(0)
-                
-                # 生成sky mask：深度值接近0的区域被认为是天空
-                # 使用阈值来识别深度为0的区域
-                depth_threshold = 0.1  # 可以根据需要调整阈值
-                sky_mask = (depth_tensor < depth_threshold).float()
-                
-                # 可选：使用形态学操作来平滑mask
-                # 这里可以添加开运算和闭运算来改善mask质量
-                
-                sky_masks[b, s] = sky_mask
-    
-    return sky_masks
 
 
 @hydra.main(
