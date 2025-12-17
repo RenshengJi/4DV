@@ -35,14 +35,19 @@ def create_dynamic_mask_from_pixel_indices(
 ) -> torch.Tensor:
     """
     从动态物体的2D pixel indices创建dynamic mask
+    支持单相机和多相机模式
 
     Args:
         dynamic_objects: 动态物体列表，每个包含frame_pixel_indices
-        frame_idx: 当前帧索引
+        frame_idx: 当前时间帧索引
         height, width: 图像尺寸
 
     Returns:
         mask: [H, W] 布尔mask，True表示动态区域
+
+    Note:
+        单相机: frame_pixel_indices = {frame_idx: [pixel1, pixel2, ...]}
+        多相机: frame_pixel_indices = {frame_idx: {view_idx: [pixel1, pixel2, ...]}}
     """
     # 使用第一个物体的device（假设所有物体在同一device上）
     device = None
@@ -62,8 +67,30 @@ def create_dynamic_mask_from_pixel_indices(
         if frame_idx not in frame_pixel_indices:
             continue
 
-        pixel_indices = frame_pixel_indices[frame_idx]
-        if not pixel_indices:
+        pixel_data = frame_pixel_indices[frame_idx]
+        if not pixel_data:
+            continue
+
+        # ========== 检查数据格式：单相机(list)或多相机(dict) ==========
+        if isinstance(pixel_data, dict):
+            # ========== 多相机模式: {view_idx: [pixel_idx, ...]} ==========
+            # 合并所有view的pixel indices
+            all_pixel_indices = []
+            for view_idx, view_pixels in pixel_data.items():
+                if view_pixels:
+                    all_pixel_indices.extend(view_pixels)
+
+            if not all_pixel_indices:
+                continue
+
+            pixel_indices = all_pixel_indices
+
+        elif isinstance(pixel_data, list):
+            # ========== 单相机模式: [pixel_idx, ...] ==========
+            pixel_indices = pixel_data
+
+        else:
+            # 未知格式，跳过
             continue
 
         # 将1D pixel indices (0 to H*W-1) 转换为2D坐标 (v, u)
@@ -634,7 +661,9 @@ class Stage2CompleteLoss(nn.Module):
         sky_masks: Optional[torch.Tensor] = None,
         sky_colors: Optional[torch.Tensor] = None,
         sampled_frame_indices: Optional[torch.Tensor] = None,
-        depth_scale_factor: Optional[torch.Tensor] = None
+        depth_scale_factor: Optional[torch.Tensor] = None,
+        camera_indices: Optional[torch.Tensor] = None,
+        frame_indices: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
         计算第二阶段的完整损失
@@ -650,6 +679,8 @@ class Stage2CompleteLoss(nn.Module):
             sky_colors: [B, num_frames, 3, H, W] 天空颜色
             sampled_frame_indices: [num_frames] 采样帧索引
             depth_scale_factor: 深度缩放因子，用于voxel pruning
+            camera_indices: [B, S_total] 相机索引，用于多相机模式
+            frame_indices: [B, S_total] 帧索引，用于多相机模式
 
         Returns:
             complete_loss_dict: 完整损失字典

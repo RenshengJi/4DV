@@ -21,13 +21,14 @@ Waymo_Multi = WaymoDataset
 def vggt_collate_fn(batch):
     """
     Custom collate function for VGGT format data.
+    Supports both single-camera and multi-camera modes.
 
     Args:
         batch: List of samples, where each sample is a list of view dicts
 
     Returns:
         Dict with batched tensors in VGGT format:
-        - images: [B, S, 3, H, W]
+        - images: [B, S, 3, H, W] (or [B, C*S, 3, H, W] in multi-camera mode)
         - depths: [B, S, H, W]
         - intrinsics: [B, S, 3, 3]
         - extrinsics: [B, S, 4, 4]
@@ -38,6 +39,8 @@ def vggt_collate_fn(batch):
         - segment_mask: [B, S, H, W] (optional)
         - sky_masks: [B, S, H, W] (optional)
         - depth_scale_factor: [B] (optional)
+        - camera_indices: [B, S] (optional, multi-camera mode)
+        - frame_indices: [B, S] (optional, multi-camera mode)
     """
     # batch is a list of samples
     # Each sample is a list of view dicts
@@ -60,7 +63,8 @@ def vggt_collate_fn(batch):
 
     # Keys to skip (metadata)
     skip_keys = {'idx', 'dataset', 'label', 'instance', 'is_video',
-                 'is_metric', 'quantile', 'rng', 'true_shape', 'ray_map'}
+                 'is_metric', 'quantile', 'rng', 'true_shape', 'ray_map',
+                 'camera_idx', 'frame_idx'}  # Skip camera_idx and frame_idx from tensor_keys
 
     for key in sample_keys:
         if key in skip_keys:
@@ -97,6 +101,27 @@ def vggt_collate_fn(batch):
             print(f"Error stacking key {key}: {e}")
             output[key] = None
 
+    # ========== Extract camera_indices and frame_indices for multi-camera mode ==========
+    # Check if the first view of the first sample has camera_idx and frame_idx fields
+    if 'camera_idx' in batch[0][0] and 'frame_idx' in batch[0][0]:
+        # Multi-camera mode: extract indices
+        camera_indices_list = []
+        frame_indices_list = []
+
+        for sample in batch:
+            sample_camera_indices = [view['camera_idx'] for view in sample]
+            sample_frame_indices = [view['frame_idx'] for view in sample]
+
+            camera_indices_list.append(torch.tensor(sample_camera_indices, dtype=torch.long))
+            frame_indices_list.append(torch.tensor(sample_frame_indices, dtype=torch.long))
+
+        output['camera_indices'] = torch.stack(camera_indices_list, dim=0)  # [B, S] or [B, C*S]
+        output['frame_indices'] = torch.stack(frame_indices_list, dim=0)    # [B, S] or [B, C*S]
+    else:
+        # Single-camera mode: no camera indices
+        output['camera_indices'] = None
+        output['frame_indices'] = None
+
     # Rename keys to match VGGT format
     vggt_batch = {
         'images': output.get('img'),
@@ -110,6 +135,8 @@ def vggt_collate_fn(batch):
         'segment_mask': output.get('segment_mask'),
         'depth_scale_factor': output.get('depth_scale_factor'),
         'sky_masks': output.get('sky_mask'),
+        'camera_indices': output.get('camera_indices'),  # New field
+        'frame_indices': output.get('frame_indices'),    # New field
     }
 
     return vggt_batch

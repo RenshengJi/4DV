@@ -831,42 +831,124 @@ class OnlineDynamicProcessor:
         preds: Dict[str, Any],
         vggt_batch: Dict[str, Any]
     ) -> List[Dict]:
-        """使用demo_video_with_pointcloud_save.py中的聚类方法"""
+        """
+        使用demo_video_with_pointcloud_save.py中的聚类方法
+        支持单相机和多相机模式
+
+        单相机模式: 对每一帧独立聚类 (S帧)
+        多相机模式: 按时间帧分组,将同一时刻所有相机的点云合并后聚类 (S帧,每帧包含C个相机的合并点云)
+        """
         try:
             # 从preds获取批次维度信息（已在vggt.py的forward中保存）
             batch_dims = preds['batch_dims']
             B = batch_dims['B']
-            S = batch_dims['S']
+            S = batch_dims['S']  # 单相机:S帧, 多相机:C*S个views
             H = batch_dims['H']
             W = batch_dims['W']
 
             # 获取xyz_camera（已在vggt.py中计算）
-            xyz_camera = preds['xyz_camera']  # [B, S, H*W, 3]
-            xyz = xyz_camera[0]  # [S, H*W, 3]
+            xyz_camera = preds['xyz_camera']  # [B, S, H*W, 3] or [B, C*S, H*W, 3]
+            xyz = xyz_camera[0]  # [S, H*W, 3] or [C*S, H*W, 3]
 
             # 获取velocity_global（已在vggt.py中计算并转换到全局坐标系）
-            velocity_global = preds['velocity_global']  # [B, S, H, W, 3] or [B, S, H*W, 3]
-            velocity_reshaped = velocity_global[0]  # [S, H, W, 3] or [S, H*W, 3]
+            velocity_global = preds['velocity_global']  # [B, S, H, W, 3] or [B, C*S, H, W, 3]
+            velocity_reshaped = velocity_global[0]  # [S, H, W, 3] or [C*S, H, W, 3]
 
-            # 统一为 [S, H*W, 3] 格式
-            if velocity_reshaped.ndim == 4:  # [S, H, W, 3]
-                velocity_reshaped = velocity_reshaped.reshape(S, H * W, 3)
+            # 统一为 [S, H*W, 3] 或 [C*S, H*W, 3] 格式
+            if velocity_reshaped.ndim == 4:  # [S, H, W, 3] or [C*S, H, W, 3]
+                S_total = velocity_reshaped.shape[0]
+                velocity_reshaped = velocity_reshaped.reshape(S_total, H * W, 3)
 
             # 获取gt_scale用于将velocity转换到metric尺度
             gt_scale = vggt_batch.get('depth_scale_factor', 1.0)
             if isinstance(gt_scale, torch.Tensor):
                 gt_scale = gt_scale[0] if gt_scale.ndim > 0 else gt_scale
 
-            # 使用直接定义的动态物体聚类函数
-            clustering_results = dynamic_object_clustering(
-                xyz,  # [S, H*W, 3] - 保留梯度
-                velocity_reshaped,  # [S, H*W, 3] - 保留梯度
-                velocity_threshold=self.velocity_threshold,  # 速度阈值(metric尺度, m/s)
-                eps=self.clustering_eps,  # DBSCAN的邻域半径
-                min_samples=self.clustering_min_samples,  # DBSCAN的最小样本数
-                area_threshold=self.min_object_size,  # 面积阈值
-                gt_scale=gt_scale  # GT scale factor
-            )
+            # ========== 检查是否为多相机模式 ==========
+            camera_indices = vggt_batch.get('camera_indices')  # [B, S_total] or None
+            frame_indices = vggt_batch.get('frame_indices')    # [B, S_total] or None
+
+            is_multi_camera = (camera_indices is not None and frame_indices is not None)
+
+            if is_multi_camera:
+                # ========== 多相机模式: 按时间帧分组聚类 ==========
+                cam_idx = camera_indices[0]  # [S_total] - 每个view的相机索引
+                frm_idx = frame_indices[0]   # [S_total] - 每个view的时间帧索引
+
+                # 找出总共有多少个时间帧
+                num_frames = int(frm_idx.max().item()) + 1
+
+                clustering_results = []
+
+                for t in range(num_frames):
+                    # 找到时刻t的所有view索引
+                    mask_t = (frm_idx == t)
+                    view_indices_t = torch.where(mask_t)[0]
+
+                    if len(view_indices_t) == 0:
+                        # 该时刻没有view (理论上不应该发生)
+                        _print_main(f"⚠️  警告: 时间帧{t}没有找到任何view")
+                        clustering_results.append({
+                            'points': torch.empty(0, 3, device=xyz.device),
+                            'labels': torch.empty(0, dtype=torch.long),
+                            'num_clusters': 0,
+                            'cluster_centers': [],
+                            'cluster_velocities': [],
+                            'cluster_sizes': [],
+                            'cluster_indices': []
+                        })
+                        continue
+
+                    # 合并该时刻所有相机的点云和速度
+                    xyz_list = []
+                    velocity_list = []
+                    view_point_ranges = []  # [(view_idx, start_idx, end_idx), ...]
+
+                    offset = 0
+                    for view_idx in view_indices_t:
+                        view_idx_int = int(view_idx.item())
+                        view_xyz = xyz[view_idx_int]  # [H*W, 3]
+                        view_velocity = velocity_reshaped[view_idx_int]  # [H*W, 3]
+
+                        xyz_list.append(view_xyz)
+                        velocity_list.append(view_velocity)
+
+                        start_idx = offset
+                        end_idx = offset + len(view_xyz)
+                        view_point_ranges.append((view_idx_int, start_idx, end_idx))
+                        offset = end_idx
+
+                    # 合并点云
+                    merged_xyz = torch.cat(xyz_list, dim=0)  # [N_total, 3]
+                    merged_velocity = torch.cat(velocity_list, dim=0)  # [N_total, 3]
+
+                    # 对合并后的点云进行聚类 (输入格式需要是[1, N, 3])
+                    frame_clustering = dynamic_object_clustering(
+                        merged_xyz.unsqueeze(0),  # [1, N_total, 3]
+                        merged_velocity.unsqueeze(0),  # [1, N_total, 3]
+                        velocity_threshold=self.velocity_threshold,
+                        eps=self.clustering_eps,
+                        min_samples=self.clustering_min_samples,
+                        area_threshold=self.min_object_size,
+                        gt_scale=gt_scale
+                    )[0]  # 取第一帧的结果
+
+                    # 保存view_point_ranges用于后续索引映射
+                    frame_clustering['view_point_ranges'] = view_point_ranges
+
+                    clustering_results.append(frame_clustering)
+
+            else:
+                # ========== 单相机模式: 直接使用原有逻辑 ==========
+                clustering_results = dynamic_object_clustering(
+                    xyz,  # [S, H*W, 3] - 保留梯度
+                    velocity_reshaped,  # [S, H*W, 3] - 保留梯度
+                    velocity_threshold=self.velocity_threshold,  # 速度阈值(metric尺度, m/s)
+                    eps=self.clustering_eps,  # DBSCAN的邻域半径
+                    min_samples=self.clustering_min_samples,  # DBSCAN的最小样本数
+                    area_threshold=self.min_object_size,  # 面积阈值
+                    gt_scale=gt_scale  # GT scale factor
+                )
 
             return clustering_results
 
@@ -1028,6 +1110,7 @@ class OnlineDynamicProcessor:
     ) -> List[Dict]:
         """
         提取行人物体的每帧Gaussians（不进行聚合）
+        支持单相机和多相机模式
 
         对于行人，我们不使用刚体假设，因此不进行跨帧聚合。
         而是直接提取每帧中该物体的Gaussian参数。
@@ -1050,8 +1133,8 @@ class OnlineDynamicProcessor:
         W = batch_dims['W']
         S = batch_dims['S']
 
-        # 获取gaussian参数 [B, S, H, W, gaussian_output_dim]
-        gaussian_params = preds['gaussian_params'][0]  # [S, H, W, gaussian_output_dim]
+        # 获取gaussian参数 [B, S, H, W, gaussian_output_dim] or [B, C*S, H, W, gaussian_output_dim]
+        gaussian_params = preds['gaussian_params'][0]  # [S, H, W, gaussian_output_dim] or [C*S, H, W, gaussian_output_dim]
 
         # 获取所有全局物体ID
         all_global_ids = set()
@@ -1092,23 +1175,70 @@ class OnlineDynamicProcessor:
                 # 记录该物体在当前帧存在
                 object_frames.append(frame_idx)
 
-                # 将pixel_indices转换为2D坐标
-                pixel_indices_tensor = torch.tensor(pixel_indices, dtype=torch.long, device=self.device)
-                v_coords = pixel_indices_tensor // W  # 行坐标
-                u_coords = pixel_indices_tensor % W   # 列坐标
+                # ========== 检查是否为多相机模式 ==========
+                view_point_ranges = result.get('view_point_ranges')  # [(view_idx, start, end), ...]
 
-                # 过滤在图像范围内的坐标
-                valid = (v_coords >= 0) & (v_coords < H) & (u_coords >= 0) & (u_coords < W)
-                v_valid = v_coords[valid]
-                u_valid = u_coords[valid]
+                if view_point_ranges is not None:
+                    # ========== 多相机模式: 需要索引映射 ==========
+                    # pixel_indices是合并后的全局索引，需要映射回(view_idx, local_pixel_idx)
+                    object_gaussians_list = []
+                    frame_pixel_indices_dict = {}  # {view_idx: [local_pixel_idx, ...]}
 
-                # 提取当前帧该物体的Gaussian参数
-                frame_gaussian_params = gaussian_params[frame_idx]  # [H, W, gaussian_output_dim]
-                object_gaussians = frame_gaussian_params[v_valid, u_valid]  # [N_points, gaussian_output_dim]
+                    for global_idx in pixel_indices:
+                        # 找到该全局索引属于哪个view
+                        view_idx = None
+                        local_idx = None
+
+                        for v_idx, start, end in view_point_ranges:
+                            if start <= global_idx < end:
+                                view_idx = v_idx
+                                local_idx = global_idx - start
+                                break
+
+                        if view_idx is None:
+                            continue  # 索引超出范围，跳过
+
+                        # 从对应view提取gaussian参数
+                        v_coord = local_idx // W
+                        u_coord = local_idx % W
+
+                        if v_coord >= H or u_coord >= W:
+                            continue  # 坐标超出范围
+
+                        gaussian = gaussian_params[view_idx, v_coord, u_coord]
+                        object_gaussians_list.append(gaussian)
+
+                        # 记录该view的像素索引
+                        if view_idx not in frame_pixel_indices_dict:
+                            frame_pixel_indices_dict[view_idx] = []
+                        frame_pixel_indices_dict[view_idx].append(local_idx)
+
+                    if len(object_gaussians_list) == 0:
+                        continue  # 没有有效的gaussians
+
+                    object_gaussians = torch.stack(object_gaussians_list, dim=0)
+                    frame_pixel_indices[frame_idx] = frame_pixel_indices_dict  # 多相机: dict格式
+
+                else:
+                    # ========== 单相机模式: 原有逻辑 ==========
+                    # 将pixel_indices转换为2D坐标
+                    pixel_indices_tensor = torch.tensor(pixel_indices, dtype=torch.long, device=self.device)
+                    v_coords = pixel_indices_tensor // W  # 行坐标
+                    u_coords = pixel_indices_tensor % W   # 列坐标
+
+                    # 过滤在图像范围内的坐标
+                    valid = (v_coords >= 0) & (v_coords < H) & (u_coords >= 0) & (u_coords < W)
+                    v_valid = v_coords[valid]
+                    u_valid = u_coords[valid]
+
+                    # 提取当前帧该物体的Gaussian参数
+                    frame_gaussian_params = gaussian_params[frame_idx]  # [H, W, gaussian_output_dim]
+                    object_gaussians = frame_gaussian_params[v_valid, u_valid]  # [N_points, gaussian_output_dim]
+
+                    frame_pixel_indices[frame_idx] = pixel_indices  # 单相机: list格式
 
                 # 存储该帧的Gaussians
                 frame_gaussians[frame_idx] = object_gaussians
-                frame_pixel_indices[frame_idx] = pixel_indices
 
             if not object_frames:
                 continue
@@ -1123,7 +1253,7 @@ class OnlineDynamicProcessor:
             people_objects.append({
                 'object_id': global_id,
                 'frame_gaussians': frame_gaussians,  # {frame_idx: gaussians} 每帧独立的Gaussians
-                'frame_pixel_indices': frame_pixel_indices,  # {frame_idx: [pixel_idx1, ...]}
+                'frame_pixel_indices': frame_pixel_indices,  # {frame_idx: [pixel_idx, ...]} or {frame_idx: {view_idx: [pixel_idx, ...]}}
                 'frame_existence': torch.tensor(frame_existence, dtype=torch.bool, device=self.device),
                 'object_frames': object_frames,
                 'is_people': True  # 标记为行人物体
@@ -1229,41 +1359,74 @@ class OnlineDynamicProcessor:
             S = batch_dims['S']
 
             # 获取gaussian参数（必须存在）
-            gaussian_params = preds['gaussian_params']  # [B, S, H, W, gaussian_output_dim]
+            gaussian_params = preds['gaussian_params']  # [B, S, H, W, gaussian_output_dim] or [B, C*S, H, W, gaussian_output_dim]
 
-            # 重新整形为 [S, H*W, gaussian_output_dim]
-            gaussian_params = gaussian_params[0].reshape(S, H * W, self.gaussian_output_dim)
+            # 重新整形为 [S, H*W, gaussian_output_dim] or [C*S, H*W, gaussian_output_dim]
+            S_total = gaussian_params.shape[1]  # 可能是S或C*S
+            gaussian_params = gaussian_params[0].reshape(S_total, H * W, self.gaussian_output_dim)
 
             static_gaussians = []
 
-            for s, clustering_result in enumerate(clustering_results):
-                if s >= S:
-                    break
+            for frame_idx, clustering_result in enumerate(clustering_results):
+                # 获取当前时间帧的full_labels，-1表示静态点
+                full_labels = clustering_result['labels']  # [N_points] - 单相机:[H*W], 多相机:[C*H*W]
 
-                # 获取当前帧的full_labels，-1表示静态点
-                full_labels = clustering_result['labels']  # [H*W]
+                # 检查是否为多相机模式
+                view_point_ranges = clustering_result.get('view_point_ranges')  # [(view_idx, start, end), ...]
 
-                # 创建静态mask（标签为-1的点）
-                static_mask = full_labels == -1  # [H*W]
+                if view_point_ranges is not None:
+                    # ========== 多相机模式: 需要拆分full_labels到各个view ==========
+                    for view_idx, start, end in view_point_ranges:
+                        # 提取该view对应的labels
+                        view_labels = full_labels[start:end]  # [H*W]
 
-                # 如果有sky_masks，过滤掉sky区域的点
-                if sky_masks is not None:
-                    # sky_masks: [B, S, H, W] -> [H*W]
-                    sky_mask_frame = sky_masks[0, s].reshape(-1)  # [H*W]
-                    # 确保sky_mask_frame是布尔类型并在正确的设备上
-                    if sky_mask_frame.dtype != torch.bool:
-                        sky_mask_frame = sky_mask_frame.bool()
-                    sky_mask_frame = sky_mask_frame.to(static_mask.device)
-                    # sky区域不应该被包含在静态背景中
-                    static_mask = static_mask & (~sky_mask_frame)  # [H*W]
+                        # 创建静态mask（标签为-1的点）
+                        static_mask = view_labels == -1  # [H*W]
 
-                # 获取当前帧的gaussian参数
-                frame_gaussians = gaussian_params[s]  # [H*W, gaussian_output_dim]
+                        # 如果有sky_masks，过滤掉sky区域的点
+                        if sky_masks is not None:
+                            # sky_masks: [B, S_total, H, W]
+                            if view_idx < sky_masks.shape[1]:
+                                sky_mask_view = sky_masks[0, view_idx].reshape(-1)  # [H*W]
+                                # 确保sky_mask_view是布尔类型并在正确的设备上
+                                if sky_mask_view.dtype != torch.bool:
+                                    sky_mask_view = sky_mask_view.bool()
+                                sky_mask_view = sky_mask_view.to(static_mask.device)
+                                # sky区域不应该被包含在静态背景中
+                                static_mask = static_mask & (~sky_mask_view)  # [H*W]
 
-                # 提取静态gaussian
-                static_frame_gaussians = frame_gaussians[static_mask]  # [N_static, gaussian_output_dim]
+                        # 获取该view的gaussian参数
+                        if view_idx < S_total:
+                            view_gaussians = gaussian_params[view_idx]  # [H*W, gaussian_output_dim]
 
-                static_gaussians.append(static_frame_gaussians)
+                            # 提取静态gaussian
+                            static_view_gaussians = view_gaussians[static_mask]  # [N_static, gaussian_output_dim]
+                            static_gaussians.append(static_view_gaussians)
+
+                else:
+                    # ========== 单相机模式: 直接使用原有逻辑 ==========
+                    # 创建静态mask（标签为-1的点）
+                    static_mask = full_labels == -1  # [H*W]
+
+                    # 如果有sky_masks，过滤掉sky区域的点
+                    if sky_masks is not None:
+                        # sky_masks: [B, S, H, W]
+                        if frame_idx < sky_masks.shape[1]:
+                            sky_mask_frame = sky_masks[0, frame_idx].reshape(-1)  # [H*W]
+                            # 确保sky_mask_frame是布尔类型并在正确的设备上
+                            if sky_mask_frame.dtype != torch.bool:
+                                sky_mask_frame = sky_mask_frame.bool()
+                            sky_mask_frame = sky_mask_frame.to(static_mask.device)
+                            # sky区域不应该被包含在静态背景中
+                            static_mask = static_mask & (~sky_mask_frame)  # [H*W]
+
+                    # 获取当前帧的gaussian参数
+                    if frame_idx < S_total:
+                        frame_gaussians = gaussian_params[frame_idx]  # [H*W, gaussian_output_dim]
+
+                        # 提取静态gaussian
+                        static_frame_gaussians = frame_gaussians[static_mask]  # [N_static, gaussian_output_dim]
+                        static_gaussians.append(static_frame_gaussians)
 
             # 合并所有帧的静态gaussian
             if static_gaussians:

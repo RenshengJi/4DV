@@ -337,8 +337,43 @@ class VelocityBasedRegistration:
                 # 获取数据
                 depth_src = preds["depth"][0, frame_idx, :, :, 0]
                 depth_dst = preds["depth"][0, next_frame, :, :, 0]
-                velocity_src = preds['velocity_global'][0, frame_idx]
-                velocity_dst = preds['velocity_global'][0, next_frame]
+
+                # 检查是否为多相机模式
+                view_point_ranges = current_result.get('view_point_ranges')
+
+                if view_point_ranges is not None:
+                    # 多相机模式: 合并所有view的velocity数据
+                    velocity_src_list = []
+                    velocity_dst_list = []
+
+                    for view_idx, start, end in view_point_ranges:
+                        vel_src_view = preds['velocity_global'][0, view_idx]  # [H, W, 3]
+                        velocity_src_list.append(vel_src_view.reshape(-1, 3))  # [H*W, 3]
+
+                        # 获取下一帧对应的view velocity
+                        # 在多相机模式下，需要找到下一个时间帧的对应view
+                        next_view_point_ranges = next_result.get('view_point_ranges')
+                        if next_view_point_ranges is not None:
+                            # 找到相同相机位置的下一帧view
+                            # view_idx对应的相机ID需要从view_point_ranges推断
+                            # 假设view按顺序排列：frame0_cam0, frame0_cam1, ..., frame1_cam0, ...
+                            # 简单方法：如果direction=1，下一个view_idx应该在next_result的view_point_ranges中
+                            # 这里我们假设view的组织方式是按时间帧分组的
+                            # 由于next_result是下一个时间帧，它的view_point_ranges包含该时间帧所有相机的view
+                            # 我们需要按相同的顺序获取
+                            view_position = [v for v, s, e in view_point_ranges].index(view_idx)
+                            if view_position < len(next_view_point_ranges):
+                                next_view_idx = next_view_point_ranges[view_position][0]
+                                vel_dst_view = preds['velocity_global'][0, next_view_idx]
+                                velocity_dst_list.append(vel_dst_view.reshape(-1, 3))
+
+                    velocity_src = torch.cat(velocity_src_list, dim=0)  # [C*H*W, 3]
+                    velocity_dst = torch.cat(velocity_dst_list, dim=0) if velocity_dst_list else None
+                else:
+                    # 单相机模式: 原有逻辑
+                    velocity_src = preds['velocity_global'][0, frame_idx]
+                    velocity_dst = preds['velocity_global'][0, next_frame]
+
                 depth_conf_src = preds.get('depth_conf', [None])[0, frame_idx] if 'depth_conf' in preds else None
                 velocity_conf_src = preds.get('velocity_conf', [None])[0, frame_idx] if 'velocity_conf' in preds else None
 
@@ -408,9 +443,15 @@ class VelocityBasedRegistration:
 
         # 提取对应点的velocity
         if isinstance(velocity_src, torch.Tensor):
-            if len(velocity_src.shape) == 3:
+            # 检查是否为多相机模式下已合并的velocity数据
+            if len(velocity_src.shape) == 2 and velocity_src.shape[0] > H * W:
+                # 已经是扁平化且合并的多相机数据 [C*H*W, 3]
+                velocity_flat = velocity_src
+            elif len(velocity_src.shape) == 3:
+                # 单view数据: [H, W, 3] -> [H*W, 3]
                 velocity_flat = velocity_src.reshape(H * W, 3)
             elif len(velocity_src.shape) == 2:
+                # 已经扁平化的单view数据 [H*W, 3]
                 velocity_flat = velocity_src
             else:
                 return None
@@ -436,6 +477,12 @@ class VelocityBasedRegistration:
             labels = clustering_src.get('labels', None)
             if points_src is None or labels is None:
                 return None
+
+            # 确保labels和points在同一设备上
+            if isinstance(labels, torch.Tensor):
+                labels = labels.to(points_src.device)
+            else:
+                labels = torch.tensor(labels, device=points_src.device)
 
             object_mask = labels == cluster_idx
             points_src_object = points_src[object_mask]
@@ -516,8 +563,17 @@ class VelocityBasedRegistration:
             frame_idx = object_frames[0]
             result = clustering_results[frame_idx]
             cluster_idx = result['global_ids'].index(global_id)
-            object_mask = result['labels'] == cluster_idx
-            object_points = result['points'][object_mask]
+
+            # 确保labels和points在同一设备上
+            labels = result['labels']
+            points = result['points']
+            if isinstance(labels, torch.Tensor):
+                labels = labels.to(points.device)
+            else:
+                labels = torch.tensor(labels, device=points.device)
+
+            object_mask = labels == cluster_idx
+            object_points = points[object_mask]
 
             cluster_indices = result.get('cluster_indices', [])
             single_frame_pixel_indices = cluster_indices[cluster_idx] if cluster_idx < len(cluster_indices) else []
@@ -555,6 +611,12 @@ class VelocityBasedRegistration:
         middle_points = middle_result['points']
         middle_labels = middle_result['labels']
 
+        # 确保labels和points在同一设备上
+        if isinstance(middle_labels, torch.Tensor):
+            middle_labels = middle_labels.to(middle_points.device)
+        else:
+            middle_labels = torch.tensor(middle_labels, device=middle_points.device)
+
         middle_object_mask = middle_labels == middle_cluster_idx
         middle_object_points = middle_points[middle_object_mask]
 
@@ -564,7 +626,23 @@ class VelocityBasedRegistration:
         transformations = {}
         transformation_cache = {}
         aggregated_points = [middle_object_points]
-        all_point_indices = [(middle_frame_idx, pixel_idx) for pixel_idx in middle_pixel_indices[:len(middle_object_points)]]
+
+        # 构建middle frame的point_indices
+        # 在多相机模式下，需要将全局pixel索引映射回(view_idx, local_pixel_idx)
+        view_point_ranges = middle_result.get('view_point_ranges')
+        all_point_indices = []
+
+        if view_point_ranges is not None:
+            # 多相机模式: 将全局索引映射到(view_idx, local_pixel_idx)
+            for global_idx in middle_pixel_indices[:len(middle_object_points)]:
+                for view_idx, start, end in view_point_ranges:
+                    if start <= global_idx < end:
+                        local_pixel_idx = global_idx - start
+                        all_point_indices.append((view_idx, local_pixel_idx))
+                        break
+        else:
+            # 单相机模式: frame_idx == view_idx
+            all_point_indices = [(middle_frame_idx, pixel_idx) for pixel_idx in middle_pixel_indices[:len(middle_object_points)]]
 
         # 对其他帧进行链式变换
         for frame_idx in object_frames:
@@ -586,8 +664,17 @@ class VelocityBasedRegistration:
 
                 current_result = clustering_results[frame_idx]
                 current_cluster_idx = current_result['global_ids'].index(global_id)
-                current_object_mask = current_result['labels'] == current_cluster_idx
-                current_object_points = current_result['points'][current_object_mask]
+
+                # 确保labels和points在同一设备上
+                current_labels = current_result['labels']
+                current_points = current_result['points']
+                if isinstance(current_labels, torch.Tensor):
+                    current_labels = current_labels.to(current_points.device)
+                else:
+                    current_labels = torch.tensor(current_labels, device=current_points.device)
+
+                current_object_mask = current_labels == current_cluster_idx
+                current_object_points = current_points[current_object_mask]
 
                 current_cluster_indices = current_result.get('cluster_indices', [])
                 current_pixel_indices = current_cluster_indices[current_cluster_idx] if current_cluster_idx < len(current_cluster_indices) else []
@@ -596,8 +683,22 @@ class VelocityBasedRegistration:
                 aggregated_points.append(transformed_points)
 
                 num_transformed_points = len(transformed_points)
-                frame_point_indices = [(frame_idx, pixel_idx) for pixel_idx in current_pixel_indices[:num_transformed_points]]
-                all_point_indices.extend(frame_point_indices)
+
+                # 在多相机模式下，需要将全局pixel索引映射回(view_idx, local_pixel_idx)
+                current_view_point_ranges = current_result.get('view_point_ranges')
+
+                if current_view_point_ranges is not None:
+                    # 多相机模式: 将全局索引映射到(view_idx, local_pixel_idx)
+                    for global_idx in current_pixel_indices[:num_transformed_points]:
+                        for view_idx, start, end in current_view_point_ranges:
+                            if start <= global_idx < end:
+                                local_pixel_idx = global_idx - start
+                                all_point_indices.append((view_idx, local_pixel_idx))
+                                break
+                else:
+                    # 单相机模式: frame_idx == view_idx
+                    frame_point_indices = [(frame_idx, pixel_idx) for pixel_idx in current_pixel_indices[:num_transformed_points]]
+                    all_point_indices.extend(frame_point_indices)
             else:
                 print(f"    ⚠️  链式变换失败: {frame_idx}")
 
@@ -618,9 +719,27 @@ class VelocityBasedRegistration:
             for frame_idx in object_frames:
                 current_result = clustering_results[frame_idx]
                 current_cluster_idx = current_result['global_ids'].index(global_id)
-                frame_gaussians[frame_idx] = self._extract_gaussian_params_for_object(
-                    current_result, current_cluster_idx, frame_idx, preds['gaussian_params'], vggt_batch
-                )
+
+                # 在多相机模式下，需要为每个view提取gaussian参数并合并
+                current_view_point_ranges = current_result.get('view_point_ranges')
+
+                if current_view_point_ranges is not None:
+                    # 多相机模式: 从所有view提取并合并gaussians
+                    frame_gaussians_list = []
+                    for view_idx, start, end in current_view_point_ranges:
+                        view_gaussians = self._extract_gaussian_params_for_object(
+                            current_result, current_cluster_idx, view_idx, preds['gaussian_params'], vggt_batch
+                        )
+                        if view_gaussians is not None:
+                            frame_gaussians_list.append(view_gaussians)
+
+                    if frame_gaussians_list:
+                        frame_gaussians[frame_idx] = torch.cat(frame_gaussians_list, dim=0)
+                else:
+                    # 单相机模式: 原有逻辑，frame_idx == view_idx
+                    frame_gaussians[frame_idx] = self._extract_gaussian_params_for_object(
+                        current_result, current_cluster_idx, frame_idx, preds['gaussian_params'], vggt_batch
+                    )
 
         return {
             'global_id': global_id,
@@ -704,12 +823,13 @@ class VelocityBasedRegistration:
                                             vggt_batch: Dict) -> Optional[torch.Tensor]:
         """
         从聚类结果中提取对应物体的Gaussian参数
+        支持单相机和多相机模式
 
         Args:
             clustering_result: 单帧聚类结果
             cluster_idx: 聚类索引
-            frame_idx: 帧索引
-            gaussian_params: VGGT预测的Gaussian参数 [B, S, H, W, gaussian_output_dim]
+            frame_idx: 时间帧索引 (0, 1, 2, ...)
+            gaussian_params: VGGT预测的Gaussian参数 [B, S, H, W, gaussian_output_dim] or [B, C*S, H, W, gaussian_output_dim]
             vggt_batch: 批次数据
 
         Returns:
@@ -733,13 +853,69 @@ class VelocityBasedRegistration:
                 return None
 
             gaussian_output_dim = gaussian_params.shape[-1]
-            gaussian_params = gaussian_params.reshape(B, S * H * W, gaussian_output_dim)
 
-            H_W = H * W
-            pixel_indices_tensor = torch.tensor(pixel_indices, dtype=torch.long, device=gaussian_params.device)
-            global_indices = frame_idx * H_W + pixel_indices_tensor
+            # ========== 检查是否为多相机模式 ==========
+            view_point_ranges = clustering_result.get('view_point_ranges')  # [(view_idx, start, end), ...]
 
-            selected_gaussians_tensor = gaussian_params[0, global_indices]
+            if view_point_ranges is not None:
+                # ========== 多相机模式: 需要索引映射 ==========
+                # pixel_indices是合并后的全局索引，需要映射回(view_idx, local_pixel_idx)
+                selected_gaussians_list = []
+
+                for global_idx in pixel_indices:
+                    # 找到该全局索引属于哪个view
+                    view_idx = None
+                    local_idx = None
+
+                    for v_idx, start, end in view_point_ranges:
+                        if start <= global_idx < end:
+                            view_idx = v_idx
+                            local_idx = global_idx - start
+                            break
+
+                    if view_idx is None:
+                        continue  # 索引超出范围，跳过
+
+                    # 从对应view提取gaussian参数
+                    # gaussian_params: [B, S_total, H, W, gaussian_output_dim]
+                    # view_idx是全局view索引，需要确保在范围内
+                    if view_idx >= gaussian_params.shape[1]:
+                        print(f"    WARNING: view_idx={view_idx} >= S_total={gaussian_params.shape[1]}, skipping")
+                        continue
+
+                    v_coord = local_idx // W
+                    u_coord = local_idx % W
+
+                    if v_coord >= H or u_coord >= W:
+                        print(f"    WARNING: coord out of range: v={v_coord}, u={u_coord}, H={H}, W={W}")
+                        continue  # 坐标超出范围
+
+                    gaussian = gaussian_params[0, view_idx, v_coord, u_coord]
+                    selected_gaussians_list.append(gaussian)
+
+                if len(selected_gaussians_list) == 0:
+                    print(f"    无法提取有效的Gaussian参数 (多相机模式)")
+                    return None
+
+                selected_gaussians_tensor = torch.stack(selected_gaussians_list, dim=0)
+
+            else:
+                # ========== 单相机模式: 原有逻辑 ==========
+                gaussian_params = gaussian_params.reshape(B, S * H * W, gaussian_output_dim)
+
+                H_W = H * W
+                pixel_indices_tensor = torch.tensor(pixel_indices, dtype=torch.long, device=gaussian_params.device)
+                global_indices = frame_idx * H_W + pixel_indices_tensor
+
+                # 检查索引是否在范围内
+                max_idx = global_indices.max().item() if len(global_indices) > 0 else -1
+                if max_idx >= gaussian_params.shape[1]:
+                    print(f"    ERROR: global_indices max={max_idx} >= gaussian_params.shape[1]={gaussian_params.shape[1]}")
+                    print(f"    frame_idx={frame_idx}, H_W={H_W}, S={S}, B={B}")
+                    print(f"    pixel_indices range: [{pixel_indices_tensor.min().item()}, {pixel_indices_tensor.max().item()}]")
+                    return None
+
+                selected_gaussians_tensor = gaussian_params[0, global_indices]
 
             if selected_gaussians_tensor.shape[0] == 0:
                 print(f"    无法提取有效的Gaussian参数")

@@ -1041,7 +1041,7 @@ def main(cfg: OmegaConf):
     print(f"Using device: {device}\n")
 
     # import debugpy
-    # debugpy.listen(5697)
+    # debugpy.listen(5698)
     # print("Waiting for debugger to attach...")
     # debugpy.wait_for_client()
 

@@ -626,7 +626,9 @@ def train(args):
                                 sky_masks=sky_masks,
                                 sky_colors=sky_colors,
                                 sampled_frame_indices=sampled_frame_indices,
-                                depth_scale_factor=vggt_batch.get('depth_scale_factor', None)
+                                depth_scale_factor=vggt_batch.get('depth_scale_factor', None),
+                                camera_indices=vggt_batch.get('camera_indices', None),  # New: for multi-camera support
+                                frame_indices=vggt_batch.get('frame_indices', None)     # New: for multi-camera support
                             )
 
                             # 提取各项loss并加权
@@ -772,7 +774,7 @@ def run(cfg: OmegaConf):
     if cfg.get("debug", False):
         cfg.num_workers = 0
         import debugpy
-        debugpy.listen(5697)
+        debugpy.listen(5698)
         print("Waiting for debugger to attach...")
         debugpy.wait_for_client()
     logdir = pathlib.Path(cfg.logdir)
