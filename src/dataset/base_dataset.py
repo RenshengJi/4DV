@@ -37,6 +37,13 @@ class BaseDataset(EasyDataset, torch.utils.data.Dataset):
         self.transform = transform
         self.seed = seed
 
+        # Initialize RNG once in __init__
+        if seed is not None:
+            self._rng = np.random.default_rng(seed=seed)
+        else:
+            random_seed = torch.randint(0, 2**32, (1,)).item()
+            self._rng = np.random.default_rng(seed=random_seed)
+
         # Set num_views range for random sampling
         if num_views_range is not None:
             assert len(num_views_range) == 2, "num_views_range must be [min, max]"
@@ -58,13 +65,6 @@ class BaseDataset(EasyDataset, torch.utils.data.Dataset):
         Returns:
             List of view dictionaries in VGGT format
         """
-        # Set up RNG
-        if self.seed:
-            self._rng = np.random.default_rng(seed=self.seed + idx)
-        elif not hasattr(self, "_rng"):
-            seed = torch.randint(0, 2**32, (1,)).item()
-            self._rng = np.random.default_rng(seed=seed)
-
         while True:
             try:
                 views = self._get_views(idx, self._rng)
