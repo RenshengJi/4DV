@@ -26,7 +26,7 @@ num_views: 4
 # =============== 推理配置 ===============
 # 批处理模式
 batch_mode: true
-start_idx: 0
+start_idx: 2
 end_idx: 100
 step: 1
 
@@ -44,6 +44,20 @@ save_images: false
 # =============== Gaussian Splatting配置 ===============
 sh_degree: 0
 use_gt_camera: true              # 是否使用GT相机参数
+
+# =============== 动态物体处理配置 ===============
+# 速度变换模式: "simple" (仅平移) 或 "procrustes" (旋转+平移)
+velocity_transform_mode: "procrustes"
+
+# 动态物体检测阈值
+velocity_threshold: 0.1           # 速度阈值 (m/s)
+clustering_eps: 0.3              # DBSCAN邻域半径
+clustering_min_samples: 10       # DBSCAN最小样本数
+min_object_size: 500             # 最小物体尺寸（点数）
+
+# 物体跟踪阈值
+tracking_position_threshold: 2.0  # 位置匹配阈值 (米)
+tracking_velocity_threshold: 0.2  # 速度匹配阈值 (m/s)
 
 # =============== 输出配置 ===============
 output_dir: "./results/multi_camera"

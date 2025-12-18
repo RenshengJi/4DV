@@ -652,8 +652,17 @@ def run_single_inference(model, dataset, idx, num_views, device, cfg):
             if pred_depth.ndim == 4 and pred_depth.shape[-1] == 1:
                 pred_depth = pred_depth.squeeze(-1)  # [S, H, W, 1] -> [S, H, W]
 
-        # 创建动态处理器
-        dynamic_processor = OnlineDynamicProcessor(device=device)
+        # 创建动态处理器（使用配置参数）
+        dynamic_processor = OnlineDynamicProcessor(
+            device=device,
+            velocity_transform_mode=cfg.velocity_transform_mode,
+            velocity_threshold=cfg.velocity_threshold,
+            clustering_eps=cfg.clustering_eps,
+            clustering_min_samples=cfg.clustering_min_samples,
+            min_object_size=cfg.min_object_size,
+            tracking_position_threshold=cfg.tracking_position_threshold,
+            tracking_velocity_threshold=cfg.tracking_velocity_threshold
+        )
 
         # 处理use_gt_camera参数
         preds_for_dynamic = preds.copy() if isinstance(preds, dict) else preds
@@ -1072,10 +1081,10 @@ def main(cfg: OmegaConf):
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}\n")
 
-    # import debugpy
-    # debugpy.listen(5698)
-    # print("Waiting for debugger to attach...")
-    # debugpy.wait_for_client()
+    import debugpy
+    debugpy.listen(5698)
+    print("Waiting for debugger to attach...")
+    debugpy.wait_for_client()
 
 
     # Load model and dataset

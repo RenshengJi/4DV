@@ -22,7 +22,7 @@ num_views: 8
 # =============== 推理配置 ===============
 # 批处理模式
 batch_mode: true
-start_idx: 1
+start_idx: 0
 end_idx: 798
 step: 1
 
