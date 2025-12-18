@@ -1081,11 +1081,10 @@ def main(cfg: OmegaConf):
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}\n")
 
-    import debugpy
-    debugpy.listen(5698)
-    print("Waiting for debugger to attach...")
-    debugpy.wait_for_client()
-
+    # import debugpy
+    # debugpy.listen(5698)
+    # print("Waiting for debugger to attach...")
+    # debugpy.wait_for_client()
 
     # Load model and dataset
     model = load_model(cfg.model_path, device, cfg)
