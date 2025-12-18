@@ -228,42 +228,102 @@ def create_clustering_visualization(matched_clustering_results, vggt_batch, fusi
     try:
         B, S, C, image_height, image_width = vggt_batch["images"].shape
 
+        print(f"[DEBUG] create_clustering_visualization:")
+        print(f"  vggt_batch['images'] shape: {vggt_batch['images'].shape}")
+        print(f"  matched_clustering_results length: {len(matched_clustering_results) if matched_clustering_results else 0}")
+
         if not matched_clustering_results or len(matched_clustering_results) == 0:
             # 返回源RGB图像（转为uint8）
             images_np = (vggt_batch["images"][0].cpu().numpy() * 255).astype(np.uint8)  # [S, 3, H, W]
             images_np = images_np.transpose(0, 2, 3, 1)  # [S, H, W, 3]
+            print(f"[DEBUG] No clustering results, returning RGB images: {images_np.shape}")
             return images_np
 
         # 生成可视化颜色
         colored_results = visualize_clustering_results(matched_clustering_results, num_colors=20)
+        print(f"[DEBUG] colored_results length: {len(colored_results)}")
 
-        # 将聚类结果与源RGB图像融合
-        clustering_images = []
-        for frame_idx, colored_result in enumerate(colored_results):
-            # 获取源RGB图像
-            source_rgb = vggt_batch["images"][0, frame_idx].permute(1, 2, 0)  # [H, W, 3]
-            source_rgb = (source_rgb * 255).cpu().numpy().astype(np.uint8)
+        # 检查是否是多相机模式
+        camera_indices = vggt_batch.get('camera_indices', None)
+        frame_indices = vggt_batch.get('frame_indices', None)
+        is_multi_camera = (camera_indices is not None and frame_indices is not None)
 
-            # 检查是否有动态物体
-            if colored_result['num_clusters'] > 0:
-                # 将点云颜色重塑为图像格式
-                point_colors = colored_result['colors']  # [H*W, 3]
-                clustering_image = point_colors.reshape(image_height, image_width, 3)  # [H, W, 3]
+        if is_multi_camera:
+            # 多相机模式：colored_results按时间帧组织，每帧包含所有相机的点
+            # 需要为每个view单独创建可视化
+            camera_indices = camera_indices[0].cpu().numpy() if isinstance(camera_indices, torch.Tensor) else camera_indices
+            frame_indices = frame_indices[0].cpu().numpy() if isinstance(frame_indices, torch.Tensor) else frame_indices
 
-                # 融合
-                mask = np.any(clustering_image > 0, axis=2)  # [H, W]
-                mask = mask[:, :, np.newaxis]  # [H, W, 1]
+            num_cameras = len(np.unique(camera_indices))
+            num_frames = len(colored_results)
 
-                fused_image = np.where(mask,
-                                     (fusion_alpha * clustering_image + (1 - fusion_alpha) * source_rgb).astype(np.uint8),
-                                     source_rgb)
-            else:
-                # 没有动态物体
-                fused_image = source_rgb.copy()
-                cv2.putText(fused_image, "No Dynamic Objects", (10, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
+            print(f"[DEBUG] Multi-camera mode: {num_cameras} cameras, {num_frames} frames")
 
-            clustering_images.append(fused_image)
+            clustering_images = []
+            for view_idx in range(S):
+                cam_idx = camera_indices[view_idx]
+                frame_idx = frame_indices[view_idx]
+
+                # 获取源RGB图像
+                source_rgb = vggt_batch["images"][0, view_idx].permute(1, 2, 0)  # [H, W, 3]
+                source_rgb = (source_rgb * 255).cpu().numpy().astype(np.uint8)
+
+                # 获取该帧的clustering结果
+                colored_result = colored_results[frame_idx]
+                point_colors = colored_result['colors']  # [num_cameras * H * W, 3]
+
+                # 提取该相机的点云颜色
+                # points按照view顺序组织，每个view有H*W个点
+                start_idx = cam_idx * image_height * image_width
+                end_idx = start_idx + image_height * image_width
+                camera_point_colors = point_colors[start_idx:end_idx]  # [H*W, 3]
+
+                if colored_result['num_clusters'] > 0 and np.any(camera_point_colors > 0):
+                    # 重塑为图像
+                    clustering_image = camera_point_colors.reshape(image_height, image_width, 3)
+
+                    # 融合
+                    mask = np.any(clustering_image > 0, axis=2)[:, :, np.newaxis]
+                    fused_image = np.where(mask,
+                                         (fusion_alpha * clustering_image + (1 - fusion_alpha) * source_rgb).astype(np.uint8),
+                                         source_rgb)
+                else:
+                    fused_image = source_rgb.copy()
+
+                clustering_images.append(fused_image)
+        else:
+            # 单相机模式：原有逻辑
+            clustering_images = []
+            for frame_idx, colored_result in enumerate(colored_results):
+                print(f"[DEBUG] Processing frame {frame_idx}, num_clusters: {colored_result['num_clusters']}")
+
+                # 获取源RGB图像
+                source_rgb = vggt_batch["images"][0, frame_idx].permute(1, 2, 0)  # [H, W, 3]
+                source_rgb = (source_rgb * 255).cpu().numpy().astype(np.uint8)
+
+                # 检查是否有动态物体
+                if colored_result['num_clusters'] > 0:
+                    # 将点云颜色重塑为图像格式
+                    point_colors = colored_result['colors']  # [H*W, 3]
+                    print(f"[DEBUG] point_colors shape: {point_colors.shape}, non-zero: {np.sum(np.any(point_colors > 0, axis=1))}")
+                    clustering_image = point_colors.reshape(image_height, image_width, 3)  # [H, W, 3]
+
+                    # 融合
+                    mask = np.any(clustering_image > 0, axis=2)  # [H, W]
+                    print(f"[DEBUG] mask sum: {np.sum(mask)}, total pixels: {mask.size}")
+                    mask = mask[:, :, np.newaxis]  # [H, W, 1]
+
+                    fused_image = np.where(mask,
+                                         (fusion_alpha * clustering_image + (1 - fusion_alpha) * source_rgb).astype(np.uint8),
+                                         source_rgb)
+                else:
+                    # 没有动态物体
+                    print(f"[DEBUG] No clusters for frame {frame_idx}")
+                    fused_image = source_rgb.copy()
+                    cv2.putText(fused_image, "No Dynamic Objects", (10, 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
+
+                clustering_images.append(fused_image)
 
         return np.array(clustering_images)  # [S, H, W, 3]
 
@@ -791,6 +851,15 @@ def create_multi_camera_grid(
     Returns:
         视频帧列表，每帧是网格布局
     """
+    # Debug: print shapes
+    print(f"[DEBUG] create_multi_camera_grid inputs:")
+    print(f"  gt_rgb shape: {gt_rgb.shape}")
+    print(f"  num_cameras: {num_cameras}, num_frames: {num_frames}")
+    print(f"  camera_indices: {camera_indices}")
+    print(f"  frame_indices: {frame_indices}")
+    if dynamic_clustering is not None:
+        print(f"  dynamic_clustering shape: {dynamic_clustering.shape}")
+
     grid_frames = []
 
     # Camera reordering map: [cam1, cam2, cam3] -> [cam2(center), cam1(left), cam3(right)]
@@ -800,15 +869,23 @@ def create_multi_camera_grid(
     camera_order = [1, 0, 2]  # 重新排列: cam2(idx=1), cam1(idx=0), cam3(idx=2)
 
     for frame_idx in range(num_frames):
-        # 收集这一帧所有相机的视图，按照原始顺序
+        # 使用camera_indices和frame_indices来找到对应的view
+        # camera_indices和frame_indices告诉我们每个view的相机ID和帧ID
         frame_views_original = []
         for cam_idx in range(num_cameras):
-            # 计算view索引: 数据按相机组织 [cam0_f0...cam0_fn, cam1_f0...cam1_fn, ...]
-            view_idx = cam_idx * num_frames + frame_idx
-            frame_views_original.append(view_idx)
+            # 找到属于当前camera和frame的view索引
+            for view_idx in range(len(camera_indices)):
+                if camera_indices[view_idx] == cam_idx and frame_indices[view_idx] == frame_idx:
+                    frame_views_original.append(view_idx)
+                    break
 
         # 重新排列相机顺序: 中, 左, 右
-        frame_views = [frame_views_original[i] for i in camera_order]
+        if len(frame_views_original) == num_cameras:
+            frame_views = [frame_views_original[i] for i in camera_order]
+        else:
+            print(f"[WARNING] frame_idx={frame_idx}: found {len(frame_views_original)} views, expected {num_cameras}")
+            frame_views = frame_views_original
+        print(f"[DEBUG] frame_idx={frame_idx}, frame_views={frame_views}")
 
         # === Row 1: GT RGB (左中右) | Rendered RGB (左中右) ===
         gt_rgb_concat = np.concatenate([gt_rgb[v] for v in frame_views], axis=1)
@@ -866,13 +943,16 @@ def create_multi_camera_grid(
             pred_seg_concat = np.zeros_like(gt_depth_concat)
         row4 = np.concatenate([gt_seg_concat, pred_seg_concat], axis=1)
 
-        # === Row 5: Dynamic Clustering (左中右, full width - spans both GT and Pred columns) ===
+        # === Row 5: Dynamic Clustering (左中右) | 空白 (左中右) ===
         if dynamic_clustering is not None:
-            # Dynamic clustering只有3个相机，但需要填满整行（6个相机宽度）
-            # 方案：左侧显示dynamic clustering，右侧显示相同内容或留空
+            # dynamic_clustering是[num_views, H, W, 3]，按视图组织
+            # 左侧显示3个相机的clustering结果
             clustering_concat = np.concatenate([dynamic_clustering[v] for v in frame_views], axis=1)
-            # 复制一份以填满整行，或者可以选择右侧留黑
-            row5 = np.concatenate([clustering_concat, clustering_concat], axis=1)
+            # 右侧留白（白色背景）
+            H = clustering_concat.shape[0]
+            W = clustering_concat.shape[1]
+            white_space = np.ones((H, W, 3), dtype=np.uint8) * 255
+            row5 = np.concatenate([clustering_concat, white_space], axis=1)
         else:
             # 使用与row1相同宽度的零图作为占位符 (需要6个相机的宽度)
             H = gt_rgb_concat.shape[0]
