@@ -3,6 +3,7 @@
 *.pt
 data   
 src/checkpoints
+checkpoints
 config/debug
 results/
 

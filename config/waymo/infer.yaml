@@ -1,5 +1,7 @@
-# Inference Configuration for VGGT
-# 推理配置文件
+# Multi-Camera Inference Configuration for VGGT
+# 多相机推理配置文件
+
+# debug: true
 
 # =============== 模型配置 ===============
 model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=0, use_gs_head=True, use_gs_head_velocity=True, use_gs_head_segment=False, use_gt_camera=True, velocity_head_small_init=False)"
@@ -8,22 +10,25 @@ model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=0, use_gs_he
 model_path: "src/checkpoints/new/start/checkpoint-epoch_0_19533.pth"
 
 # =============== 数据集配置 ===============
+# 多相机模式数据集
 infer_dataset: Waymo_Multi(
   ROOT="data/waymo/train_full",
   valid_camera_id_list=["1", "2", "3"],
-  intervals=[1],
+  intervals=[5],
   resolution=[(518, 336)],
   transform=ImgNorm,
   num_views=${num_views},
+  multi_camera_mode=True,
   zero_ground_velocity=True)
 
-num_views: 8
+# 每个相机的帧数
+num_views: 4
 
 # =============== 推理配置 ===============
 # 批处理模式
 batch_mode: true
-start_idx: 0
-end_idx: 798
+start_idx: 2
+end_idx: 100
 step: 1
 
 # 单样本模式 (当batch_mode=false时使用)
@@ -35,7 +40,7 @@ device: "cuda"
 # 可视化配置
 fps: 10
 save_video: true
-save_images: true
+save_images: false
 
 # =============== Gaussian Splatting配置 ===============
 sh_degree: 0
@@ -56,9 +61,9 @@ tracking_position_threshold: 2.0  # 位置匹配阈值 (米)
 tracking_velocity_threshold: 0.2  # 速度匹配阈值 (m/s)
 
 # =============== 输出配置 ===============
-output_dir: "./results/test_new"
-output_prefix: "waymo_train"        # 输出文件名前缀
-continue_on_error: true          # 遇到错误时继续处理下一个样本
+output_dir: "./results/multi_camera"
+output_prefix: "waymo_multi"        # 输出文件名前缀
+continue_on_error: true             # 遇到错误时继续处理下一个样本
 
 # =============== Hydra配置 ===============
 hydra:

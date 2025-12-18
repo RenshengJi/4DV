@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from dataset.base_dataset import BaseDataset
 from dataset.utils import depthmap_to_absolute_camera_coordinates
-from dust3r.utils.image import imread_cv2  # Keep this for now until we create our own image reader
+from src.utils import imread_cv2
 
 
 class WaymoDataset(BaseDataset):

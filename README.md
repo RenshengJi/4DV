@@ -21,14 +21,13 @@ python datasets_preprocess/extract_tars.py ../data/waymo/tar --num-workers 64
 
 ```bash
 cd src
-CUDA_VISIBLE_DEVICES=0 accelerate launch --multi_gpu train.py --config-path ../config/waymo --config-name train 
+CUDA_VISIBLE_DEVICES=0 accelerate launch --multi_gpu train.py --config-path config/waymo --config-name train 
 ```
 
 ## Inference
 
-生成包含GT/Pred对比的可视化：RGB、Depth、Velocity、Segmentationn、ynamic Clustering
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python inference_multi.py --config-path ./config/waymo --config-name infer_multi 
+CUDA_VISIBLE_DEVICES=0 python infer.py --config-path config/waymo --config-name infer
 ```
 

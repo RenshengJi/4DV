@@ -5,11 +5,9 @@ from .base_dataset import BaseDataset
 from .waymo import WaymoDataset
 from .easy_dataset import EasyDataset, MulDataset, ResizedDataset, CatDataset
 
-# Import transforms from dust3r for compatibility (will be migrated later)
-from dust3r.datasets.utils.transforms import ImgNorm
-
-# Import sampler from dust3r for compatibility (will be migrated later)
-from dust3r.datasets.base.batched_sampler import BatchedRandomSampler
+# Import transforms and sampler (migrated from dust3r)
+from .transforms import ImgNorm
+from .batched_sampler import BatchedRandomSampler
 
 from accelerate import Accelerator
 import torch

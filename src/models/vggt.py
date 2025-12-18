@@ -8,16 +8,16 @@ import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin  # used for model hub
 
-from vggt.models.aggregator import Aggregator
-from vggt.heads.camera_head import CameraHead
-from vggt.heads.dpt_head import DPTHead
-from vggt.heads.gs_head import DPTGSHead
-from vggt.heads.track_head import TrackHead
-from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+from .aggregator import Aggregator
+from .heads.camera_head import CameraHead
+from .heads.dpt_head import DPTHead
+from .heads.gs_head import DPTGSHead
+from .heads.track_head import TrackHead
+from .utils.pose_enc import pose_encoding_to_extri_intri
 
 # Import storm components from local modules
-from vggt.models.decoder_layers import ModulatedLinearLayer
-from vggt.models.embedders import PluckerEmbedder
+from .decoder_layers import ModulatedLinearLayer
+from .embedders import PluckerEmbedder
 
 from contextlib import contextmanager
 
@@ -262,7 +262,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                         extrinsics_to_use = torch.cat([extrinsics_to_use, homo_row], dim=-2)
                 elif "pose_enc" in predictions:
                     # Use predicted camera parameters
-                    from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+                    from models.utils.pose_enc import pose_encoding_to_extri_intri
                     extrinsics_pred, intrinsics_pred = pose_encoding_to_extri_intri(
                         predictions["pose_enc"], images.shape[-2:]
                     )
@@ -275,7 +275,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
 
                 # Compute world points if camera parameters are available
                 if extrinsics_to_use is not None and intrinsics_to_use is not None:
-                    from vggt.training.loss import depth_to_world_points
+                    from losses.loss import depth_to_world_points
 
                     B_d, S_d, H_d, W_d = depth.shape[0], depth.shape[1], depth.shape[2], depth.shape[3]
 

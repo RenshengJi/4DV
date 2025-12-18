@@ -6,7 +6,7 @@
 
 from src.utils import tf32_off, compute_lpips
 from gsplat.rendering import rasterization
-from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+from models.utils.pose_enc import pose_encoding_to_extri_intri
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

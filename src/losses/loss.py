@@ -9,15 +9,12 @@
 
 from src.utils import scene_flow_to_rgb, tf32_off, compute_lpips
 from gsplat.rendering import rasterization
-from vggt.utils.pose_enc import extri_intri_to_pose_encoding, pose_encoding_to_extri_intri
-from vggt.training.stage2_loss import prune_gaussians_by_voxel
+from models.utils.pose_enc import extri_intri_to_pose_encoding, pose_encoding_to_extri_intri
+from losses.stage2_loss import prune_gaussians_by_voxel
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from math import ceil, floor
-import os
-import sys
-sys.path.append(os.path.join(os.path.dirname(__file__), '../../vggt/'))
 
 
 def parse_gaussian_params(gaussian_params, sh_degree=0):
