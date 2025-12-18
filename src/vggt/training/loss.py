@@ -156,7 +156,6 @@ def gt_flow_loss_ours(velocity, vggt_batch):
         # 将velocity reshape为与gt_velocity相同的格式
         velocity = velocity.reshape(B, S, H, W, 3)  # [B, S, H, W, 3]
 
-        # velocity已在模型forward中激活，这里直接使用
 
         # 只在有GT velocity的位置计算loss
         # 扩展mask以匹配velocity的维度

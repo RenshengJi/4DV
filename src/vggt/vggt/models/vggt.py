@@ -290,7 +290,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                     world_points = depth_to_world_points(depth_reshaped, intrinsics_reshaped)
                     world_points = world_points.reshape(B_d, S_d, H_d * W_d, 3)
 
-                    # Transform to camera coordinate frame (first frame as reference)
+                    # Transform to ref camera coordinate frame (first frame as reference)
                     extrinsic_inv = torch.linalg.inv(extrinsics_to_use)  # [B, S, 4, 4]
 
                     # Use first batch [S, H*W, 3]
@@ -364,20 +364,19 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
 
                 # Transform velocity to global coordinate frame if camera parameters are available
                 if extrinsics_to_use is not None and intrinsics_to_use is not None:
-                    # velocity is in camera coordinate frame, we need to transform it to world frame
-                    # extrinsics_to_use is world2cam, so extrinsic_inv is cam2world
-                    extrinsic_cam2world = torch.linalg.inv(extrinsics_to_use)  # [B, S, 4, 4]
+                    # velocity is in camera coordinate frame, we need to transform it to ref frame
+                    extrinsic_cam2ref = torch.linalg.inv(extrinsics_to_use)  # [B, S, 4, 4]
 
-                    # Extract rotation matrix from cam2world
-                    R_cam2world = extrinsic_cam2world[:, :, :3, :3]  # [B, S, 3, 3]
+                    # Extract rotation matrix from cam2ref
+                    R_cam2ref = extrinsic_cam2ref[:, :, :3, :3]  # [B, S, 3, 3]
 
                     # velocity shape: [B, S, H, W, 3]
-                    # Transform: vel_world = R_cam2world @ vel_camera
+                    # Transform: vel_ref = R_cam2ref @ vel_camera
                     B_v, S_v, H_v, W_v, _ = velocity.shape
                     velocity_reshaped = velocity.reshape(B_v, S_v, H_v * W_v, 3)  # [B, S, H*W, 3]
 
                     # Apply rotation: [B, S, 3, 3] @ [B, S, H*W, 3]^T -> [B, S, 3, H*W] -> transpose -> [B, S, H*W, 3]
-                    velocity_global = torch.matmul(R_cam2world, velocity_reshaped.transpose(-1, -2)).transpose(-1, -2)
+                    velocity_global = torch.matmul(R_cam2ref, velocity_reshaped.transpose(-1, -2)).transpose(-1, -2)
                     velocity_global = velocity_global.reshape(B_v, S_v, H_v, W_v, 3)
 
                     predictions["velocity_global"] = velocity_global  # World frame velocity (for downstream use)
@@ -442,6 +441,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
 
                 # Generate sky colors using sky_head (only for sampled frames)
                 sampled_sky_token = sky_token[0, sampled_frame_indices, 0]  # [num_frames, embed_dim]
+                sampled_sky_token = sampled_sky_token.mean(dim=0, keepdim=True)  # [1, embed_dim] - average over sampled frames
                 sky_colors_sampled = self.sky_head(
                     ray_dirs.reshape(num_frames_to_render, H * W, 3),
                     sampled_sky_token

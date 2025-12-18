@@ -421,7 +421,7 @@ class WaymoDataset(BaseDataset):
         # Both single-camera and multi-camera modes use cam0_f0 as reference
         reference_view_idx = 0
 
-        # Get reference camera pose (cam2world)
+        # Get reference camera pose (ref_to_world)
         reference_cam_pose = views[reference_view_idx]['camera_pose']  # [4, 4]
 
         # Compute world_to_ref transformation
@@ -464,6 +464,7 @@ class WaymoDataset(BaseDataset):
             view['depthmap'] = view['depthmap'] * depth_scale_factor
             view['camera_pose'][:3, 3] = view['camera_pose'][:3, 3] * depth_scale_factor
             view['pts3d'] = view['pts3d'] * depth_scale_factor
+            view['flowmap'][..., :3] = view['flowmap'][..., :3] * depth_scale_factor if 'flowmap' in view else None
             view['depth_scale_factor'] = depth_scale_factor
-
+            
         return views

@@ -168,31 +168,56 @@ def visualize_segmentation(seg_labels, seg_mask=None, num_classes=4):
     return seg_rgb
 
 
-def visualize_clustering_results(matched_clustering_results, num_colors=20):
-    """为聚类结果生成颜色（from inference.py）"""
+def visualize_clustering_results(clustering_results, num_colors=20):
+    """为聚类结果生成颜色（参考inference.py）"""
+    # 使用tab20颜色映射（与inference.py一致）
+    colors = plt.cm.tab20(np.linspace(0, 1, num_colors))
+    colors = (colors[:, :3] * 255).astype(np.uint8)
+
     colored_results = []
 
-    # Generate distinct colors for clusters
-    np.random.seed(42)
-    colors = (np.random.rand(num_colors, 3) * 255).astype(np.uint8)
+    for frame_result in clustering_results:
+        points = frame_result['points']  # [H*W, 3]
+        labels = frame_result['labels']  # [H*W] tensor
+        global_ids = frame_result.get('global_ids', [])
 
-    for cluster_result in matched_clustering_results:
-        cluster_ids = cluster_result['cluster_ids']  # [H*W]
+        # 初始化颜色数组（默认黑色背景）
+        point_colors = np.zeros((len(points), 3), dtype=np.uint8)
 
-        # Count unique clusters (excluding -1 for static/background)
-        unique_clusters = np.unique(cluster_ids[cluster_ids >= 0])
-        num_clusters = len(unique_clusters)
+        # 为每个聚类分配颜色（基于全局ID）
+        if isinstance(labels, torch.Tensor):
+            unique_labels = torch.unique(labels)
+        else:
+            unique_labels = np.unique(labels)
 
-        # Assign colors
-        point_colors = np.zeros((len(cluster_ids), 3), dtype=np.uint8)
-        for i, cluster_id in enumerate(unique_clusters):
-            mask = (cluster_ids == cluster_id)
-            color_idx = i % num_colors
-            point_colors[mask] = colors[color_idx]
+        colors_assigned = 0
+        for label in unique_labels:
+            if isinstance(label, torch.Tensor):
+                label_val = label.item()
+            else:
+                label_val = int(label)
+
+            if label_val == -1:
+                continue  # 跳过噪声点
+
+            if label_val < len(global_ids):
+                global_id = global_ids[label_val]
+                if global_id != -1:
+                    color_idx = global_id % num_colors
+                    color = colors[color_idx]
+
+                    if isinstance(labels, torch.Tensor):
+                        mask = (labels == label).cpu().numpy()
+                    else:
+                        mask = (labels == label)
+
+                    point_colors[mask] = color
+                    colors_assigned += 1
 
         colored_results.append({
+            'points': points,
             'colors': point_colors,
-            'num_clusters': num_clusters
+            'num_clusters': colors_assigned
         })
 
     return colored_results
