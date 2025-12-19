@@ -20,7 +20,6 @@ python datasets_preprocess/extract_tars.py ../data/waymo/tar --num-workers 64
 ## Train
 
 ```bash
-cd src
 CUDA_VISIBLE_DEVICES=0 accelerate launch --multi_gpu train.py --config-path config/waymo --config-name train 
 ```
 

@@ -1,7 +1,7 @@
 # Stage 1 Online Training Configuration for VGGT
 # 第一阶段在线训练配置 - 包含统一的损失权重管理
 
-# debug: true
+debug: true
 
 # =============== 模型配置 ===============
 model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=0, use_gs_head=True, use_gs_head_velocity=True, use_gs_head_segment=False, use_gt_camera=True, velocity_head_small_init=False)"
@@ -84,7 +84,7 @@ scale_loss_weight: 1.0                      # 场景尺度预测损失权重
 
 # Aggregator_all Render Loss (代替Stage2 refine网络的渲染loss)
 # 这个loss直接在Stage1中使用动态物体处理+渲染监督,跳过Stage2的refine网络
-aggregator_all_start_iter: 10000           # Aggregator_all loss开始计算的iteration (默认50k)
+aggregator_all_start_iter: 0           # Aggregator_all loss开始计算的iteration (默认50k)
 aggregator_all_render_rgb_weight: 1.0      # Aggregator_all RGB渲染损失权重
 aggregator_all_render_depth_weight: 1.0    # Aggregator_all depth渲染损失权重
 aggregator_all_render_lpips_weight: 0.1    # Aggregator_all LPIPS渲染损失权重

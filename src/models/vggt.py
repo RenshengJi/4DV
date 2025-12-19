@@ -349,6 +349,9 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 # Opacity activation: sigmoid
                 gaussian_params_activated[..., opacity_idx:opacity_idx+1] = gaussian_params_raw[..., opacity_idx:opacity_idx+1].sigmoid()
 
+                # For Debug: set Opacity all to 1
+                # gaussian_params_activated[..., opacity_idx:opacity_idx+1] = 1.0
+
                 predictions["gaussian_params"] = gaussian_params_activated  # Activated params
                 predictions["gaussian_params_raw"] = gaussian_params_raw  # Keep raw for backward compatibility
                 predictions["gaussian_conf"] = gaussian_conf

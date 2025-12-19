@@ -7,7 +7,7 @@
 model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=0, use_gs_head=True, use_gs_head_velocity=True, use_gs_head_segment=False, use_gt_camera=True, velocity_head_small_init=False)"
 
 # 模型检查点路径
-model_path: "src/checkpoints/new/start/checkpoint-epoch_0_19533.pth"
+model_path: "checkpoints/new/start/checkpoint-epoch_0_4166.pth"
 
 # =============== 数据集配置 ===============
 # 多相机模式数据集
