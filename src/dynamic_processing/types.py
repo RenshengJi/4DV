@@ -49,7 +49,6 @@ class ViewMapping:
                 camera_idx=int(self.camera_indices[view_idx].item())
             )
         else:
-            # Single camera: view_idx == frame_idx
             return ViewIndex(view_idx=view_idx, frame_idx=view_idx)
 
     def get_views_for_frame(self, frame_idx: int) -> List[int]:
@@ -58,7 +57,6 @@ class ViewMapping:
             mask = self.frame_indices == frame_idx
             return torch.where(mask)[0].tolist()
         else:
-            # Single camera: one view per frame
             return [frame_idx] if frame_idx < self.num_views else []
 
 

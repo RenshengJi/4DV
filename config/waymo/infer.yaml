@@ -1,16 +1,15 @@
 # Multi-Camera Inference Configuration for VGGT
-# 多相机推理配置文件
 
 # debug: true
 
-# =============== 模型配置 ===============
+# =============== Model Configuration ===============
 model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=0, use_gs_head=True, use_gs_head_velocity=True, use_gs_head_segment=False, use_gt_camera=True, velocity_head_small_init=False)"
 
-# 模型检查点路径
+# Model checkpoint path
 model_path: "checkpoints/new/start/checkpoint-epoch_0_4166.pth"
 
-# =============== 数据集配置 ===============
-# 多相机模式数据集
+# =============== Dataset Configuration ===============
+# Multi-camera mode dataset
 infer_dataset: Waymo_Multi(
   ROOT="data/waymo/train_full",
   valid_camera_id_list=["1", "2", "3"],
@@ -21,51 +20,51 @@ infer_dataset: Waymo_Multi(
   multi_camera_mode=True,
   zero_ground_velocity=True)
 
-# 每个相机的帧数
+# Frames per camera
 num_views: 4
 
-# =============== 推理配置 ===============
-# 批处理模式
+# =============== Inference Configuration ===============
+# Batch processing mode
 batch_mode: true
 start_idx: 2
 end_idx: 100
 step: 1
 
-# 单样本模式 (当batch_mode=false时使用)
+# Single sample mode (used when batch_mode=false)
 single_idx: 0
 
-# 设备配置
+# Device configuration
 device: "cuda"
 
-# 可视化配置
+# Visualization configuration
 fps: 10
 save_video: true
 save_images: false
 
-# =============== Gaussian Splatting配置 ===============
+# =============== Gaussian Splatting Configuration ===============
 sh_degree: 0
-use_gt_camera: true              # 是否使用GT相机参数
+use_gt_camera: true              # Use GT camera parameters
 
-# =============== 动态物体处理配置 ===============
-# 速度变换模式: "simple" (仅平移) 或 "procrustes" (旋转+平移)
+# =============== Dynamic Object Processing Configuration ===============
+# Velocity transform mode: "simple" (translation only) or "procrustes" (rotation+translation)
 velocity_transform_mode: "procrustes"
 
-# 动态物体检测阈值
-velocity_threshold: 0.1           # 速度阈值 (m/s)
-clustering_eps: 0.3              # DBSCAN邻域半径
-clustering_min_samples: 10       # DBSCAN最小样本数
-min_object_size: 500             # 最小物体尺寸（点数）
+# Dynamic object detection thresholds
+velocity_threshold: 0.1           # Velocity threshold (m/s)
+clustering_eps: 0.3              # DBSCAN neighborhood radius
+clustering_min_samples: 10       # DBSCAN minimum samples
+min_object_size: 500             # Minimum object size (points)
 
-# 物体跟踪阈值
-tracking_position_threshold: 2.0  # 位置匹配阈值 (米)
-tracking_velocity_threshold: 0.2  # 速度匹配阈值 (m/s)
+# Object tracking thresholds
+tracking_position_threshold: 2.0  # Position matching threshold (meters)
+tracking_velocity_threshold: 0.2  # Velocity matching threshold (m/s)
 
-# =============== 输出配置 ===============
+# =============== Output Configuration ===============
 output_dir: "./results/multi_camera"
-output_prefix: "waymo_multi"        # 输出文件名前缀
-continue_on_error: true             # 遇到错误时继续处理下一个样本
+output_prefix: "waymo_multi"        # Output filename prefix
+continue_on_error: true             # Continue to next sample on error
 
-# =============== Hydra配置 ===============
+# =============== Hydra Configuration ===============
 hydra:
   verbose: False
   run:

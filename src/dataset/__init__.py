@@ -5,14 +5,12 @@ from .base_dataset import BaseDataset
 from .waymo import WaymoDataset
 from .easy_dataset import EasyDataset, MulDataset, ResizedDataset, CatDataset
 
-# Import transforms and sampler (migrated from dust3r)
 from .transforms import ImgNorm
 from .batched_sampler import BatchedRandomSampler
 
 from accelerate import Accelerator
 import torch
 
-# Create alias for compatibility with config files
 Waymo_Multi = WaymoDataset
 
 
@@ -40,29 +38,22 @@ def vggt_collate_fn(batch):
         - camera_indices: [B, S] (optional, multi-camera mode)
         - frame_indices: [B, S] (optional, multi-camera mode)
     """
-    # batch is a list of samples
-    # Each sample is a list of view dicts
-
     batch_size = len(batch)
     num_views = len(batch[0])
 
-    # Initialize output dict
     output = {}
 
-    # Get keys from first view of first sample
     sample_keys = batch[0][0].keys()
 
-    # Keys that should be batched as tensors
     tensor_keys = {
         'img', 'depthmap', 'camera_intrinsics', 'camera_pose',
         'valid_mask', 'pts3d', 'flowmap', 'segment_label',
         'segment_mask', 'depth_scale_factor', 'sky_mask'
     }
 
-    # Keys to skip (metadata)
     skip_keys = {'idx', 'dataset', 'label', 'instance', 'is_video',
                  'is_metric', 'quantile', 'rng', 'true_shape', 'ray_map',
-                 'camera_idx', 'frame_idx'}  # Skip camera_idx and frame_idx from tensor_keys
+                 'camera_idx', 'frame_idx'}
 
     for key in sample_keys:
         if key in skip_keys:
@@ -71,7 +62,6 @@ def vggt_collate_fn(batch):
         if key not in tensor_keys:
             continue
 
-        # Check if all samples have this key with valid values
         has_key = all(
             key in view and view[key] is not None
             for sample in batch
@@ -82,27 +72,21 @@ def vggt_collate_fn(batch):
             output[key] = None
             continue
 
-        # Stack across batch and views
         try:
             if key == 'depth_scale_factor':
-                # This is per-sample, not per-view
                 tensors = [sample[0][key] for sample in batch]
-                output[key] = torch.stack(tensors, dim=0)  # [B]
+                output[key] = torch.stack(tensors, dim=0)
             else:
-                # Stack across views first, then batch
                 batch_tensors = []
                 for sample in batch:
                     view_tensors = [view[key] for view in sample]
-                    batch_tensors.append(torch.stack(view_tensors, dim=0))  # [S, ...]
-                output[key] = torch.stack(batch_tensors, dim=0)  # [B, S, ...]
+                    batch_tensors.append(torch.stack(view_tensors, dim=0))
+                output[key] = torch.stack(batch_tensors, dim=0)
         except Exception as e:
             print(f"Error stacking key {key}: {e}")
             output[key] = None
 
-    # ========== Extract camera_indices and frame_indices for multi-camera mode ==========
-    # Check if the first view of the first sample has camera_idx and frame_idx fields
     if 'camera_idx' in batch[0][0] and 'frame_idx' in batch[0][0]:
-        # Multi-camera mode: extract indices
         camera_indices_list = []
         frame_indices_list = []
 
@@ -113,14 +97,12 @@ def vggt_collate_fn(batch):
             camera_indices_list.append(torch.tensor(sample_camera_indices, dtype=torch.long))
             frame_indices_list.append(torch.tensor(sample_frame_indices, dtype=torch.long))
 
-        output['camera_indices'] = torch.stack(camera_indices_list, dim=0)  # [B, S] or [B, C*S]
-        output['frame_indices'] = torch.stack(frame_indices_list, dim=0)    # [B, S] or [B, C*S]
+        output['camera_indices'] = torch.stack(camera_indices_list, dim=0)
+        output['frame_indices'] = torch.stack(frame_indices_list, dim=0)
     else:
-        # Single-camera mode: no camera indices
         output['camera_indices'] = None
         output['frame_indices'] = None
 
-    # Rename keys to match VGGT format
     vggt_batch = {
         'images': output.get('img'),
         'depths': output.get('depthmap'),
@@ -133,8 +115,8 @@ def vggt_collate_fn(batch):
         'segment_mask': output.get('segment_mask'),
         'depth_scale_factor': output.get('depth_scale_factor'),
         'sky_masks': output.get('sky_mask'),
-        'camera_indices': output.get('camera_indices'),  # New field
-        'frame_indices': output.get('frame_indices'),    # New field
+        'camera_indices': output.get('camera_indices'),
+        'frame_indices': output.get('frame_indices'),
     }
 
     return vggt_batch
@@ -166,11 +148,9 @@ def get_data_loader(
     Returns:
         DataLoader instance
     """
-    # Eval string if necessary
     if isinstance(dataset, str):
         dataset = eval(dataset)
 
-    # Try to use custom sampler if available
     try:
         sampler = dataset.make_sampler(
             batch_size,
@@ -190,7 +170,6 @@ def get_data_loader(
         )
 
     except (AttributeError, NotImplementedError):
-        # Fallback to standard DataLoader
         sampler = None
 
         data_loader = torch.utils.data.DataLoader(

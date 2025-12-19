@@ -44,23 +44,19 @@ class TrackHead(nn.Module):
         super().__init__()
 
         self.patch_size = patch_size
-        self.gradient_checkpointing = False  # Flag for enabling gradient checkpointing
+        self.gradient_checkpointing = False
 
-        # Feature extractor based on DPT architecture
-        # Processes tokens into feature maps for tracking
         self.feature_extractor = DPTHead(
             dim_in=dim_in,
             patch_size=patch_size,
             features=features,
-            feature_only=True,  # Only output features, no activation
-            down_ratio=2,  # Reduces spatial dimensions by factor of 2
+            feature_only=True,
+            down_ratio=2,
             pos_embed=False,
         )
 
-        # Tracker module that predicts point trajectories
-        # Takes feature maps and predicts coordinates and visibility
         self.tracker = BaseTrackerPredictor(
-            latent_dim=features,  # Match the output_dim of feature extractor
+            latent_dim=features,
             predict_conf=predict_conf,
             stride=stride,
             corr_levels=corr_levels,
@@ -70,7 +66,7 @@ class TrackHead(nn.Module):
 
         self.iters = iters
 
-    def gradient_checkpointing_enable(self, enable=True):  # Added for gradient checkpointing
+    def gradient_checkpointing_enable(self, enable=True):
         """Enable or disable gradient checkpointing."""
         self.gradient_checkpointing = enable
 
@@ -95,15 +91,11 @@ class TrackHead(nn.Module):
         """
         B, S, _, H, W = images.shape
 
-        # Extract features from tokens
-        # feature_maps has shape (B, S, C, H//2, W//2) due to down_ratio=2
         feature_maps = self.feature_extractor(aggregated_tokens_list, images, patch_start_idx)
 
-        # Use default iterations if not specified
         if iters is None:
             iters = self.iters
 
-        # Perform tracking using the extracted features
         coord_preds, vis_scores, conf_scores = self.tracker(query_points=query_points, fmaps=feature_maps, iters=iters)
 
         return coord_preds, vis_scores, conf_scores

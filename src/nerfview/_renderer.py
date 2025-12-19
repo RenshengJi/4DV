@@ -89,10 +89,8 @@ class Renderer(threading.Thread):
         return self._may_interrupt_trace
 
     def _get_img_wh(self, aspect: float) -> Tuple[int, int]:
-        # we always trade off speed for quality
         max_img_res = self.viewer.render_tab_state.viewer_res
         if self._state in ["high"]:
-            #  if True:
             H = max_img_res
             W = int(H * aspect)
             if W > max_img_res:
@@ -138,7 +136,6 @@ class Renderer(threading.Thread):
             self._render_event.clear()
             task = self._task
             assert task is not None
-            #  print(self._state, task.action, self.transitions[self._state][task.action])
             if self._state == "high" and task.action == "static":
                 continue
             self._state = self.transitions[self._state][task.action]

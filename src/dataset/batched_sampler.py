@@ -7,13 +7,9 @@ from torch.utils.data import BatchSampler, Sampler
 
 
 class CustomRandomSampler(Sampler):
-    """Random sampling under a constraint: each sample in the batch has the same feature,
-    which is chosen randomly from a known pool of 'features' for each batch.
-
-    For instance, the 'feature' could be the image aspect-ratio.
-
-    The index returned is a tuple (sample_idx, feat_idx).
-    This sampler ensures that each series of `batch_size` indices has the same `feat_idx`.
+    """
+    Random sampling with batch-wise constraint: all samples in a batch share the same feature.
+    Returns tuples (sample_idx, feat_idx) where feat_idx is constant per batch.
     """
 
     def __init__(
@@ -52,10 +48,8 @@ class CustomRandomSampler(Sampler):
 
         seed = self.epoch + 788
         rng = np.random.default_rng(seed=seed)
-        # random indices (will restart from 0 if not drop_last)
         sample_idxs = np.arange(self.total_size)
         rng.shuffle(sample_idxs)
-        # random feat_idxs (same across each batch)
         n_batches = (self.total_size + self.batch_size - 1) // self.batch_size
         if self.pool_size > 1:
             p = np.ones(self.pool_size)
@@ -77,10 +71,10 @@ class CustomRandomSampler(Sampler):
 
 
 class BatchedRandomSampler(BatchSampler):
-    """Batch sampler that groups indices from RandomSampler into batches."""
+    """Batch sampler that groups indices from CustomRandomSampler into batches."""
 
     def __init__(self, sampler: CustomRandomSampler, batch_size, drop_last=True):
-        self.sampler = sampler  # An instance of RandomSampler
+        self.sampler = sampler
         self.batch_size = batch_size
         self.drop_last = drop_last
 

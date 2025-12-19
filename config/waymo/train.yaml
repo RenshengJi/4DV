@@ -1,46 +1,44 @@
 # Stage 1 Online Training Configuration for VGGT
-# 第一阶段在线训练配置 - 包含统一的损失权重管理
 
 debug: true
 
-# =============== 模型配置 ===============
+# =============== Model Configuration ===============
 model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=0, use_gs_head=True, use_gs_head_velocity=True, use_gs_head_segment=False, use_gt_camera=True, velocity_head_small_init=False)"
-# sh_degree: 球谐函数的阶数（0=只有DC分量3个参数，1=DC+方向性12个参数，2=27个参数，3=48个参数）
-# use_gs_head: 是否对gaussian_head使用DPTGSHead (True=DPTGSHead, False=DPTHead)
-#   - True: gaussian_head使用DPTGSHead (默认)
-#   - False: gaussian_head使用普通DPTHead
-# use_gs_head_velocity: 是否对velocity_head使用DPTGSHead (True=DPTGSHead, False=DPTHead)
-#   - True: velocity_head使用DPTGSHead
-#   - False: velocity_head使用普通DPTHead (默认)
-# use_gs_head_segment: 是否对segment_head使用DPTGSHead (True=DPTGSHead, False=DPTHead)
-#   - True: segment_head使用DPTGSHead
-#   - False: segment_head使用普通DPTHead (默认)
-# Gaussian head的output_dim会根据sh_degree自动计算：11 + 3*(sh_degree+1)^2
-# use_gt_camera: 是否在模型forward中使用GT相机参数来计算world_points
-#   - True: 使用GT的extrinsics和intrinsics
-#   - False: 使用模型预测的pose_enc (默认)
-# velocity_head_small_init: 是否对velocity_head最后一层进行小初始化
-#   - True: 最后一层weight初始化为小值(std=0.001)，bias初始化为0，使velocity从接近0开始
-#   - False: 使用默认初始化 (默认)
+# sh_degree: Spherical harmonics degree (0=DC only 3 params, 1=DC+directional 12 params, 2=27 params, 3=48 params)
+# use_gs_head: Use DPTGSHead for gaussian_head (True=DPTGSHead, False=DPTHead)
+#   - True: gaussian_head uses DPTGSHead (default)
+#   - False: gaussian_head uses standard DPTHead
+# use_gs_head_velocity: Use DPTGSHead for velocity_head (True=DPTGSHead, False=DPTHead)
+#   - True: velocity_head uses DPTGSHead
+#   - False: velocity_head uses standard DPTHead (default)
+# use_gs_head_segment: Use DPTGSHead for segment_head (True=DPTGSHead, False=DPTHead)
+#   - True: segment_head uses DPTGSHead
+#   - False: segment_head uses standard DPTHead (default)
+# Gaussian head output_dim is auto-calculated based on sh_degree: 11 + 3*(sh_degree+1)^2
+# use_gt_camera: Use GT camera parameters in model forward for world_points calculation
+#   - True: Use GT extrinsics and intrinsics
+#   - False: Use model predicted pose_enc (default)
+# velocity_head_small_init: Small initialization for velocity_head last layer
+#   - True: Last layer weight initialized to small value (std=0.001), bias to 0, velocity starts near 0
+#   - False: Use default initialization (default)
 
 # pretrained: model.pt
 # pretrained_velocity: False
 pretrained_velocity: "src/checkpoints/new/start/checkpoint-epoch_0_19533.pth"
 
-# VGGT冻结策略配置
-# 可选值: "none", "noap",
-# null表示不设置冻结策略（保持模型默认行为）
+# VGGT freeze strategy configuration
+# Options: "none", "noap", null (null means no freeze strategy, keep model default behavior)
 vggt_freeze_strategy: "none"
 
 
-# =============== 辅助模型配置 ===============
+# =============== Auxiliary Model Configuration ===============
 auxiliary_models:
-  # # DAM2模型 (用于生成sky masks)
+  # # DAM2 model (for generating sky masks)
   # dam2: DepthAnythingV2(encoder="vitb", offload=${offload_auxiliary})
 
 offload_auxiliary: False
 
-# =============== 训练配置 ===============
+# =============== Training Configuration ===============
 load_only_encoder: False
 long_context: True
 fixed_length: False
@@ -49,69 +47,69 @@ benchmark: False
 num_views: 4
 num_test_views: 16
 
-# =============== 第一阶段损失权重配置 ===============
-# 权重为0则完全不计算该损失
+# =============== Stage 1 Loss Weight Configuration ===============
+# Weight of 0 means the loss is not computed
 
-# Self Render Loss (训练gaussian head)
-self_render_weight: 0.0                    # Gaussian参数学习的主要损失
-self_render_rgb_weight: 1.0                # RGB损失权重
-self_render_lpips_weight: 0.0              # LPIPS感知损失权重
-self_render_depth_weight: 0.0              # 深度损失权重
+# Self Render Loss (trains gaussian head)
+self_render_weight: 0.0                    # Main loss for Gaussian parameter learning
+self_render_rgb_weight: 1.0                # RGB loss weight
+self_render_lpips_weight: 0.0              # LPIPS perceptual loss weight
+self_render_depth_weight: 0.0              # Depth loss weight
 
-# GT Flow Loss Ours (我们自己实现的版本)
-gt_flow_loss_ours_weight: 1.0              # 自定义GT flowmap损失权重
+# GT Flow Loss Ours (custom implementation)
+gt_flow_loss_ours_weight: 1.0              # Custom GT flowmap loss weight
 
-# Sky Opacity Loss (监督gaussian head的opacity参数)
-sky_opacity_weight: 0.0                    # 天空区域opacity约束
+# Sky Opacity Loss (supervises gaussian head opacity parameter)
+sky_opacity_weight: 0.0                    # Sky region opacity constraint
 
-# Velocity Regularization Loss (约束velocity值)
-velocity_reg_weight: 0.0                 # 速度正则化约束
+# Velocity Regularization Loss (constrains velocity values)
+velocity_reg_weight: 0.0                   # Velocity regularization constraint
 
-# Segmentation Loss (监督segment head训练)
-segment_loss_weight: 1.0                  # 语义分割损失权重 (从flowmap第4维度提取GT labels)
-                                          # 4类: bg(0), vehicle(1), sign(2), pedestrian+cyclist(3)
+# Segmentation Loss (trains segment head)
+segment_loss_weight: 1.0                   # Semantic segmentation loss weight (GT labels from flowmap 4th dimension)
+                                           # 4 classes: bg(0), vehicle(1), sign(2), pedestrian+cyclist(3)
 
-# Camera Loss (监督camera head训练)
-camera_loss_weight: 5.0                   # 相机参数预测损失权重
+# Camera Loss (trains camera head)
+camera_loss_weight: 5.0                    # Camera parameter prediction loss weight
 
-# Depth Loss (监督depth head训练)
-conf_depth_loss_weight: 1.0                    # 深度预测损失权重
-grad_depth_loss_weight: 0.0                 # 深度梯度损失权重
-reg_depth_loss_weight: 1.0                      # 深度正则化损失权重
+# Depth Loss (trains depth head)
+conf_depth_loss_weight: 1.0                # Depth prediction loss weight
+grad_depth_loss_weight: 0.0                # Depth gradient loss weight
+reg_depth_loss_weight: 1.0                 # Depth regularization loss weight
 
-# Scale Loss (监督scale head训练，使用depth_scale_factor作为GT)
-scale_loss_weight: 1.0                      # 场景尺度预测损失权重
+# Scale Loss (trains scale head, uses depth_scale_factor as GT)
+scale_loss_weight: 1.0                     # Scene scale prediction loss weight
 
-# Aggregator_all Render Loss (代替Stage2 refine网络的渲染loss)
-# 这个loss直接在Stage1中使用动态物体处理+渲染监督,跳过Stage2的refine网络
-aggregator_all_start_iter: 0           # Aggregator_all loss开始计算的iteration (默认50k)
-aggregator_all_render_rgb_weight: 1.0      # Aggregator_all RGB渲染损失权重
-aggregator_all_render_depth_weight: 1.0    # Aggregator_all depth渲染损失权重
-aggregator_all_render_lpips_weight: 0.1    # Aggregator_all LPIPS渲染损失权重
-aggregator_all_detach_velocity: true      # 是否detach velocity阻止梯度回传到velocity head
-                                           # true: velocity.detach()不回传梯度，只用velocity监督dynamic objects
-                                           # false: 允许渲染loss梯度回传到velocity head (默认)
-# Stage2配置（用于aggregator_all loss的渲染配置）
-stage2_render_only_dynamic: false          # 是否只渲染动态物体
-stage2_supervise_only_dynamic: false       # 是否只监督动态区域
+# Aggregator_all Render Loss (replaces Stage2 refine network rendering loss)
+# This loss directly uses dynamic object processing + rendering supervision in Stage1, skipping Stage2 refine network
+aggregator_all_start_iter: 0               # Iteration to start aggregator_all loss (default 50k)
+aggregator_all_render_rgb_weight: 1.0      # Aggregator_all RGB rendering loss weight
+aggregator_all_render_depth_weight: 1.0    # Aggregator_all depth rendering loss weight
+aggregator_all_render_lpips_weight: 0.1    # Aggregator_all LPIPS rendering loss weight
+aggregator_all_detach_velocity: true       # Detach velocity to prevent gradient backprop to velocity head
+                                           # true: velocity.detach() prevents gradient backprop, only use velocity to supervise dynamic objects
+                                           # false: Allow rendering loss gradient backprop to velocity head (default)
+# Stage2 configuration (rendering config for aggregator_all loss)
+stage2_render_only_dynamic: false          # Render only dynamic objects
+stage2_supervise_only_dynamic: false       # Supervise only dynamic regions
 
-# 渲染配置（用于self_render_loss和aggregator_all_loss）
-enable_voxel_pruning: true                 # 是否启用voxel剪枝
-voxel_size: 0.002                          # voxel大小（metric尺度，单位米）
+# Rendering configuration (for self_render_loss and aggregator_all_loss)
+enable_voxel_pruning: true                 # Enable voxel pruning
+voxel_size: 0.002                          # Voxel size (metric scale, meters)
 
-# 动态处理器配置（用于aggregator_all loss的动态物体处理）
-min_object_size: 500                       # 最小物体尺寸（点数）
-max_objects_per_frame: 10                  # 每帧最大物体数量
-velocity_threshold: 0.1                    # 速度阈值（metric尺度，m/s）
-clustering_eps: 0.3                       # DBSCAN邻域半径
-clustering_min_samples: 10                 # DBSCAN最小样本数
-tracking_position_threshold: 2.0           # 位置匹配阈值
-tracking_velocity_threshold: 0.2           # 速度匹配阈值
-enable_optical_flow_aggregation: true      # 是否使用光流聚合
-use_velocity_based_transform: true        # 是否使用velocity直接计算变换（false=光流方法，true=velocity方法）
-velocity_transform_mode: "procrustes"          # velocity变换模式: "simple"(仅T)或"procrustes"(R+T)
+# Dynamic processor configuration (for aggregator_all loss dynamic object processing)
+min_object_size: 500                       # Minimum object size (points)
+max_objects_per_frame: 10                  # Maximum objects per frame
+velocity_threshold: 0.1                    # Velocity threshold (metric scale, m/s)
+clustering_eps: 0.3                        # DBSCAN neighborhood radius
+clustering_min_samples: 10                 # DBSCAN minimum samples
+tracking_position_threshold: 2.0           # Position matching threshold
+tracking_velocity_threshold: 0.2           # Velocity matching threshold
+enable_optical_flow_aggregation: true      # Use optical flow aggregation
+use_velocity_based_transform: true         # Use velocity for direct transform (false=optical flow method, true=velocity method)
+velocity_transform_mode: "procrustes"      # Velocity transform mode: "simple"(T only) or "procrustes"(R+T)
 
-# =============== 数据集配置 ===============
+# =============== Dataset Configuration ===============
 
 train_dataset: 500000 @ Waymo_Multi(
   ROOT="data/waymo/train_full",
@@ -119,16 +117,16 @@ train_dataset: 500000 @ Waymo_Multi(
   intervals=[5],
   resolution=[(518, 336)], transform=ImgNorm,
   num_views=${num_views}, zero_ground_velocity=True,
-  multi_camera_mode=True)  # New: set to True to enable multi-camera mode
+  multi_camera_mode=True)  # Enable multi-camera mode
 
 test_dataset: 1000 @ Waymo_Multi(
   ROOT="data/waymo/train_full",
   valid_camera_id_list=["1", "2", "3"],
   intervals=[1],
   resolution=[(518, 378),(518, 336),(518, 294),(518, 252),(518, 210),(518, 140),(378, 518),(336, 518),(294, 518),(252, 518)], num_views=${num_test_views}, seed=42, zero_ground_velocity=True,
-  multi_camera_mode=True)  # New: set to True to enable multi-camera mode
+  multi_camera_mode=True)  # Enable multi-camera mode
 
-# =============== 优化器配置 ===============
+# =============== Optimizer Configuration ===============
 seed: 0
 batch_size: 1
 accum_iter: 4
@@ -141,7 +139,7 @@ min_lr: 1e-8
 warmup_epochs: 0.02
 amp: 1
 
-# =============== 训练监控配置 ===============
+# =============== Training Monitoring Configuration ===============
 num_workers: 4
 world_size: 1
 local-rank: -1
@@ -152,20 +150,20 @@ distributed: False
 dist_backend: 'nccl'
 
 eval_freq: 1
-save_freq: 0.05                             # 每10%的epoch保存一次
+save_freq: 0.05                             # Save every 10% of epoch
 keep_freq: 2
 print_freq: 10
 print_img_freq: 50000000
 num_imgs_vis: 4
 
-# =============== 输出配置 ===============
+# =============== Output Configuration ===============
 save_dir: 'checkpoints/new'
 exp_name: 'start'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/
 
-# =============== Hydra配置 ===============
+# =============== Hydra Configuration ===============
 hydra:
   verbose: False
   run:

@@ -29,6 +29,7 @@ var/
 .installed.cfg
 *.egg
 .vscode/
+CLAUDE.md
 
 # Installer logs
 pip-log.txt

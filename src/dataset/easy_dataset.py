@@ -14,7 +14,6 @@ class EasyDataset:
     A dataset that supports easy resizing and combination using operators.
 
     Examples:
-    ---------
         2 * dataset ==> duplicate each element 2x
         10 @ dataset ==> set the size to 10 (random sampling, duplicates if necessary)
         dataset1 + dataset2 ==> concatenate datasets
@@ -34,20 +33,15 @@ class EasyDataset:
 
     def set_epoch(self, epoch):
         """Set epoch for dataset (used by ResizedDataset for shuffling)"""
-        pass  # nothing to do by default
+        pass
 
     def make_sampler(
         self, batch_size, shuffle=True, drop_last=True, world_size=1, rank=0, fixed_length=False
     ):
-        """
-        Create a simple random sampler for this dataset.
-        No longer uses tuple indices - just returns scene indices.
-        """
+        """Create a simple random sampler for this dataset."""
         if not shuffle:
             raise NotImplementedError("Non-shuffled sampling not yet supported")
 
-        # Use standard PyTorch RandomSampler instead of CustomRandomSampler
-        # since we no longer need tuple indices (scene_idx, ar_idx, nview)
         from torch.utils.data import RandomSampler, BatchSampler
 
         sampler = RandomSampler(self)
@@ -70,7 +64,6 @@ class MulDataset(EasyDataset):
         return f"{self.multiplicator}*{repr(self.dataset)}"
 
     def __getitem__(self, idx):
-        # Simply map to base dataset with divided index
         return self.dataset[idx // self.multiplicator]
 
     @property
@@ -102,13 +95,10 @@ class ResizedDataset(EasyDataset):
 
     def set_epoch(self, epoch):
         """Shuffle indices based on epoch"""
-        # This random shuffle only depends on the epoch
         rng = np.random.default_rng(seed=epoch + 777)
 
-        # Shuffle all indices
         perm = rng.permutation(len(self.dataset))
 
-        # Rotary extension until target size is met
         shuffled_idxs = np.concatenate(
             [perm] * (1 + (len(self) - 1) // len(self.dataset))
         )
@@ -121,7 +111,6 @@ class ResizedDataset(EasyDataset):
             self, "_idxs_mapping"
         ), "You need to call dataset.set_epoch() to use ResizedDataset.__getitem__()"
 
-        # Simply map to base dataset with shuffled index
         return self.dataset[self._idxs_mapping[idx]]
 
     @property
@@ -146,7 +135,6 @@ class CatDataset(EasyDataset):
         return self._cum_sizes[-1]
 
     def __repr__(self):
-        # Remove uselessly long transform descriptions
         return " + ".join(
             repr(dataset).replace(
                 ",transform=Compose( ToTensor() Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)))",
@@ -164,7 +152,6 @@ class CatDataset(EasyDataset):
         if not (0 <= idx < len(self)):
             raise IndexError()
 
-        # Find which dataset this index belongs to
         db_idx = np.searchsorted(self._cum_sizes, idx, "right")
         dataset = self.datasets[db_idx]
         new_idx = idx - (self._cum_sizes[db_idx - 1] if db_idx > 0 else 0)

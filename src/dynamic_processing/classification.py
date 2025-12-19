@@ -28,12 +28,10 @@ def classify_objects(
     device = segment_logits.device
     object_classes = {}
 
-    # Collect all global IDs
     all_ids = set()
     for result in tracked_results:
         all_ids.update(result.get('global_ids', []))
 
-    # Classify each object
     for object_id in all_ids:
         logits_list = []
 
@@ -51,18 +49,14 @@ def classify_objects(
             if not pixel_indices:
                 continue
 
-            # Get view indices for this frame
             view_indices = result.get('view_indices', [frame_idx])
 
-            # Extract logits for all views in this frame
             for view_idx in view_indices:
                 if view_idx >= segment_logits.shape[1]:
                     continue
 
                 frame_logits = segment_logits[0, view_idx]  # [H, W, 4]
 
-                # Convert pixel indices to 2D coordinates
-                # Handle multi-view offset
                 view_offset = view_indices.index(view_idx) * H * W if len(view_indices) > 1 else 0
                 view_pixels = [p - view_offset for p in pixel_indices
                               if view_offset <= p < view_offset + H * W]
@@ -74,7 +68,6 @@ def classify_objects(
                 v_coords = pixel_tensor // W
                 u_coords = pixel_tensor % W
 
-                # Filter valid coordinates
                 valid = (v_coords >= 0) & (v_coords < H) & (u_coords >= 0) & (u_coords < W)
                 v_valid = v_coords[valid]
                 u_valid = u_coords[valid]
@@ -84,11 +77,9 @@ def classify_objects(
                     logits_list.append(pixel_logits.detach())
 
         if not logits_list:
-            # No data, default to car
             object_classes[object_id] = 'car'
             continue
 
-        # Aggregate logits and classify
         all_logits = torch.cat(logits_list, dim=0)  # [Total, 4]
         summed_logits = all_logits.sum(dim=0)  # [4]
         probs = torch.softmax(summed_logits, dim=0)
@@ -100,6 +91,6 @@ def classify_objects(
         elif pred_class == 3:
             object_classes[object_id] = 'pedestrian'
         else:
-            object_classes[object_id] = 'car'  # Default
+            object_classes[object_id] = 'car'
 
     return object_classes

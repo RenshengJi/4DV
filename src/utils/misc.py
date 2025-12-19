@@ -9,8 +9,8 @@ from contextlib import contextmanager
 def tf32_off():
     """Context manager to temporarily disable TF32 for CUDA matmul operations."""
     original = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = False  # disable tf32 temporarily
+    torch.backends.cuda.matmul.allow_tf32 = False
     try:
         yield
     finally:
-        torch.backends.cuda.matmul.allow_tf32 = original  # restore original setting
+        torch.backends.cuda.matmul.allow_tf32 = original

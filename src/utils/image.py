@@ -39,7 +39,6 @@ def _make_colorwheel(
         colorwheel: The RGB values of the transitions in the color space.
     """
     colorwheel_length = sum(transitions)
-    # The red hue is repeated to make the colorwheel cyclic
     base_hues = map(
         np.array,
         (
@@ -97,22 +96,18 @@ def scene_flow_to_rgb(
         backend = "torch"
         op = torch
 
-    # For scene flow, it's reasonable to assume displacements in x and y directions only for visualization pursposes.
     complex_flow = flow[..., 0] + 1j * flow[..., 1]
     radius, angle = op.abs(complex_flow), op.angle(complex_flow)
     if flow_max_radius is None:
-        # flow_max_radius = torch.max(radius)
         flow_max_radius = op.quantile(radius, 0.99)
     if flow_max_radius > 0:
         radius /= flow_max_radius
-    # Map the angles from (-pi, pi] to [0, 2pi) to [0, ncols - 1)
     wheel = _make_colorwheel(backend=backend)
     n_cols = len(wheel)
     wheel = op.vstack((wheel, wheel[0]))
     angle[angle < 0] += 2 * np.pi
     angle = angle * ((n_cols - 1) / (2 * np.pi))
 
-    # Interpolate the hues
     angle_fractional, angle_floor, angle_ceil = (
         op.fmod(angle, 1),
         op.trunc(angle),

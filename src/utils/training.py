@@ -340,7 +340,6 @@ def get_parameter_groups(
     parameter_group_names = {}
     parameter_group_vars = {}
     enc_depth, dec_depth = None, None
-    # prepare layer decay values
     assert layer_decay == 1.0 or 0.0 < layer_decay < 1.0
     if layer_decay < 1.0:
         enc_depth = model.enc_depth
@@ -352,9 +351,8 @@ def get_parameter_groups(
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
-            continue  # frozen weights
+            continue
 
-        # Assign weight decay values
         if len(param.shape) == 1 or name.endswith(".bias") or name in skip_list:
             if "enc_blocks" in name:
                 group_name = "no_decay_enc_blocks"
@@ -368,7 +366,6 @@ def get_parameter_groups(
                 group_name = "decay"
             this_weight_decay = weight_decay
 
-        # Assign layer ID for LR scaling
         if layer_decay < 1.0:
             skip_scale = False
             layer_id = _get_num_layer_for_vit(name, enc_depth, dec_depth)

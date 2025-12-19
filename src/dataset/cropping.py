@@ -1,6 +1,5 @@
 """
 Cropping utilities for dataset processing.
-Extracted from dust3r to avoid dependencies.
 """
 import PIL.Image
 import os

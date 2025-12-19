@@ -120,55 +120,42 @@ class Aggregator(nn.Module):
         self.aa_block_size = aa_block_size
         self.memory_efficient = memory_efficient
 
-        # Set default output layers if not specified
-        # Based on the comment: layers 4, 11, 17, and 23 are required
-        # Camera head needs the last layer (23), so we always include it
         if output_layers is None:
             if memory_efficient:
-                # Always include the last layer for camera head
                 self.output_layers = set([4, 11, 17, 23])
-                # Ensure we include the last layer
                 if depth - 1 not in self.output_layers:
                     self.output_layers.add(depth - 1)
             else:
                 self.output_layers = set(range(depth))
         else:
             self.output_layers = set(output_layers)
-            # Always ensure the last layer is included for camera head
             self.output_layers.add(depth - 1)
 
-        # Validate that depth is divisible by aa_block_size
         if self.depth % self.aa_block_size != 0:
             raise ValueError(f"depth ({depth}) must be divisible by aa_block_size ({aa_block_size})")
 
         self.aa_block_num = self.depth // self.aa_block_size
 
-        # Note: We have two camera tokens, one for the first frame and one for the rest
-        # The same applies for register tokens
         self.camera_token = nn.Parameter(torch.randn(1, 2, 1, embed_dim))
         self.register_token = nn.Parameter(torch.randn(1, 2, num_register_tokens, embed_dim))
 
-        # Sky token and scale token support (managed externally by VGGT main model)
         self.use_sky_token = use_sky_token
         self.use_scale_token = use_scale_token
 
-        # Calculate patch_start_idx based on special tokens
-        num_special_tokens = 1 + num_register_tokens  # camera + register
+        num_special_tokens = 1 + num_register_tokens
         if self.use_sky_token:
-            num_special_tokens += 1  # add sky token
+            num_special_tokens += 1
         if self.use_scale_token:
-            num_special_tokens += 1  # add scale token
+            num_special_tokens += 1
         self.patch_start_idx = num_special_tokens
 
-        # Initialize parameters with small values
         nn.init.normal_(self.camera_token, std=1e-6)
         nn.init.normal_(self.register_token, std=1e-6)
 
-        # Register normalization constants as buffers
         for name, value in (("_resnet_mean", _RESNET_MEAN), ("_resnet_std", _RESNET_STD)):
             self.register_buffer(name, torch.FloatTensor(value).view(1, 1, 3, 1, 1), persistent=False)
 
-        self.use_reentrant = False # hardcoded to False
+        self.use_reentrant = False
 
     def __build_patch_embed__(
         self,
@@ -207,7 +194,6 @@ class Aggregator(nn.Module):
                 init_values=init_values,
             )
 
-            # Disable gradient updates for mask token
             if hasattr(self.patch_embed, "mask_token"):
                 self.patch_embed.mask_token.requires_grad_(False)
 
@@ -231,10 +217,8 @@ class Aggregator(nn.Module):
         if C_in != 3:
             raise ValueError(f"Expected 3 input channels, got {C_in}")
 
-        # Normalize images and reshape for patch embed
         images = (images - self._resnet_mean) / self._resnet_std
 
-        # Reshape to [B*S, C, H, W] for patch embedding
         images = images.view(B * S, C_in, H, W)
         patch_tokens = self.patch_embed(images)
 
@@ -243,11 +227,9 @@ class Aggregator(nn.Module):
 
         _, P, C = patch_tokens.shape
 
-        # Expand camera and register tokens to match batch size and sequence length
         camera_token = slice_expand_and_flatten(self.camera_token, B, S)
         register_token = slice_expand_and_flatten(self.register_token, B, S)
 
-        # Add sky token and scale token if enabled
         special_tokens = []
         if self.use_sky_token:
             if sky_token is None:
@@ -260,7 +242,6 @@ class Aggregator(nn.Module):
             scale_token_expanded = scale_token.repeat(B * S, 1, 1)
             special_tokens.append(scale_token_expanded)
 
-        # Concatenate all tokens: [special_tokens, camera_token, register_token, patch_tokens]
         tokens = torch.cat(special_tokens + [camera_token, register_token, patch_tokens], dim=1)
 
         pos = None
@@ -268,21 +249,17 @@ class Aggregator(nn.Module):
             pos = self.position_getter(B * S, H // self.patch_size, W // self.patch_size, device=images.device)
 
         if self.patch_start_idx > 0:
-            # do not use position embedding for special tokens (camera and register tokens)
-            # so set pos to 0 for the special tokens
             pos = pos + 1
             pos_special = torch.zeros(B * S, self.patch_start_idx, 2).to(images.device).to(pos.dtype)
             pos = torch.cat([pos_special, pos], dim=1)
 
-        # update P because we added special tokens
         _, P, C = tokens.shape
 
         frame_idx = 0
         global_idx = 0
-        output_dict = {}  # Changed from list to dict
+        output_dict = {}
         current_layer = 0
 
-        # 使用更简单的逻辑：恢复原始结构，但在concatenate时检查是否需要该输出
         for block_num in range(self.aa_block_num):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
@@ -296,19 +273,14 @@ class Aggregator(nn.Module):
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
 
-            # 只有在需要这一层的输出时才concatenate和保存
-            # 计算当前block对应的layer编号
-            current_layer_index = block_num  # 简化：假设每个block对应一个layer
+            current_layer_index = block_num
 
             if not self.memory_efficient or current_layer_index in self.output_layers:
                 for i in range(len(frame_intermediates)):
-                    # concat frame and global intermediates, [B x S x P x 2C]
                     concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
-                    # Store in dict with layer index as key
                     layer_idx = current_layer_index * len(frame_intermediates) + i
                     output_dict[layer_idx] = concat_inter
 
-        # Clean up memory
         if 'concat_inter' in locals():
             del concat_inter
         if 'frame_intermediates' in locals():
@@ -324,7 +296,6 @@ class Aggregator(nn.Module):
         """
         Process frame attention blocks. We keep tokens in shape (B*S, P, C).
         """
-        # If needed, reshape tokens or positions:
         if tokens.shape != (B * S, P, C):
             tokens = tokens.view(B, S, P, C).view(B * S, P, C)
 
@@ -333,7 +304,6 @@ class Aggregator(nn.Module):
 
         intermediates = []
 
-        # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
             block_to_run = self.frame_blocks[frame_idx]
             if self.training:
@@ -357,7 +327,6 @@ class Aggregator(nn.Module):
 
         intermediates = []
 
-        # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
             block_to_run = self.global_blocks[global_idx]
             if self.training:
@@ -383,14 +352,9 @@ def slice_expand_and_flatten(token_tensor, B, S):
     Returns:
         torch.Tensor: Processed tokens with shape (B*S, X, C)
     """
-
-    # Slice out the "query" tokens => shape (1, 1, ...)
     query = token_tensor[:, 0:1, ...].expand(B, 1, *token_tensor.shape[2:])
-    # Slice out the "other" tokens => shape (1, S-1, ...)
     others = token_tensor[:, 1:, ...].expand(B, S - 1, *token_tensor.shape[2:])
-    # Concatenate => shape (B, S, ...)
     combined = torch.cat([query, others], dim=1)
 
-    # Finally flatten => shape (B*S, ...)
     combined = combined.view(B * S, *combined.shape[2:])
     return combined

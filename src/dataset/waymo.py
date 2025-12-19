@@ -6,6 +6,7 @@ import os
 import os.path as osp
 import numpy as np
 import torch
+import json
 from dataset.base_dataset import BaseDataset
 from dataset.utils import depthmap_to_absolute_camera_coordinates
 from src.utils import imread_cv2
@@ -21,9 +22,9 @@ class WaymoDataset(BaseDataset):
         self,
         ROOT,
         valid_camera_id_list=["1", "2", "3"],
-        intervals=[1],  # List of possible frame intervals
+        intervals=[1],
         zero_ground_velocity=True,
-        multi_camera_mode=False,  # New: whether to use multi-camera mode
+        multi_camera_mode=False,
         **kwargs
     ):
         self.ROOT = ROOT
@@ -33,7 +34,6 @@ class WaymoDataset(BaseDataset):
         self.zero_ground_velocity = zero_ground_velocity
         self.multi_camera_mode = multi_camera_mode
 
-        # Set intervals for sampling
         if not isinstance(intervals, list):
             intervals = [intervals]
         self._intervals = intervals
@@ -41,24 +41,46 @@ class WaymoDataset(BaseDataset):
         super().__init__(**kwargs)
         self._load_data()
 
+    def _get_cache_filename(self):
+        """
+        Generate cache filename based on valid camera IDs to support different configurations.
+        """
+        camera_ids_str = "_".join(sorted(self.valid_camera_id_list))
+        return f"waymo_scene_cache_{camera_ids_str}.json"
+
     def _load_data(self):
         """
-        Load dataset metadata.
-        Now only loads scene-level information, camera sequences are sampled dynamically.
+        Load dataset metadata with caching support.
+        First checks for a cached metadata file in ROOT directory.
+        If not found, performs full scan and saves cache for future use.
         """
+        cache_path = osp.join(self.ROOT, self._get_cache_filename())
+
+        # Try to load from cache first
+        if osp.exists(cache_path):
+            try:
+                print(f"Loading scene metadata from cache: {cache_path}")
+                with open(cache_path, 'r') as f:
+                    self.scene_data = json.load(f)
+                self.scene_names = sorted(list(self.scene_data.keys()))
+                print(f"Loaded {len(self.scene_names)} scenes with {len(self.valid_camera_id_list)} camera sequences from cache")
+                return
+            except Exception as e:
+                print(f"Warning: Failed to load cache file ({e}), performing full scan...")
+
+        # Perform full scan if cache doesn't exist or loading failed
+        print("Performing full dataset scan (this may take a while but only need to do once)...")
         scene_dirs = sorted([
             d for d in os.listdir(self.ROOT)
             if os.path.isdir(os.path.join(self.ROOT, d))
         ])
 
-        # Store scene info: {scene_name: {camera_id: [sorted frame_ids]}}
         self.scene_data = {}
 
         for scene_name in scene_dirs:
             scene_dir = osp.join(self.ROOT, scene_name)
             seq2frames = {}
 
-            # Collect frames for each camera sequence
             for f in os.listdir(scene_dir):
                 if not f.endswith(".jpg"):
                     continue
@@ -73,16 +95,23 @@ class WaymoDataset(BaseDataset):
                     seq2frames[seq_id] = []
                 seq2frames[seq_id].append(frame_id)
 
-            # Sort frames for each camera
             for seq_id in seq2frames:
                 seq2frames[seq_id] = sorted(seq2frames[seq_id])
 
-            # Only keep scenes that have valid camera sequences
             if seq2frames:
                 self.scene_data[scene_name] = seq2frames
 
         self.scene_names = sorted(list(self.scene_data.keys()))
         print(f"Loaded {len(self.scene_names)} scenes with {len(self.valid_camera_id_list)} camera sequences")
+
+        # Save cache for future use
+        try:
+            print(f"Saving scene metadata cache to: {cache_path}")
+            with open(cache_path, 'w') as f:
+                json.dump(self.scene_data, f, indent=2)
+            print("Cache saved successfully")
+        except Exception as e:
+            print(f"Warning: Failed to save cache file ({e}), cache will not be available for next run")
 
     def __len__(self):
         """Return number of scenes"""
@@ -124,16 +153,13 @@ class WaymoDataset(BaseDataset):
         """
         impath = f"{frame_id}_{camera_id}"
 
-        # Load image and depth
         image = imread_cv2(osp.join(scene_dir, impath + ".jpg"))
         depthmap = imread_cv2(osp.join(scene_dir, impath + ".exr"))
         camera_params = np.load(osp.join(scene_dir, impath + ".npz"))
 
-        # Ensure image is numpy array (imread_cv2 might return PIL Image in some cases)
-        if hasattr(image, 'convert'):  # PIL Image
+        if hasattr(image, 'convert'):
             image = np.array(image)
 
-        # Load flow data (support both .npz and legacy .npy format)
         flow_path_npz = osp.join(scene_dir, impath + "_flow.npz")
         flow_path_npy = osp.join(scene_dir, impath + ".npy")
         flowmap = None
@@ -143,7 +169,6 @@ class WaymoDataset(BaseDataset):
         elif osp.exists(flow_path_npy):
             flowmap = np.load(flow_path_npy)
 
-        # Load semantic segmentation mask
         seg_path = osp.join(scene_dir, impath + "_seg.png")
         seg_mask = None
         if osp.exists(seg_path):
@@ -152,7 +177,6 @@ class WaymoDataset(BaseDataset):
         intrinsics = np.float32(camera_params["intrinsics"])
         camera_pose = np.float32(camera_params["cam2world"])
 
-        # Crop and resize
         if flowmap is not None or seg_mask is not None:
             image, depthmap, intrinsics, flowmap, seg_mask = self._crop_resize_if_necessary(
                 image, depthmap, intrinsics, resolution, rng, info=(scene_dir, impath),
@@ -163,27 +187,23 @@ class WaymoDataset(BaseDataset):
                 image, depthmap, intrinsics, resolution, rng, info=(scene_dir, impath)
             )
 
-        # Extract segmentation labels from flowmap
         segment_label = None
         segment_mask = None
         if flowmap is not None and flowmap.shape[-1] >= 4:
-            raw_labels = flowmap[..., 3]  # [H, W]
+            raw_labels = flowmap[..., 3]
             segment_mask = (raw_labels != 0).astype(np.float32)
 
-            # Map raw labels to 4 classes: [bg, vehicle, sign, pedestrian+cyclist]
             segment_label = np.zeros_like(raw_labels, dtype=np.int64)
-            segment_label[raw_labels == 1] = 0  # background/unlabeled
-            segment_label[raw_labels == 2] = 1  # vehicle
-            segment_label[raw_labels == 4] = 2  # sign
-            segment_label[(raw_labels == 3) | (raw_labels == 5)] = 3  # pedestrian + cyclist
+            segment_label[raw_labels == 1] = 0
+            segment_label[raw_labels == 2] = 1
+            segment_label[raw_labels == 4] = 2
+            segment_label[(raw_labels == 3) | (raw_labels == 5)] = 3
 
-        # Extract sky mask from semantic segmentation
         sky_mask = None
         if seg_mask is not None:
             sky_color = np.array([70, 130, 180])
-            sky_mask = np.all(seg_mask == sky_color, axis=-1).astype(np.float32)  # [H, W]
+            sky_mask = np.all(seg_mask == sky_color, axis=-1).astype(np.float32)
 
-        # Apply semantic segmentation to zero out velocity on road and sidewalk
         if self.zero_ground_velocity and seg_mask is not None and flowmap is not None:
             road_color = np.array([128, 64, 128])
             sidewalk_color = np.array([244, 35, 232])
@@ -192,27 +212,22 @@ class WaymoDataset(BaseDataset):
             sidewalk_mask = np.all(seg_mask == sidewalk_color, axis=-1)
             static_ground_mask = road_mask | sidewalk_mask
 
-            # Zero out velocity on static ground regions
             if static_ground_mask.any():
                 flowmap[..., :3][static_ground_mask] = 0.0
                 if segment_label is not None:
                     segment_label[static_ground_mask & (segment_label != 0)] = 0
 
-        # Apply transform (ImgNorm: converts to tensor [-1, 1])
         if self.transform is not None:
             img_tensor = self.transform(image)
         else:
             img_tensor = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
 
-        # Convert img from [-1, 1] to [0, 1] range for VGGT format
         img_tensor = img_tensor * 0.5 + 0.5
 
-        # Convert to tensors
         depthmap_tensor = torch.from_numpy(depthmap).float()
         intrinsics_tensor = torch.from_numpy(intrinsics).float()
         camera_pose_tensor = torch.from_numpy(camera_pose).float()
 
-        # Generate 3D points in current camera coordinates (not world coordinates yet)
         from dataset.utils import depthmap_to_camera_coordinates
         pts3d_cam, valid_mask = depthmap_to_camera_coordinates(
             depthmap=depthmap,
@@ -221,10 +236,8 @@ class WaymoDataset(BaseDataset):
         pts3d_tensor = torch.from_numpy(pts3d_cam).float()
         valid_mask_tensor = torch.from_numpy(valid_mask & np.isfinite(pts3d_cam).all(axis=-1)).bool()
 
-        # Convert flowmap and segmentation data
         if flowmap is not None:
             flowmap_tensor = torch.from_numpy(flowmap).float()
-            # Scale velocity component by (interval * 0.1) to convert to m/frame to m/0.1s
             flowmap_tensor[..., :3] *= (interval * 0.1)
         else:
             flowmap_tensor = None
@@ -244,11 +257,10 @@ class WaymoDataset(BaseDataset):
         else:
             sky_mask_tensor = None
 
-        # Construct view dictionary in VGGT format
         view_dict = dict(
-            idx=(idx, camera_idx, frame_idx),  # Changed: use real camera_idx instead of hardcoded 0
-            camera_idx=camera_idx,  # New field
-            frame_idx=frame_idx,    # New field
+            idx=(idx, camera_idx, frame_idx),
+            camera_idx=camera_idx,
+            frame_idx=frame_idx,
             img=img_tensor,
             depthmap=depthmap_tensor,
             camera_pose=camera_pose_tensor,
@@ -264,7 +276,6 @@ class WaymoDataset(BaseDataset):
             rng=int.from_bytes(rng.bytes(4), "big"),
         )
 
-        # Add optional fields
         if flowmap_tensor is not None:
             view_dict["flowmap"] = flowmap_tensor
         if segment_label_tensor is not None:
@@ -291,16 +302,13 @@ class WaymoDataset(BaseDataset):
         Returns:
             List of view dictionaries in VGGT format
         """
-        # Get scene name
         scene_name = self.scene_names[idx]
         scene_dir = osp.join(self.ROOT, scene_name)
         seq2frames = self.scene_data[scene_name]
 
-        # Randomly select resolution from available resolutions
         ar_idx = rng.integers(0, len(self._resolutions))
         resolution = self._resolutions[ar_idx]
 
-        # Randomly select num_views
         if self.num_views_range is not None:
             num_views = rng.integers(self.num_views_range[0], self.num_views_range[1] + 1)
         else:
@@ -308,26 +316,17 @@ class WaymoDataset(BaseDataset):
 
         views = []
 
-        # ========== Multi-camera or single-camera mode ==========
         if self.multi_camera_mode:
-            # Multi-camera mode: use all available cameras
             available_cameras = sorted(list(seq2frames.keys()))
             selected_cameras = available_cameras
 
-            # In multi-camera mode, all cameras should use the SAME frame IDs (synchronized frames)
-            # First, determine the interval and frame sampling strategy based on all cameras
-
-            # Find the minimum number of frames across all cameras
             min_frames = min(len(seq2frames[cam_id]) for cam_id in selected_cameras)
 
-            # Randomly select an interval from available intervals
             interval = rng.choice(self._intervals)
 
-            # Calculate how many frames we need with this interval
             required_frames = 1 + (num_views - 1) * interval
 
             if min_frames < required_frames:
-                # Not enough frames with this interval, adjust to max possible interval
                 max_possible_interval = (min_frames - 1) // (num_views - 1) if num_views > 1 else 1
                 if max_possible_interval < 1:
                     raise ValueError(
@@ -337,21 +336,16 @@ class WaymoDataset(BaseDataset):
                 interval = min(interval, max_possible_interval)
                 required_frames = 1 + (num_views - 1) * interval
 
-            # Randomly select starting frame position (same for all cameras)
             max_start_pos = min_frames - required_frames
             start_pos = rng.integers(0, max_start_pos + 1)
 
-            # Sample frame positions (same for all cameras)
             sampled_positions = [start_pos + i * interval for i in range(num_views)]
 
-            # For each camera, load views using the SAME frame positions
             for camera_idx, camera_id in enumerate(selected_cameras):
                 frame_ids = seq2frames[camera_id]
 
-                # Use the pre-determined frame positions
                 sampled_frame_ids = [frame_ids[pos] for pos in sampled_positions]
 
-                # Load views for this camera
                 for frame_idx_in_camera, frame_id in enumerate(sampled_frame_ids):
                     view_dict = self._load_single_view(
                         scene_dir=scene_dir,
@@ -368,19 +362,15 @@ class WaymoDataset(BaseDataset):
                     views.append(view_dict)
 
         else:
-            # Single-camera mode: randomly select one camera
             available_cameras = sorted(list(seq2frames.keys()))
             camera_id = rng.choice(available_cameras)
             frame_ids = seq2frames[camera_id]
 
-            # Randomly select an interval from available intervals
             interval = rng.choice(self._intervals)
 
-            # Calculate how many frames we need with this interval
             required_frames = 1 + (num_views - 1) * interval
 
             if len(frame_ids) < required_frames:
-                # Not enough frames with this interval, try smaller interval or raise error
                 max_possible_interval = (len(frame_ids) - 1) // (num_views - 1) if num_views > 1 else 1
                 if max_possible_interval < 1:
                     raise ValueError(
@@ -390,15 +380,12 @@ class WaymoDataset(BaseDataset):
                 interval = min(interval, max_possible_interval)
                 required_frames = 1 + (num_views - 1) * interval
 
-            # Randomly select starting frame position
             max_start_pos = len(frame_ids) - required_frames
             start_pos = rng.integers(0, max_start_pos + 1)
 
-            # Sample frames with the selected interval
             sampled_positions = [start_pos + i * interval for i in range(num_views)]
             sampled_frame_ids = [frame_ids[pos] for pos in sampled_positions]
 
-            # Load views for single camera (camera_idx=0 for backward compatibility)
             for v, frame_id in enumerate(sampled_frame_ids):
                 view_dict = self._load_single_view(
                     scene_dir=scene_dir,
@@ -414,52 +401,36 @@ class WaymoDataset(BaseDataset):
                 )
                 views.append(view_dict)
 
-        # ============ Apply coordinate transformations ============
-
-        # Select reference view: always use the first camera's first frame (view_idx = 0)
-        # Camera layout: [cam0_f0...cam0_f(n-1), cam1_f0...cam1_f(n-1), ...]
-        # Both single-camera and multi-camera modes use cam0_f0 as reference
         reference_view_idx = 0
 
-        # Get reference camera pose (ref_to_world)
-        reference_cam_pose = views[reference_view_idx]['camera_pose']  # [4, 4]
+        reference_cam_pose = views[reference_view_idx]['camera_pose']
 
-        # Compute world_to_ref transformation
-        world_to_ref = torch.linalg.inv(reference_cam_pose)  # [4, 4]
+        world_to_ref = torch.linalg.inv(reference_cam_pose)
 
-        # Transform pts3d from each camera's coordinate system to reference camera coordinate system
-        # For each view: pts3d_ref = world_to_ref @ cam_to_world @ pts3d_cam
         for view in views:
-            pts3d_cam = view['pts3d']  # [H, W, 3] - in current camera coordinates
+            pts3d_cam = view['pts3d']
             H, W, _ = pts3d_cam.shape
 
-            cam_to_world = view['camera_pose']  # [4, 4]
+            cam_to_world = view['camera_pose']
 
-            # Compute transformation: current_cam -> world -> reference_cam
-            cam_to_ref = torch.matmul(world_to_ref, cam_to_world)  # [4, 4]
+            cam_to_ref = torch.matmul(world_to_ref, cam_to_world)
 
-            # Apply transformation to points
-            pts3d_flat = pts3d_cam.reshape(-1, 3)  # [H*W, 3]
+            pts3d_flat = pts3d_cam.reshape(-1, 3)
             pts3d_ref = torch.matmul(cam_to_ref[:3, :3], pts3d_flat.T).T + cam_to_ref[:3, 3]
             view['pts3d'] = pts3d_ref.reshape(H, W, 3)
 
-            # Update camera_pose to be ref_to_cam (inverse of cam_to_ref)
             view['camera_pose'] = torch.linalg.inv(cam_to_ref)
 
-        # ============ Depth scale normalization (make non-metric) ============
-
-        # Collect all valid points and compute average distance
         all_pts = []
         for view in views:
-            pts = view['pts3d']  # [H, W, 3]
+            pts = view['pts3d']
             mask = view['valid_mask'].bool()
             all_pts.append(pts[mask])
 
-        all_pts = torch.cat(all_pts, dim=0)  # [N, 3]
+        all_pts = torch.cat(all_pts, dim=0)
         dist_avg = all_pts.norm(dim=-1).mean()
         depth_scale_factor = 1.0 / dist_avg
 
-        # Apply normalization to depths, poses, and points
         for view in views:
             view['depthmap'] = view['depthmap'] * depth_scale_factor
             view['camera_pose'][:3, 3] = view['camera_pose'][:3, 3] * depth_scale_factor

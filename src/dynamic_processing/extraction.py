@@ -33,9 +33,8 @@ def extract_object_gaussians(
     H, W = gaussian_params.shape[2:4]
     device = gaussian_params.device
 
-    # Collect frames where object appears
     object_frames = []
-    frame_data = {}  # {frame_idx: (cluster_idx, view_indices, pixel_indices)}
+    frame_data = {}
 
     for frame_idx, result in enumerate(tracked_results):
         global_ids = result.get('global_ids', [])
@@ -58,19 +57,16 @@ def extract_object_gaussians(
     if not object_frames:
         return _create_empty_object(object_id, object_class, device)
 
-    # Extract Gaussians and pixel indices for each frame
     frame_gaussians = {}
     frame_pixel_indices = {}
 
     for frame_idx in object_frames:
         cluster_idx, view_indices, pixel_indices = frame_data[frame_idx]
 
-        # Convert pixel indices to view-specific format
         gaussians_list = []
         pixel_dict = {}
 
         for view_idx in view_indices:
-            # Get pixels belonging to this view
             view_offset = view_indices.index(view_idx) * H * W if len(view_indices) > 1 else 0
             view_pixels = [p - view_offset for p in pixel_indices
                           if view_offset <= p < view_offset + H * W]
@@ -78,7 +74,6 @@ def extract_object_gaussians(
             if not view_pixels:
                 continue
 
-            # Extract Gaussians for this view
             view_gaussians = _extract_gaussians_for_view(
                 view_idx, view_pixels, gaussian_params, H, W
             )
@@ -91,7 +86,6 @@ def extract_object_gaussians(
             frame_gaussians[frame_idx] = torch.cat(gaussians_list, dim=0)
             frame_pixel_indices[frame_idx] = pixel_dict
 
-    # Create frame existence mask
     max_frame = max(object_frames) if object_frames else 0
     frame_existence = torch.tensor(
         [f in object_frames for f in range(max_frame + 1)],
@@ -99,7 +93,6 @@ def extract_object_gaussians(
         device=device
     )
 
-    # For cars: aggregate if registration available
     if object_class == 'car' and registration is not None and preds is not None:
         canonical_gaussians, frame_transforms, reference_frame = _aggregate_car_object(
             object_id, object_frames, frame_data, tracked_results,
@@ -117,7 +110,6 @@ def extract_object_gaussians(
             reference_frame=reference_frame
         )
     else:
-        # For pedestrians or cars without registration: per-frame only
         return DynamicObject(
             object_id=object_id,
             object_class=object_class,
@@ -140,7 +132,6 @@ def _extract_gaussians_for_view(
         v_coords = pixel_tensor // W
         u_coords = pixel_tensor % W
 
-        # Filter valid coordinates
         valid = (v_coords >= 0) & (v_coords < H) & (u_coords >= 0) & (u_coords < W)
         v_valid = v_coords[valid]
         u_valid = u_coords[valid]
@@ -148,7 +139,6 @@ def _extract_gaussians_for_view(
         if len(v_valid) == 0:
             return None
 
-        # Extract Gaussians: [1, view_idx, v, u, D]
         view_gaussians = gaussian_params[0, view_idx, v_valid, u_valid]
         return view_gaussians
 
@@ -168,14 +158,11 @@ def _aggregate_car_object(
 ) -> Tuple[Optional[torch.Tensor], Optional[Dict[int, torch.Tensor]], Optional[int]]:
     """Aggregate car object across frames using registration."""
     if len(object_frames) == 1:
-        # Single frame: no aggregation needed
         frame_idx = object_frames[0]
         return frame_gaussians[frame_idx], {}, frame_idx
 
-    # Choose middle frame as reference
     reference_frame = object_frames[len(object_frames) // 2]
 
-    # Prepare per-frame data for registration
     points_frames = {}
     velocity_frames = {}
 
@@ -183,7 +170,6 @@ def _aggregate_car_object(
         cluster_idx, _, _ = frame_data[frame_idx]
         result = tracked_results[frame_idx]
 
-        # Get cluster points and velocities
         points = result['points']
         labels = result['labels']
         mask = labels == cluster_idx
@@ -193,10 +179,8 @@ def _aggregate_car_object(
         else:
             points_frames[frame_idx] = torch.tensor(points[mask], device=registration.device)
 
-        # Extract velocities from preds
         velocity_global = preds.get('velocity_global')
         if velocity_global is not None:
-            # Get velocities for the views in this frame
             view_indices = result.get('view_indices', [frame_idx])
             velocities = []
             for view_idx in view_indices:
@@ -206,7 +190,6 @@ def _aggregate_car_object(
             merged_velocity = torch.cat(velocities, dim=0)
             velocity_frames[frame_idx] = merged_velocity[mask]
 
-    # Compute transforms to reference frame
     frame_transforms = {}
     transform_cache = {}
 
@@ -221,7 +204,6 @@ def _aggregate_car_object(
             if transform is not None:
                 frame_transforms[frame_idx] = transform
 
-    # Aggregate Gaussians to reference frame
     aggregated_list = []
     for frame_idx in object_frames:
         if frame_idx not in frame_transforms:
@@ -230,7 +212,6 @@ def _aggregate_car_object(
         transform = frame_transforms[frame_idx]
         gaussians = frame_gaussians[frame_idx].clone()
 
-        # Transform xyz coordinates (first 3 dims)
         xyz = gaussians[:, :3]
         ones = torch.ones((xyz.shape[0], 1), device=xyz.device, dtype=xyz.dtype)
         xyz_homo = torch.cat([xyz, ones], dim=1)
@@ -285,22 +266,18 @@ def extract_static_gaussians(
         if not view_indices:
             continue
 
-        # Split labels back to individual views
         view_offset = 0
         for view_idx in view_indices:
             view_size = H * W
             view_labels = labels[view_offset:view_offset + view_size]
             view_offset += view_size
 
-            # Static mask: label == -1
             static_mask = view_labels == -1
 
-            # Filter sky if available
             if sky_masks is not None and view_idx < sky_masks.shape[1]:
                 sky_mask = sky_masks[0, view_idx].reshape(-1).bool()
                 static_mask = static_mask & (~sky_mask.to(static_mask.device))
 
-            # Extract static Gaussians
             view_gaussians = gaussian_params[0, view_idx].reshape(H * W, -1)
             static_gaussians = view_gaussians[static_mask]
             static_list.append(static_gaussians)

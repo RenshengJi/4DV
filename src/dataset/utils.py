@@ -1,6 +1,5 @@
 """
 Utility functions for dataset processing.
-Extracted from dust3r to avoid dependencies.
 """
 import numpy as np
 
@@ -61,7 +60,7 @@ def depthmap_to_absolute_camera_coordinates(
     """
     X_cam, valid_mask = depthmap_to_camera_coordinates(depthmap, camera_intrinsics)
 
-    X_world = X_cam  # default
+    X_world = X_cam
     if camera_pose is not None:
         R_cam2world = camera_pose[:3, :3]
         t_cam2world = camera_pose[:3, 3]

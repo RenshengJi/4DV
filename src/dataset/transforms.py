@@ -1,18 +1,14 @@
 # Copyright (C) 2024-present Naver Corporation. All rights reserved.
 # Licensed under CC BY-NC-SA 4.0 (non-commercial use only).
 #
-# --------------------------------------------------------
 # Image transforms migrated from dust3r
-# --------------------------------------------------------
 import torch
 import torchvision.transforms as tvf
 import torchvision.transforms.functional as F
 
 
-# ImgNorm definition (moved here from dust3r.utils.image)
 ImgNorm = tvf.Compose([tvf.ToTensor(), tvf.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
 
-# define the standard image transforms
 ColorJitter = tvf.Compose([tvf.ColorJitter(0.5, 0.5, 0.5, 0.1), ImgNorm])
 
 
@@ -31,8 +27,6 @@ def _check_input(value, center=1, bound=(0, float("inf")), clip_first_on_zero=Tr
     if not bound[0] <= value[0] <= value[1] <= bound[1]:
         raise ValueError(f"values should be between {bound}, but got {value}.")
 
-    # if value is 0 or (1., 1.) for brightness/contrast/saturation
-    # or (0., 0.) for hue, do nothing
     if value[0] == value[1] == center:
         return None
     else:
@@ -40,9 +34,7 @@ def _check_input(value, center=1, bound=(0, float("inf")), clip_first_on_zero=Tr
 
 
 def SeqColorJitter():
-    """
-    Return a color jitter transform with same random parameters
-    """
+    """Return a color jitter transform with same random parameters"""
     brightness = _check_input(0.5)
     contrast = _check_input(0.5)
     saturation = _check_input(0.5)

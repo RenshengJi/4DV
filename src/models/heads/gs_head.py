@@ -66,11 +66,6 @@ class DPTGSHead(DPTHead):
             down_ratio=down_ratio,
         )
         merger_channels = features // 2
-        # self.input_merger = nn.Sequential(
-        #     nn.Conv2d(3, merger_channels, kernel_size=7, stride=1, padding=3, padding_mode='reflect'),
-        #     nn.ReLU(),
-        #     nn.Conv2d(merger_channels, merger_channels, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
-        # )
         self.input_merger = nn.Sequential(
             nn.Conv2d(3, merger_channels, kernel_size=7, stride=1, padding=3),
             nn.ReLU(),
@@ -112,7 +107,6 @@ class DPTGSHead(DPTHead):
         dpt_idx = 0
 
         for i, layer_idx in enumerate(self.intermediate_layer_idx):
-            # Access layer directly from dict using layer_idx as key
             if layer_idx not in aggregated_tokens_list:
                 raise KeyError(f"Required layer {layer_idx} not found in aggregated_tokens_list. "
                              f"Available layers: {list(aggregated_tokens_list.keys())}, "
@@ -120,7 +114,6 @@ class DPTGSHead(DPTHead):
 
             x = aggregated_tokens_list[layer_idx][:, :, patch_start_idx:]
 
-            # Select frames if processing a chunk
             if frames_start_idx is not None and frames_end_idx is not None:
                 x = x[:, frames_start_idx:frames_end_idx]
 
@@ -138,14 +131,12 @@ class DPTGSHead(DPTHead):
             out.append(x)
             dpt_idx += 1
 
-        # Fuse features from multiple layers.
         if self.gradient_checkpointing and self.training:
             output_features = checkpoint(self.scratch_forward, out, use_reentrant=False)
         else:
             output_features = self.scratch_forward(out)
         out = output_features
 
-        # Interpolate fused output to match target image resolution.
         out = custom_interpolate(
             out,
             (int(patch_h * self.patch_size / self.down_ratio), int(patch_w * self.patch_size / self.down_ratio)),
@@ -153,7 +144,6 @@ class DPTGSHead(DPTHead):
             align_corners=True,
         )
 
-        # Merge images' low-level features with the DPT output.
         images = rearrange(images, "B S C H W -> (B S) C H W") * 2 - 1
         direct_img_feat = self.input_merger(images)
         out = out + direct_img_feat

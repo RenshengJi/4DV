@@ -33,11 +33,11 @@ from accelerate import DistributedDataParallelKwargs, InitProcessGroupKwargs
 from accelerate.logging import get_logger
 from datetime import timedelta
 
-# ===== 添加子模块路径 =====
+# Add submodule paths
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src/dam2'))
 
-# ===== VGGT相关导入 =====
+# VGGT imports
 from src.models import VGGT
 from src.losses import (
     camera_loss, depth_loss, gt_flow_loss_ours,
@@ -45,15 +45,15 @@ from src.losses import (
     scale_loss, segment_loss, Stage2CompleteLoss
 )
 
-# ===== Dynamic Processing =====
+# Dynamic processing
 from src.dynamic_processing import DynamicProcessor
 
-# ===== Dataset and Utils =====
+# Dataset and utils
 from src.dataset import get_data_loader
 from src.utils import training as misc
 from src.utils import NativeScalerWithGradNormCount as NativeScaler
 
-torch.backends.cuda.matmul.allow_tf32 = True  # for gpu >= Ampere and pytorch >= 1.12
+torch.backends.cuda.matmul.allow_tf32 = True
 torch.autograd.set_detect_anomaly(True)
 
 torch.multiprocessing.set_sharing_strategy("file_system")
@@ -86,14 +86,14 @@ def setup_for_distributed(accelerator: Accelerator):
         force = force or (accelerator.num_processes > 8)
         if accelerator.is_main_process or force:
             now = datetime.datetime.now().time()
-            builtin_print("[{}] ".format(now), end="")  # print with time stamp
+            builtin_print("[{}] ".format(now), end="")
             builtin_print(*args, **kwargs)
 
     builtins.print = print
 
 
 def save_current_code(outdir):
-    now = datetime.datetime.now()  # current date and time
+    now = datetime.datetime.now()
     date_time = now.strftime("%m_%d-%H:%M:%S")
     src_dir = "."
     dst_dir = os.path.join(outdir, "code", "{}".format(date_time))
@@ -142,7 +142,7 @@ def train(args):
 
     setup_for_distributed(accelerator)
 
-    # 初始化动态处理器和Stage2损失函数（用于aggregator_all loss）
+    # Initialize dynamic processor and Stage2 loss
     dynamic_processor_config = {
         'min_object_size': getattr(args, 'min_object_size', 100),
         'max_objects_per_frame': getattr(args, 'max_objects_per_frame', 10),
@@ -155,7 +155,6 @@ def train(args):
         'velocity_transform_mode': getattr(args, 'velocity_transform_mode', 'simple')
     }
 
-    # 初始化动态处理器
     dynamic_processor = DynamicProcessor(
         device=device,
         velocity_threshold=dynamic_processor_config.get('velocity_threshold', 0.1),
@@ -167,7 +166,6 @@ def train(args):
         use_registration=dynamic_processor_config.get('use_optical_flow_aggregation', True)
     )
 
-    # 初始化Stage2损失函数（用于aggregator_all）
     stage2_loss_config = {
         'rgb_weight': getattr(args, 'aggregator_all_render_rgb_weight', 1.0),
         'depth_weight': getattr(args, 'aggregator_all_render_depth_weight', 1.0),
@@ -187,14 +185,14 @@ def train(args):
         dst_dir = save_current_code(outdir=args.output_dir)
         printer.info(f"Saving current code to {dst_dir}")
 
-    # auto resume
+    # Auto resume from last checkpoint
     if not args.resume:
         last_ckpt_fname = os.path.join(args.output_dir, f"checkpoint-last.pth")
         args.resume = last_ckpt_fname if os.path.isfile(last_ckpt_fname) else None
 
     printer.info("job dir: {}".format(os.path.dirname(os.path.realpath(__file__))))
 
-    # fix the seed
+    # Set random seed
     seed = args.seed + accelerator.state.process_index
     printer.info(
         f"Setting seed to {seed} for process {accelerator.state.process_index}"
@@ -204,9 +202,7 @@ def train(args):
     random.seed(seed)
     cudnn.benchmark = args.benchmark
 
-    # training dataset and loader
     printer.info("Building train dataset %s", args.train_dataset)
-    #  dataset and loader
     data_loader_train = build_dataset(
         args.train_dataset,
         args.batch_size,
@@ -229,12 +225,10 @@ def train(args):
     # }
 
 
-    # model
     printer.info("Loading model: %s", args.model)
     model = eval(args.model)
     model.gradient_checkpointing_enable()
 
-    # 应用VGGT冻结策略配置
     vggt_freeze_strategy = getattr(args, 'vggt_freeze_strategy', None)
     if vggt_freeze_strategy is not None:
         printer.info(f"Applying VGGT freeze strategy: {vggt_freeze_strategy}")
@@ -250,70 +244,55 @@ def train(args):
     if not args.pretrained_velocity:
         printer.info(f"Loading pretrained: {args.pretrained}")
         ckpt = torch.load(args.pretrained, map_location=device)
-        # 删除 gaussian_head 的 output_conv2.2 参数（可能因为 sh_degree 不匹配）
-        # keys_to_remove = [k for k in ckpt.keys() if 'gaussian_head.scratch.output_conv2.2' in k]
-        # for key in keys_to_remove:
-        #     printer.info(f"Removing {key} from checkpoint (sh_degree mismatch)")
-        #     del ckpt[key]
         model.load_state_dict(ckpt, strict=False)
         del ckpt
     else:
         printer.info(f"Resume from: {args.pretrained_velocity}")
         checkpoint = torch.load(args.pretrained_velocity, map_location=device)
-        ckpt = strip_module(checkpoint.get('model', checkpoint))  # Handle both wrapped and direct state_dict
-        # 删除 gaussian_head 的 output_conv2.2 参数（可能因为 sh_degree 不匹配）
-        # keys_to_remove = [k for k in ckpt.keys() if 'gaussian_head.scratch.output_conv2.2' in k]
-        # for key in keys_to_remove:
-        #     printer.info(f"Removing {key} from checkpoint (sh_degree mismatch)")
-        #     del ckpt[key]
+        ckpt = strip_module(checkpoint.get('model', checkpoint))
         model.load_state_dict(ckpt, strict=False)
         del ckpt, checkpoint
     
 
-    # 加载辅助模型
+    # Load auxiliary models
     auxiliary_model_configs = getattr(args, "auxiliary_models", None)
     auxiliary_models = dict()
     if auxiliary_model_configs is not None:
         for model_name, model_config in auxiliary_model_configs.items():
-            # 检查是否是DAM2模型
             if "DepthAnythingV2" in model_config:
-                # 延迟导入DAM2，避免Hydra冲突
                 try:
-                    # 添加dam2目录到Python路径
                     dam2_path = os.path.join(os.path.dirname(__file__), 'src/dam2')
                     if dam2_path not in sys.path:
                         sys.path.insert(0, dam2_path)
                     from depth_anything_v2.dpt import DepthAnythingV2
 
-                    # 解析DAM2配置
                     encoder_match = re.search(r"encoder\s*=\s*\"([^\"]+)\"", model_config)
                     offload_match = re.search(r"offload\s*=\s*(\"True\"|False)\b", model_config, re.IGNORECASE)
 
                     if encoder_match:
                         encoder = encoder_match.group(1)
-                        # 直接从src目录加载模型文件
                         ckpt_path = os.path.join(os.path.dirname(__file__), f"src/depth_anything_v2_{encoder}.pth")
                         offload = offload_match.group(1).lower() == "true" if offload_match else False
-                        
-                        # 模型配置
+
+
                         model_configs = {
                             'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
                             'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
                             'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
                             'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
                         }
-                        
-                        # 构建DAM2模型
+
                         dam2_model = DepthAnythingV2(**model_configs[encoder])
                         state_dict = torch.load(ckpt_path, map_location="cpu" if offload else device, weights_only=True)
                         dam2_model.load_state_dict(state_dict)
-                        
+
                         if not offload:
                             dam2_model.to(device)
-                        
+
                         dam2_model.eval()
                         dam2_model.requires_grad_(False)
-                        
+
+
                         auxiliary_models[model_name] = dam2_model
                         printer.info(f"successfully load DAM2 model: {model_name}")
                     else:
@@ -323,11 +302,8 @@ def train(args):
                     printer.info("Skipping DAM2 model loading due to error")
 
 
-
-    # # following timm: set wd as 0 for bias and norm layers
     param_groups = misc.get_parameter_groups(model, args.weight_decay)
 
-    # 检查是否有可训练参数
     if not param_groups:
         raise ValueError(
             "No trainable parameters found! "
@@ -344,7 +320,6 @@ def train(args):
 
 
     def save_model(epoch, fname, best_so_far):
-        # 保存主模型
         misc.save_model(
             accelerator=accelerator,
             args=args,
@@ -356,7 +331,6 @@ def train(args):
             best_so_far=best_so_far,
         )
 
-    # 加载主模型
     best_so_far = misc.load_model(
         args=args, model_without_ddp=model, optimizer=optimizer, loss_scaler=loss_scaler
     )
@@ -388,7 +362,6 @@ def train(args):
                 if data_iter_step % args.accum_iter == 0:
                     misc.adjust_learning_rate(optimizer, epoch_f, args)
 
-                # For VGGT model
                 frame_sample_ratio = getattr(args, 'aggregator_frame_sample_ratio', 1.0)
                 preds = model(
                     vggt_batch["images"],
@@ -397,17 +370,16 @@ def train(args):
                     frame_sample_ratio=frame_sample_ratio
                 )
 
-                # =============== STAGE 1 TRAINING LOGIC ===============
+                # Stage 1 training logic
                 loss = 0.0
                 loss_dict = {}
 
-                # 获取损失权重配置
                 loss_weights = {
                     'self_render_weight': getattr(args, 'self_render_weight', 1.0),
                     'self_render_rgb_weight': getattr(args, 'self_render_rgb_weight', 1.0),
                     'self_render_lpips_weight': getattr(args, 'self_render_lpips_weight', 0.0),
                     'self_render_depth_weight': getattr(args, 'self_render_depth_weight', 0.0),
-                    'gt_flow_loss_ours_weight': getattr(args, 'gt_flow_loss_ours_weight', 0.0),  # GT flowmap ours损失
+                    'gt_flow_loss_ours_weight': getattr(args, 'gt_flow_loss_ours_weight', 0.0),
                     'sky_opacity_weight': getattr(args, 'sky_opacity_weight', 1.0),
                     'velocity_reg_weight': getattr(args, 'velocity_reg_weight', 0.001),
                     'camera_loss_weight': getattr(args, 'camera_loss_weight', 1.0),
@@ -415,13 +387,12 @@ def train(args):
                     'grad_depth_loss_weight': getattr(args, 'grad_depth_loss_weight', 1.0),
                     'reg_depth_loss_weight': getattr(args, 'reg_depth_loss_weight', 1.0),
                     'scale_loss_weight': getattr(args, 'scale_loss_weight', 1.0),
-                    'segment_loss_weight': getattr(args, 'segment_loss_weight', 0.0),  # Segmentation loss
+                    'segment_loss_weight': getattr(args, 'segment_loss_weight', 0.0),
                     'aggregator_all_render_rgb_weight': getattr(args, 'aggregator_all_render_rgb_weight', 0.0),
                     'aggregator_all_render_depth_weight': getattr(args, 'aggregator_all_render_depth_weight', 0.0),
                     'aggregator_all_render_lpips_weight': getattr(args, 'aggregator_all_render_lpips_weight', 0.0),
                 }
 
-                # 计算光流（已删除flow_loss，不再需要）
                 interval = getattr(args, 'flow_interval', 2)
 
                 # Self Render Loss
@@ -433,7 +404,6 @@ def train(args):
                             enable_voxel_pruning=getattr(args, 'enable_voxel_pruning', True),
                             voxel_size=getattr(args, 'voxel_size', 0.002)
                         )
-                        # 将所有self_render损失加入到总loss中
                         self_render_rgb_loss = self_loss_dict.get("loss_self_render_rgb", 0.0)
                         self_render_lpips_loss = self_loss_dict.get("loss_self_render_lpips", 0.0)
                         self_render_depth_loss = self_loss_dict.get("loss_self_render_depth", 0.0)
@@ -442,7 +412,6 @@ def train(args):
                                 loss_weights.get('self_render_lpips_weight', 0.0) * self_render_lpips_loss +
                                 loss_weights.get('self_render_depth_weight', 0.0) * self_render_depth_loss)
 
-                        # 将所有损失记录到loss_dict中
                         loss_dict.update(self_loss_dict)
                     except Exception as e:
                         print(f"Error in self render loss computation: {e}")
@@ -468,7 +437,7 @@ def train(args):
                         import traceback
                         traceback.print_exc()
 
-                # Sky Opacity Loss (监督gaussian head的opacity参数)
+                # Sky Opacity Loss
                 if loss_weights['sky_opacity_weight'] > 0 and preds.get("gaussian_params") is not None and vggt_batch.get("sky_masks") is not None:
                     try:
                         sky_opacity_loss_dict = sky_opacity_loss(
@@ -482,7 +451,7 @@ def train(args):
                     except Exception as e:
                         print(f"Error in sky opacity loss computation: {e}")
 
-                # Velocity Regularization Loss (约束velocity值)
+                # Velocity Regularization Loss
                 if loss_weights['velocity_reg_weight'] > 0 and preds.get("velocity") is not None:
                     try:
                         velocity_loss_value = velocity_loss(preds["velocity"])
@@ -491,7 +460,7 @@ def train(args):
                     except Exception as e:
                         print(f"Error in velocity regularization loss computation: {e}")
 
-                # Segmentation Loss (监督segment head训练)
+                # Segmentation Loss
                 if loss_weights['segment_loss_weight'] > 0 and preds.get("segment_logits") is not None and preds.get("segment_conf") is not None:
                     try:
                         segment_loss_dict = segment_loss(
@@ -505,7 +474,7 @@ def train(args):
                     except Exception as e:
                         print(f"Error in segmentation loss computation: {e}")
 
-                # Camera Loss (监督camera head训练)
+                # Camera Loss
                 if loss_weights['camera_loss_weight'] > 0 and preds.get("pose_enc") is not None and vggt_batch.get("extrinsics") is not None and vggt_batch.get("intrinsics") is not None:
                     try:
                         camera_loss_dict = camera_loss(
@@ -518,7 +487,7 @@ def train(args):
                     except Exception as e:
                         print(f"Error in camera loss computation: {e}")
 
-                # Depth Loss (监督depth head训练)
+                # Depth Loss
                 if loss_weights['conf_depth_loss_weight'] > 0 and preds.get("depth") is not None and preds.get("depth_conf") is not None and vggt_batch.get("depths") is not None:
                     try:
                         depth_loss_dict = depth_loss(
@@ -536,7 +505,7 @@ def train(args):
                     except Exception as e:
                         print(f"Error in depth loss computation: {e}")
 
-                # Scale Loss (监督scale head训练，使用depth_scale_factor作为GT)
+                # Scale Loss
                 if loss_weights['scale_loss_weight'] > 0 and preds.get("scale") is not None and vggt_batch.get("depth_scale_factor") is not None:
                     try:
                         scale_loss_dict = scale_loss(
@@ -549,14 +518,12 @@ def train(args):
                     except Exception as e:
                         print(f"Error in scale loss computation: {e}")
 
-                # Aggregator_all Render Loss (代替Stage2 refine网络的渲染loss)
-                # 这个loss直接在Stage1中使用动态物体处理+渲染监督,跳过Stage2的refine网络
+                # Aggregator_all Render Loss
                 aggregator_all_rgb_weight = loss_weights.get('aggregator_all_render_rgb_weight', 0.0)
                 aggregator_all_depth_weight = loss_weights.get('aggregator_all_render_depth_weight', 0.0)
                 aggregator_all_lpips_weight = loss_weights.get('aggregator_all_render_lpips_weight', 0.0)
                 aggregator_all_start_iter = getattr(args, 'aggregator_all_start_iter', 50000)
 
-                # 计算当前iteration
                 current_iteration = epoch * len(data_loader_train) + data_iter_step
 
                 if ((aggregator_all_rgb_weight > 0 or
@@ -564,58 +531,48 @@ def train(args):
                     aggregator_all_lpips_weight > 0) and
                     current_iteration >= aggregator_all_start_iter):
                     try:
-                        # Step 1: Process dynamic objects (using DynamicProcessor)
                         preds_for_dynamic = preds.copy()
                         if args.aggregator_all_detach_velocity and 'velocity_global' in preds_for_dynamic:
                             preds_for_dynamic['velocity_global'] = preds_for_dynamic['velocity_global'].detach()
 
-                        # Use new unified processor
                         result = dynamic_processor.process(preds_for_dynamic, vggt_batch)
 
-                        # Convert to legacy format for compatibility
                         dynamic_objects_data = dynamic_processor.to_legacy_format(result)
 
-                        # 检查是否有有效的动态物体（注意：即使没有动态物体，也要计算静态物体的loss）
+
                         num_cars = len(dynamic_objects_data.get('dynamic_objects_cars', [])) if dynamic_objects_data else 0
                         num_people = len(dynamic_objects_data.get('dynamic_objects_people', [])) if dynamic_objects_data else 0
                         has_valid_dynamic = (num_cars + num_people) > 0
 
-                        # 无论是否有动态物体，都需要计算loss（因为有静态物体）
                         if dynamic_objects_data is not None:
-                            # Step 2: 跳过Stage2 refine网络,直接构建场景
-                            # 不调用 stage2_model()，直接使用原始的canonical gaussians
                             dynamic_objects_cars = dynamic_objects_data.get('dynamic_objects_cars', []) if has_valid_dynamic else []
                             dynamic_objects_people = dynamic_objects_data.get('dynamic_objects_people', []) if has_valid_dynamic else []
                             static_gaussians = dynamic_objects_data.get('static_gaussians')
 
-                            # 构建"refined"场景 (实际上是未refine的原始数据)
                             aggregator_all_scene = {
                                 'static_gaussians': static_gaussians,
-                                'dynamic_objects_cars': dynamic_objects_cars,  # 车辆（使用刚体假设聚合）
-                                'dynamic_objects_people': dynamic_objects_people  # 行人（每帧单独）
+                                'dynamic_objects_cars': dynamic_objects_cars,
+                                'dynamic_objects_people': dynamic_objects_people
                             }
 
-                            # Step 3: 计算渲染loss (使用Stage2的loss函数)
                             B, S, C, H, W = vggt_batch['images'].shape
                             gt_images = vggt_batch['images']
                             gt_depths = vggt_batch.get('depths', torch.ones(B, S, H, W, device=device) * 5.0)
 
-                            # 使用预测的相机参数（从preds中获取）
-                            intrinsics = preds['intrinsics']  # [B, S, 3, 3]
-                            extrinsics = preds['extrinsics']  # [B, S, 4, 4]
+                            intrinsics = preds['intrinsics']
+                            extrinsics = preds['extrinsics']
 
                             sky_masks = vggt_batch.get('sky_masks', None)
 
-                            # 获取sky_colors和sampled_frame_indices（如果有）
-                            sky_colors = preds.get('sky_colors', None)  # [B, num_frames, 3, H, W]
-                            sampled_frame_indices = preds.get('sampled_frame_indices', None)  # [num_frames]
+                            sky_colors = preds.get('sky_colors', None)
+                            sampled_frame_indices = preds.get('sampled_frame_indices', None)
 
-                            # 使用Stage2的criterion计算loss
+
                             aggregator_all_loss_dict = stage2_criterion(
                                 refinement_results={
                                     'refined_dynamic_objects_cars': dynamic_objects_cars,
                                     'refined_dynamic_objects_people': dynamic_objects_people
-                                },  # 无refine结果
+                                },
                                 refined_scene=aggregator_all_scene,
                                 gt_images=gt_images,
                                 gt_depths=gt_depths,
@@ -625,20 +582,18 @@ def train(args):
                                 sky_colors=sky_colors,
                                 sampled_frame_indices=sampled_frame_indices,
                                 depth_scale_factor=vggt_batch.get('depth_scale_factor', None),
-                                camera_indices=vggt_batch.get('camera_indices', None),  # New: for multi-camera support
-                                frame_indices=vggt_batch.get('frame_indices', None)     # New: for multi-camera support
+                                camera_indices=vggt_batch.get('camera_indices', None),
+                                frame_indices=vggt_batch.get('frame_indices', None)
                             )
 
-                            # 提取各项loss并加权
+
                             aggregator_all_rgb_loss = aggregator_all_loss_dict.get('stage2_rgb_loss', 0.0)
                             aggregator_all_depth_loss = aggregator_all_loss_dict.get('stage2_depth_loss', 0.0)
                             aggregator_all_lpips_loss = aggregator_all_loss_dict.get('stage2_lpips_loss', 0.0)
 
-                            # 提取可视化指标 (不参与梯度回传)
                             aggregator_all_rgb_loss_sky = aggregator_all_loss_dict.get('stage2_rgb_loss_sky', None)
                             aggregator_all_rgb_loss_nonsky = aggregator_all_loss_dict.get('stage2_rgb_loss_nonsky', None)
 
-                            # 加入总loss
                             if aggregator_all_rgb_weight > 0:
                                 loss += aggregator_all_rgb_weight * aggregator_all_rgb_loss
                             if aggregator_all_depth_weight > 0:
@@ -646,7 +601,6 @@ def train(args):
                             if aggregator_all_lpips_weight > 0:
                                 loss += aggregator_all_lpips_weight * aggregator_all_lpips_loss
 
-                            # 记录到loss_dict (重命名为aggregator_all前缀)
                             loss_dict_update = {
                                 'aggregator_all_rgb_loss': float(aggregator_all_rgb_loss) if isinstance(aggregator_all_rgb_loss, torch.Tensor) else aggregator_all_rgb_loss,
                                 'aggregator_all_depth_loss': float(aggregator_all_depth_loss) if isinstance(aggregator_all_depth_loss, torch.Tensor) else aggregator_all_depth_loss,
@@ -656,7 +610,6 @@ def train(args):
                                 'aggregator_all_num_people': num_people
                             }
 
-                            # 添加可视化指标 (如果存在)
                             if aggregator_all_rgb_loss_sky is not None:
                                 loss_dict_update['aggregator_all_rgb_loss_sky'] = float(aggregator_all_rgb_loss_sky) if isinstance(aggregator_all_rgb_loss_sky, torch.Tensor) else aggregator_all_rgb_loss_sky
                             if aggregator_all_rgb_loss_nonsky is not None:
@@ -664,7 +617,6 @@ def train(args):
 
                             loss_dict.update(loss_dict_update)
                         else:
-                            # dynamic_objects_data为None，无法计算loss
                             loss_dict.update({
                                 'aggregator_all_rgb_loss': 0.0,
                                 'aggregator_all_depth_loss': 0.0,
@@ -680,7 +632,6 @@ def train(args):
                 lr = optimizer.param_groups[0]["lr"]
                 metric_logger.update(epoch=epoch)
                 metric_logger.update(lr=lr)
-                # 先记录第一阶段的损失（第二阶段损失会在后面加入）
                 loss_value_stage1 = float(loss)
                 metric_logger.update(loss=loss_value_stage1, **loss_dict)
                 if log_writer is not None:
@@ -695,10 +646,7 @@ def train(args):
                             continue
                         log_writer.add_scalar("train_" + name, val, step)
 
-                # =============== 梯度更新逻辑 ===============
                 loss_value = float(loss)
-
-                # 只有Stage1训练
                 loss_scaler(
                     loss,
                     optimizer,
@@ -708,7 +656,6 @@ def train(args):
                 )
                 optimizer.zero_grad()
 
-                # 按照save_freq保存模型
                 if (
                     data_iter_step % int(args.save_freq * len(data_loader_train)) == 0
                     and data_iter_step != 0
@@ -717,7 +664,6 @@ def train(args):
                     print("saving at step", data_iter_step)
                     save_model(epoch - 1, f"epoch_{epoch}_{data_iter_step}", float("inf"))
 
-    # gather the stats from all processes (应该在epoch结束后，for循环外面)
     metric_logger.synchronize_between_processes(accelerator)
     printer.info("Averaged stats: %s", metric_logger)
 

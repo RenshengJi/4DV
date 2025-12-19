@@ -40,18 +40,15 @@ def cluster_dynamic_objects(
     results = []
 
     for frame_idx in range(view_mapping.num_frames):
-        # Get all views for this temporal frame
         view_indices = view_mapping.get_views_for_frame(frame_idx)
 
         if not view_indices:
             results.append(_create_empty_clustering_result(device))
             continue
 
-        # Merge all views for this frame
         merged_xyz = torch.cat([xyz[v] for v in view_indices], dim=0)
         merged_velocity = torch.cat([velocity[v] for v in view_indices], dim=0)
 
-        # Cluster merged point cloud
         result = _cluster_single_frame(
             merged_xyz, merged_velocity, gt_scale,
             velocity_threshold, eps, min_samples, area_threshold
@@ -75,11 +72,9 @@ def _cluster_single_frame(
     device = points.device
     N = points.shape[0]
 
-    # Convert velocity to metric scale
     velocity_metric = velocity / gt_scale
     velocity_magnitude = torch.norm(velocity_metric, dim=-1)
 
-    # Filter dynamic points
     dynamic_mask = velocity_magnitude > velocity_threshold
     dynamic_points = points[dynamic_mask]
     dynamic_velocities = velocity[dynamic_mask]
@@ -87,17 +82,14 @@ def _cluster_single_frame(
     if len(dynamic_points) < min_samples:
         return _create_empty_clustering_result(device, points)
 
-    # Convert to metric scale for clustering
     dynamic_points_metric = dynamic_points / gt_scale
 
-    # Perform clustering (try GPU first)
     try:
         points_cp = cp.asarray(dynamic_points_metric.detach())
         dbscan = DBSCAN(eps=eps, min_samples=min_samples)
         labels_cp = dbscan.fit_predict(points_cp)
         cluster_labels = torch.as_tensor(labels_cp, device='cuda')
     except Exception:
-        # Fallback to CPU
         try:
             points_np = dynamic_points_metric.detach().cpu().numpy()
             dbscan = SklearnDBSCAN(eps=eps, min_samples=min_samples)
@@ -106,11 +98,9 @@ def _cluster_single_frame(
         except Exception:
             cluster_labels = torch.full((len(dynamic_points),), -1, dtype=torch.long, device=device)
 
-    # Map back to full point cloud
     full_labels = torch.full((N,), -1, device=device)
     full_labels[dynamic_mask] = cluster_labels.to(device).long()
 
-    # Extract valid clusters
     unique_labels = set(cluster_labels.cpu().numpy().tolist())
     unique_labels.discard(-1)
 
@@ -126,7 +116,6 @@ def _cluster_single_frame(
         cluster_vel = dynamic_velocities[mask].detach()
 
         if len(cluster_pts) < area_threshold:
-            # Mark as static
             dynamic_indices = torch.where(dynamic_mask)[0]
             filtered_indices = dynamic_indices[torch.where(mask)[0]]
             full_labels[filtered_indices] = -1
@@ -139,12 +128,10 @@ def _cluster_single_frame(
         cluster_velocities.append(cluster_vel.mean(dim=0))
         cluster_sizes.append(len(cluster_pts))
 
-        # Get pixel indices
         cluster_mask = full_labels == old_label
         pixel_indices = torch.where(cluster_mask)[0].cpu().numpy().tolist()
         cluster_indices.append(pixel_indices)
 
-    # Remap labels to be continuous
     for old_label, new_label in valid_label_mapping.items():
         full_labels[full_labels == old_label] = new_label
 

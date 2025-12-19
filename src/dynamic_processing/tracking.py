@@ -49,7 +49,6 @@ def track_objects_across_frames(
             continue
 
         if frame_idx == 0:
-            # Initialize tracks for first frame
             global_ids = list(range(next_global_id, next_global_id + result.num_clusters))
             next_global_id += result.num_clusters
 
@@ -61,12 +60,10 @@ def track_objects_across_frames(
                     'size': result.cluster_sizes[i]
                 }
         else:
-            # Match with previous frame
             prev_result = results_with_ids[frame_idx - 1]
             prev_global_ids = prev_result.get('global_ids', [])
 
             if len(prev_global_ids) == 0:
-                # No previous tracks, create new
                 global_ids = list(range(next_global_id, next_global_id + result.num_clusters))
                 next_global_id += result.num_clusters
 
@@ -78,7 +75,6 @@ def track_objects_across_frames(
                         'size': result.cluster_sizes[i]
                     }
             else:
-                # Build cost matrix for Hungarian matching
                 num_prev = len(prev_global_ids)
                 num_curr = result.num_clusters
                 cost_matrix = np.full((num_prev, num_curr), float('inf'))
@@ -96,7 +92,6 @@ def track_objects_across_frames(
                         if pos_distance < position_threshold:
                             cost_matrix[i, j] = pos_distance
 
-                # Solve assignment
                 if np.any(cost_matrix < float('inf')):
                     row_indices, col_indices = linear_sum_assignment(cost_matrix)
 
@@ -109,7 +104,6 @@ def track_objects_across_frames(
                             global_ids[j] = prev_gid
                             matched_curr.add(j)
 
-                            # Update track
                             global_tracks[prev_gid] = {
                                 'frame_id': frame_idx,
                                 'center': result.cluster_centers[j],
@@ -117,7 +111,6 @@ def track_objects_across_frames(
                                 'size': result.cluster_sizes[j]
                             }
 
-                    # Assign new IDs to unmatched objects
                     for j in range(num_curr):
                         if j not in matched_curr:
                             gid = next_global_id
@@ -131,7 +124,6 @@ def track_objects_across_frames(
                                 'size': result.cluster_sizes[j]
                             }
                 else:
-                    # No valid matches, create all new
                     global_ids = list(range(next_global_id, next_global_id + result.num_clusters))
                     next_global_id += result.num_clusters
 

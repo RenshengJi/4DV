@@ -84,10 +84,9 @@ class CameraPath:
 
         self._duration_element = duration_element
 
-        # These parameters should be overridden externally.
         self.loop: bool = False
         self.framerate: float = 30.0
-        self.tension: float = 0.5  # Tension / alpha term.
+        self.tension: float = 0.5
         self.default_fov: float = 0.0
         self.time_enabled = time_enabled
         self.default_render_time: float = 0.0
@@ -105,7 +104,6 @@ class CameraPath:
         """Add a new camera, or replace an old one if `keyframe_index` is passed in."""
         server = self._server
 
-        # Add a keyframe if we aren't replacing an existing one.
         if keyframe_index is None:
             keyframe_index = self._keyframe_counter
             self._keyframe_counter += 1
@@ -245,8 +243,6 @@ class CameraPath:
                         T_current_target.log() * j / 9.0
                     )
 
-                    # Important bit: we atomically set both the orientation and the position
-                    # of the camera.
                     with client.atomic():
                         client.camera.wxyz = T_world_set.rotation().wxyz
                         client.camera.position = T_world_set.translation()
@@ -287,8 +283,6 @@ class CameraPath:
         spline_indices = np.arange(transition_times_cumsum.shape[0])
 
         if self.loop:
-            # In the case of a loop, we pad the spline to match the start/end
-            # slopes.
             interpolator = interpolate.PchipInterpolator(
                 x=np.concatenate(
                     [
@@ -307,7 +301,6 @@ class CameraPath:
                 x=transition_times_cumsum, y=spline_indices
             )
 
-        # Clip to account for floating point error.
         return np.clip(interpolator(time), 0, spline_indices[-1])
 
     def interpolate_pose_and_fov_rad(
@@ -399,7 +392,6 @@ class CameraPath:
             endconditions="closed" if self.loop else "natural",
         )
 
-        # Update visualized spline.
         points_array = self._position_spline.evaluate(
             self.spline_t_from_t_sec(
                 np.linspace(0, transition_times_cumsum[-1], num_frames)
@@ -412,7 +404,6 @@ class CameraPath:
             ]
         )
 
-        # Clear prior spline nodes.
         for node in self._spline_nodes:
             node.remove()
         self._spline_nodes.clear()
@@ -513,8 +504,6 @@ class CameraPath:
         for i in range(num_transitions_plus_1 - 1):
             make_transition_handle(i)
 
-        # for i in range(transition_times.shape[0])
-
     def compute_duration(self) -> float:
         """Compute the total duration of the trajectory."""
         total = 0.0
@@ -582,8 +571,7 @@ Colormaps = Literal["turbo", "viridis", "magma", "inferno", "cividis", "gray"]
 def apply_float_colormap(
     image: Float[Tensor, "*bs 1"], colormap: Colormaps = "viridis"
 ) -> Float[Tensor, "*bs rgb=3"]:
-    """Copied from nerfstudio/utils/colormaps.py
-    Convert single channel to a color image.
+    """Convert single channel to a color image.
 
     Args:
         image: Single channel image.
@@ -612,7 +600,7 @@ def populate_general_render_tab(
     folder: viser.GuiFolderHandle,
     render_tab_state: RenderTabState,
     extra_handles: Optional[Dict[str, viser.GuiInputHandle]] = None,
-    scale_ratio: float = 10.0,  # VISER_NERFSTUDIO_SCALE_RATIO
+    scale_ratio: float = 10.0,
     time_enabled: bool = False,
 ) -> Dict[str, viser.GuiInputHandle]:
     """
@@ -660,8 +648,6 @@ def populate_general_render_tab(
                 client.camera.fov = fov_radians
             camera_path.default_fov = fov_radians
 
-            # Updating the aspect ratio will also re-render the camera frustums.
-            # Could rethink this.
             camera_path.update_aspect(
                 render_res_vec2.value[0] / render_res_vec2.value[1]
             )
@@ -696,7 +682,6 @@ def populate_general_render_tab(
             assert event.client_id is not None
             camera = server.get_clients()[event.client_id].camera
 
-            # Add this camera to the path.
             camera_path.add_camera(
                 Keyframe.from_camera(
                     camera,
@@ -730,7 +715,6 @@ def populate_general_render_tab(
 
                     duration_number.value = camera_path.compute_duration()
 
-                    # Clear move handles.
                     if len(transform_controls) > 0:
                         for t in transform_controls:
                             t.remove()
@@ -790,7 +774,6 @@ def populate_general_render_tab(
 
         @move_checkbox.on_update
         def _(event: viser.GuiEvent) -> None:
-            # Clear move handles when toggled off.
             if move_checkbox.value is False:
                 for t in transform_controls:
                     t.remove()
@@ -811,7 +794,6 @@ def populate_general_render_tab(
 
                     camera_path.update_spline()
 
-            # Show move handles.
             assert event.client is not None
             for keyframe_index, keyframe in camera_path._keyframes.items():
                 controls = event.client.scene.add_transform_controls(
@@ -869,14 +851,12 @@ def populate_general_render_tab(
             camera_path.default_transition_sec = transition_sec_number.value
             duration_number.value = camera_path.compute_duration()
 
-        # set the initial value to the current date-time string
         trajectory_name_text = server.gui.add_text(
             "Name",
             initial_value="default",
             hint="Name of the trajectory",
         )
 
-        # add button for loading existing path
         load_camera_path_button = server.gui.add_button(
             "Load Trajectory",
             icon=viser.Icon.FOLDER_OPEN,
@@ -934,7 +914,7 @@ def populate_general_render_tab(
             remove_preview_camera()
             return
         time = None
-        if len(maybe_pose_and_fov_rad) == 3:  # Time is enabled.
+        if len(maybe_pose_and_fov_rad) == 3:
             pose, fov_rad, time = maybe_pose_and_fov_rad
             render_tab_state.preview_time = time
         else:
@@ -948,8 +928,8 @@ def populate_general_render_tab(
             return pose, fov_rad
 
     def add_preview_frame_slider() -> Optional[viser.GuiInputHandle[int]]:
-        """Helper for creating the current frame # slider. This is removed and
-        re-added anytime the `max` value changes."""
+        """Helper for creating the current frame slider. This is removed and
+        re-added anytime the max value changes."""
 
         with folder:
             preview_frame_slider = server.gui.add_slider(
@@ -958,7 +938,6 @@ def populate_general_render_tab(
                 max=get_max_frame_index(),
                 step=1,
                 initial_value=0,
-                # Place right after the trajectory name text
                 order=trajectory_name_text.order + 0.01,
                 disabled=get_max_frame_index() == 1,
             )
@@ -973,7 +952,7 @@ def populate_general_render_tab(
             maybe_pose_and_fov_rad = compute_and_update_preview_camera_state()
             if maybe_pose_and_fov_rad is None:
                 return
-            if len(maybe_pose_and_fov_rad) == 3:  # Time is enabled.
+            if len(maybe_pose_and_fov_rad) == 3:
                 pose, fov_rad, time = maybe_pose_and_fov_rad
             else:
                 pose, fov_rad = maybe_pose_and_fov_rad
@@ -989,14 +968,12 @@ def populate_general_render_tab(
             )
             if render_tab_state.preview_render:
                 for client in server.get_clients().values():
-                    # aspect ratio is not assignable, pass args in get_render instead
                     client.camera.wxyz = pose.rotation().wxyz
                     client.camera.position = pose.translation()
                     client.camera.fov = fov_rad
 
         return preview_frame_slider
 
-    # We back up the camera poses before and after we start previewing renders.
     camera_pose_backup_from_id: Dict[int, tuple] = {}
 
     @preview_save_camera_path_button.on_click
@@ -1010,16 +987,14 @@ def populate_general_render_tab(
         if maybe_pose_and_fov_rad is None:
             remove_preview_camera()
             return
-        if len(maybe_pose_and_fov_rad) == 3:  # Time is enabled.
+        if len(maybe_pose_and_fov_rad) == 3:
             pose, fov, time = maybe_pose_and_fov_rad
         else:
             pose, fov = maybe_pose_and_fov_rad
         del fov
 
-        # Hide all scene nodes when we're previewing the render.
         server.scene.set_global_visibility(False)
 
-        # Back up and then set camera poses.
         for client in server.get_clients().values():
             camera_pose_backup_from_id[client.client_id] = (
                 client.camera.position,
@@ -1036,7 +1011,6 @@ def populate_general_render_tab(
         preview_render_stop_button.visible = False
         dump_video_button.disabled = False
 
-        # Revert camera poses.
         for client in server.get_clients().values():
             if client.client_id not in camera_pose_backup_from_id:
                 continue
@@ -1048,7 +1022,6 @@ def populate_general_render_tab(
             client.camera.up_direction = cam_up
             client.flush()
 
-        # Un-hide scene nodes.
         server.scene.set_global_visibility(True)
 
     preview_frame_slider = add_preview_frame_slider()
@@ -1079,11 +1052,10 @@ def populate_general_render_tab(
     if time_enabled:
         handles["render_time"] = render_time
 
-    # Update the # of frames.
     @duration_number.on_update
     @framerate_number.on_update
     def _(_) -> None:
-        remove_preview_camera()  # Will be re-added when slider is updated.
+        remove_preview_camera()
 
         nonlocal preview_frame_slider
         old = preview_frame_slider
@@ -1099,7 +1071,6 @@ def populate_general_render_tab(
         camera_path.framerate = framerate_number.value
         camera_path.update_spline()
 
-    # Play the camera trajectory when the play button is pressed.
     @play_button.on_click
     def _(_) -> None:
         play_button.visible = False
@@ -1121,7 +1092,6 @@ def populate_general_render_tab(
         play_thread.join()
         dump_video_button.disabled = False
 
-    # Play the camera trajectory when the play button is pressed.
     @pause_button.on_click
     def _(_) -> None:
         play_button.visible = True
@@ -1149,7 +1119,6 @@ def populate_general_render_tab(
 
                 @load_button.on_click
                 def _(_) -> None:
-                    # load the json file
                     json_path = output_dir / "camera_paths" / camera_path_dropdown.value
                     with open(json_path, "r") as f:
                         json_data = json.load(f)
@@ -1161,7 +1130,6 @@ def populate_general_render_tab(
                         pose = tf.SE3.from_matrix(
                             np.array(frame["matrix"]).reshape(4, 4)
                         )
-                        # apply the x rotation by 180 deg
                         pose = tf.SE3.from_rotation_and_translation(
                             pose.rotation() @ tf.SO3.from_x_radians(np.pi),
                             pose.translation(),
@@ -1170,8 +1138,6 @@ def populate_general_render_tab(
                             Keyframe(
                                 position=pose.translation() * scale_ratio,
                                 wxyz=pose.rotation().wxyz,
-                                # There are some floating point conversions between degrees and radians, so the fov and
-                                # default_Fov values will not be exactly matched.
                                 override_fov_enabled=abs(
                                     frame["fov"] - json_data.get("default_fov", 0.0)
                                 )
@@ -1195,12 +1161,10 @@ def populate_general_render_tab(
                         "default_transition_sec", 0.5
                     )
 
-                    # update the render name
                     trajectory_name_text.value = json_path.stem
                     camera_path.update_spline()
                     modal.close()
 
-                    # visualize the camera path
                     server.scene.set_global_visibility(True)
 
             cancel_button = event.client.gui.add_button("Cancel")
@@ -1214,22 +1178,6 @@ def populate_general_render_tab(
         assert event.client is not None
         num_frames = int(framerate_number.value * duration_number.value)
         json_data = {}
-        # json data has the properties:
-        # keyframes: list of keyframes with
-        #     matrix : flattened 4x4 matrix
-        #     fov: float in degrees
-        #     aspect: float
-        # render_height: int
-        # render_width: int
-        # fps: int
-        # seconds: float
-        # is_cycle: bool
-        # smoothness_value: float
-        # camera_path: list of frames with properties
-        # camera_to_world: flattened 4x4 matrix
-        # fov: float in degrees
-        # aspect: float
-        # first populate the keyframes:
         keyframes = []
         for keyframe, dummy in camera_path._keyframes.values():
             pose = tf.SE3.from_rotation_and_translation(
@@ -1257,7 +1205,6 @@ def populate_general_render_tab(
         json_data["seconds"] = duration_number.value
         json_data["is_cycle"] = loop_checkbox.value
         json_data["smoothness_value"] = tension_slider.value
-        # now populate the camera path:
         camera_path_list = []
         for i in range(num_frames):
             maybe_pose_and_fov = camera_path.interpolate_pose_and_fov_rad(
@@ -1266,11 +1213,10 @@ def populate_general_render_tab(
             if maybe_pose_and_fov is None:
                 return
             time = None
-            if len(maybe_pose_and_fov) == 3:  # Time is enabled.
+            if len(maybe_pose_and_fov) == 3:
                 pose, fov, time = maybe_pose_and_fov
             else:
                 pose, fov = maybe_pose_and_fov
-            # rotate the axis of the camera 180 about x axis
             pose = tf.SE3.from_rotation_and_translation(
                 pose.rotation() @ tf.SO3.from_x_radians(np.pi),
                 pose.translation() / scale_ratio,
@@ -1284,20 +1230,7 @@ def populate_general_render_tab(
                 camera_path_list_dict["render_time"] = time
             camera_path_list.append(camera_path_list_dict)
         json_data["camera_path"] = camera_path_list
-        # finally add crop data if crop is enabled
-        # if control_panel is not None:
-        #     if control_panel.crop_viewport:
-        #         obb = control_panel.crop_obb
-        #         rpy = tf.SO3.from_matrix(obb.R.numpy()).as_rpy_radians()
-        #         color = control_panel.background_color
-        #         json_data["crop"] = {
-        #             "crop_center": obb.T.tolist(),
-        #             "crop_scale": obb.S.tolist(),
-        #             "crop_rot": [rpy.roll, rpy.pitch, rpy.yaw],
-        #             "crop_bg_color": {"r": color[0], "g": color[1], "b": color[2]},
-        #         }
 
-        # now write the json file
         try:
             json_outfile = (
                 output_dir / "camera_paths" / f"{trajectory_name_text.value}.json"
@@ -1320,22 +1253,19 @@ def populate_general_render_tab(
         client = event.client
         assert client is not None
 
-        # enter into preview render mode
         render_tab_state.preview_render = True
         maybe_pose_and_fov_rad = compute_and_update_preview_camera_state()
         if maybe_pose_and_fov_rad is None:
             remove_preview_camera()
             return
-        if len(maybe_pose_and_fov_rad) == 3:  # Time is enabled.
+        if len(maybe_pose_and_fov_rad) == 3:
             pose, fov, time = maybe_pose_and_fov_rad
         else:
             pose, fov = maybe_pose_and_fov_rad
         del fov
 
-        # Hide all scene nodes when we're previewing the render.
         server.scene.set_global_visibility(False)
 
-        # Back up and then set camera poses.
         for client in server.get_clients().values():
             camera_pose_backup_from_id[client.client_id] = (
                 client.camera.position,
@@ -1345,7 +1275,6 @@ def populate_general_render_tab(
             client.camera.wxyz = pose.rotation().wxyz
             client.camera.position = pose.translation()
 
-        # disable all the trajectory control widgets
         handles_to_disable = list(handles.values()) + list(extra_handles.values())
         original_disabled = [handle.disabled for handle in handles_to_disable]
         for handle in handles_to_disable:
@@ -1364,7 +1293,6 @@ def populate_general_render_tab(
                 preview_frame_slider.value = (
                     preview_frame_slider.value + 1
                 ) % max_frame
-                # should we use get_render here?
                 image = client.camera.get_render(
                     height=render_res_vec2.value[1],
                     width=render_res_vec2.value[0],
@@ -1377,14 +1305,11 @@ def populate_general_render_tab(
         dump_thread.start()
         dump_thread.join()
 
-        # restore the original disabled state
         for handle, original_disabled in zip(handles_to_disable, original_disabled):
             handle.disabled = original_disabled
 
-        # exit preview render mode
         render_tab_state.preview_render = False
 
-        # Revert camera poses.
         for client in server.get_clients().values():
             if client.client_id not in camera_pose_backup_from_id:
                 continue
@@ -1396,7 +1321,6 @@ def populate_general_render_tab(
             client.camera.up_direction = cam_up
             client.flush()
 
-        # Un-hide scene nodes.
         server.scene.set_global_visibility(True)
 
     camera_path = CameraPath(server, duration_number)

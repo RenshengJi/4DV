@@ -29,7 +29,7 @@ class BaseDataset(EasyDataset, torch.utils.data.Dataset):
         resolution=None,
         transform=None,
         seed=None,
-        num_views_range=None,  # Optional: range of num_views to sample from, e.g., [4, 8]
+        num_views_range=None,
     ):
         assert num_views is not None, "num_views must be specified"
         self.num_views = num_views
@@ -37,14 +37,12 @@ class BaseDataset(EasyDataset, torch.utils.data.Dataset):
         self.transform = transform
         self.seed = seed
 
-        # Initialize RNG once in __init__
         if seed is not None:
             self._rng = np.random.default_rng(seed=seed)
         else:
             random_seed = torch.randint(0, 2**32, (1,)).item()
             self._rng = np.random.default_rng(seed=random_seed)
 
-        # Set num_views range for random sampling
         if num_views_range is not None:
             assert len(num_views_range) == 2, "num_views_range must be [min, max]"
             self.num_views_range = num_views_range
@@ -142,31 +140,25 @@ class BaseDataset(EasyDataset, torch.utils.data.Dataset):
         pos_ref = ids_all.index(id_ref)
         remaining_sum = len(ids_all) - 1 - pos_ref
 
-        # We have enough frames for the sequence
         if remaining_sum >= num_views - 1:
             if remaining_sum == num_views - 1:
-                # Exact fit: use all remaining frames
                 return [pos_ref + i for i in range(num_views)], True
 
-            # Calculate max possible interval
             max_interval = min(max_interval, 2 * remaining_sum // (num_views - 1))
 
-            # Always use fixed interval (video mode)
             fixed_interval = rng.choice(range(min_interval, min(remaining_sum // (num_views - 1) + 1, max_interval + 1)))
             intervals = [fixed_interval for _ in range(num_views - 1)]
 
             pos = list(itertools.accumulate([pos_ref] + intervals))
             pos = [p for p in pos if p < len(ids_all)]
 
-            # If we don't have enough positions, fill with remaining candidates
             if len(pos) < num_views:
                 all_possible_pos = np.arange(pos_ref, len(ids_all))
                 pos_candidates = [p for p in all_possible_pos if p not in pos]
                 pos = pos + rng.choice(pos_candidates, num_views - len(pos), replace=False).tolist()
 
-            pos = sorted(pos)  # Always sorted for video
+            pos = sorted(pos)
         else:
-            # Not enough frames - this should not happen in our use case
             raise ValueError(f"Not enough frames: need {num_views}, but only {remaining_sum + 1} available from position {pos_ref}")
 
         assert len(pos) == num_views
@@ -198,7 +190,6 @@ class BaseDataset(EasyDataset, torch.utils.data.Dataset):
         if not isinstance(image, PIL.Image.Image):
             image = PIL.Image.fromarray(image)
 
-        # Crop centered on principal point
         W, H = image.size
         cx, cy = intrinsics[:2, 2].round().astype(int)
         min_margin_x = min(cx, W - cx)
@@ -210,7 +201,6 @@ class BaseDataset(EasyDataset, torch.utils.data.Dataset):
         r, b = cx + min_margin_x, cy + min_margin_y
         crop_bbox = (l, t, r, b)
 
-        # Crop
         if flowmap is not None or seg_mask is not None:
             image, depthmap, flowmap, seg_mask, intrinsics = cropping.crop_image_depthmap_flowmap_segmask(
                 image, depthmap, flowmap, seg_mask, intrinsics, crop_bbox
@@ -220,7 +210,6 @@ class BaseDataset(EasyDataset, torch.utils.data.Dataset):
                 image, depthmap, intrinsics, crop_bbox
             )
 
-        # Resize to target resolution
         W, H = image.size
         target_resolution = np.array(resolution)
 
@@ -233,7 +222,6 @@ class BaseDataset(EasyDataset, torch.utils.data.Dataset):
                 image, depthmap, intrinsics, target_resolution
             )
 
-        # Final crop to exact resolution
         intrinsics2 = cropping.camera_matrix_of_crop(
             intrinsics, image.size, resolution, offset_factor=0.5
         )

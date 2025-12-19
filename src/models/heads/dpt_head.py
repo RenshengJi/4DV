@@ -64,16 +64,14 @@ class DPTHead(nn.Module):
         self.down_ratio = down_ratio
         self.intermediate_layer_idx = intermediate_layer_idx
 
-        self.gradient_checkpointing = False  
+        self.gradient_checkpointing = False
 
         self.norm = nn.LayerNorm(dim_in)
 
-        # Projection layers for each output channel from tokens.
         self.projects = nn.ModuleList(
             [nn.Conv2d(in_channels=dim_in, out_channels=oc, kernel_size=1, stride=1, padding=0) for oc in out_channels]
         )
 
-        # Resize layers for upsampling feature maps.
         self.resize_layers = nn.ModuleList(
             [
                 nn.ConvTranspose2d(
@@ -91,7 +89,6 @@ class DPTHead(nn.Module):
 
         self.scratch = _make_scratch(out_channels, features, expand=False)
 
-        # Attach additional modules to scratch.
         self.scratch.stem_transpose = None
         self.scratch.refinenet1 = _make_fusion_block(features)
         self.scratch.refinenet2 = _make_fusion_block(features)
@@ -107,23 +104,15 @@ class DPTHead(nn.Module):
             self.scratch.output_conv1 = nn.Conv2d(
                 head_features_1, head_features_1 // 2, kernel_size=3, stride=1, padding=1
             )
-            # self.scratch.output_conv1 = nn.Conv2d(
-            #     head_features_1, head_features_1 // 2, kernel_size=3, stride=1, padding=1, padding_mode='reflect'
-            # )
             conv2_in_channels = head_features_1 // 2
 
-            # self.scratch.output_conv2 = nn.Sequential(
-            #     nn.Conv2d(conv2_in_channels, head_features_2, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
-            #     nn.ReLU(inplace=True),
-            #     nn.Conv2d(head_features_2, output_dim, kernel_size=1, stride=1, padding=0),
-            # )
             self.scratch.output_conv2 = nn.Sequential(
                 nn.Conv2d(conv2_in_channels, head_features_2, kernel_size=3, stride=1, padding=1),
                 nn.ReLU(inplace=True),
                 nn.Conv2d(head_features_2, output_dim, kernel_size=1, stride=1, padding=0),
             )
 
-    def gradient_checkpointing_enable(self, enable=True):  # Added for gradient checkpointing
+    def gradient_checkpointing_enable(self, enable=True):
         """Enable or disable gradient checkpointing."""
         self.gradient_checkpointing = enable
 
@@ -140,9 +129,7 @@ class DPTHead(nn.Module):
             aggregated_tokens_list (List[Tensor]): List of token tensors from different transformer layers.
             images (Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
             patch_start_idx (int): Starting index for patch tokens in the token sequence.
-                Used to separate patch tokens from other tokens (e.g., camera or register tokens).
-            frames_chunk_size (int, optional): Number of frames to process in each chunk.
-                If None or larger than S, all frames are processed at once. Default: 8.
+            frames_chunk_size (int, optional): Number of frames to process in each chunk. Default: 8.
 
         Returns:
             Tensor or Tuple[Tensor, Tensor]:
@@ -151,21 +138,17 @@ class DPTHead(nn.Module):
         """
         B, S, _, H, W = images.shape
 
-        # If frames_chunk_size is not specified or greater than S, process all frames at once
         if frames_chunk_size is None or frames_chunk_size >= S:
             return self._forward_impl(aggregated_tokens_list, images, patch_start_idx)
 
-        # Otherwise, process frames in chunks to manage memory usage
         assert frames_chunk_size > 0
 
-        # Process frames in batches
         all_preds = []
         all_conf = []
 
         for frames_start_idx in range(0, S, frames_chunk_size):
             frames_end_idx = min(frames_start_idx + frames_chunk_size, S)
 
-            # Process batch of frames
             if self.feature_only:
                 chunk_output = self._forward_impl(
                     aggregated_tokens_list, images, patch_start_idx, frames_start_idx, frames_end_idx
@@ -178,7 +161,6 @@ class DPTHead(nn.Module):
                 all_preds.append(chunk_preds)
                 all_conf.append(chunk_conf)
 
-        # Concatenate results along the sequence dimension
         if self.feature_only:
             return torch.cat(all_preds, dim=1)
         else:
@@ -218,7 +200,6 @@ class DPTHead(nn.Module):
         dpt_idx = 0
 
         for i, layer_idx in enumerate(self.intermediate_layer_idx):
-            # Access layer directly from dict using layer_idx as key
             if layer_idx not in aggregated_tokens_list:
                 raise KeyError(f"Required layer {layer_idx} not found in aggregated_tokens_list. "
                              f"Available layers: {list(aggregated_tokens_list.keys())}, "
@@ -226,8 +207,6 @@ class DPTHead(nn.Module):
 
             x = aggregated_tokens_list[layer_idx][:, :, patch_start_idx:]
 
-
-            # Select frames if processing a chunk
             if frames_start_idx is not None and frames_end_idx is not None:
                 x = x[:, frames_start_idx:frames_end_idx]
 
@@ -245,13 +224,12 @@ class DPTHead(nn.Module):
             out.append(x)
             dpt_idx += 1
 
-        # Fuse features from multiple layers.
         if self.gradient_checkpointing and self.training:
             output_features = checkpoint(self.scratch_forward, out, use_reentrant=False)
         else:
             output_features = self.scratch_forward(out)
         out = output_features
-        # Interpolate fused output to match target image resolution.
+
         out = custom_interpolate(
             out,
             (int(patch_h * self.patch_size / self.down_ratio), int(patch_w * self.patch_size / self.down_ratio)),

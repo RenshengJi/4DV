@@ -51,7 +51,7 @@ class VelocityRegistration:
             return self._estimate_procrustes(points_src, velocity_src, direction)
 
     def _estimate_simple(self, velocity: torch.Tensor, direction: int) -> torch.Tensor:
-        """Simple translation estimation from mean velocity."""
+        """Estimate translation from mean velocity."""
         mean_velocity = velocity.mean(dim=0) * direction
         transform = torch.eye(4, device=self.device, dtype=torch.float32)
         transform[:3, 3] = mean_velocity
@@ -63,7 +63,7 @@ class VelocityRegistration:
         velocity: torch.Tensor,
         direction: int
     ) -> torch.Tensor:
-        """Procrustes/Kabsch algorithm for rigid transform estimation."""
+        """Estimate rigid transform using Procrustes/Kabsch algorithm."""
         if len(points_src) < 3:
             return self._estimate_simple(velocity, direction)
 
@@ -93,10 +93,8 @@ class VelocityRegistration:
             if len(pts_src) < 3:
                 raise ValueError("Need at least 3 points")
 
-            # Initial estimate
             R, t = self._kabsch_step(pts_src, pts_dst)
 
-            # Trim outliers
             if trim_ratio < 1.0:
                 pts_transformed = torch.matmul(pts_src, R.T) + t
                 residuals = torch.norm(pts_transformed - pts_dst, dim=1)
@@ -106,7 +104,6 @@ class VelocityRegistration:
                 pts_src = pts_src[inlier_indices]
                 pts_dst = pts_dst[inlier_indices]
 
-                # Refine estimate
                 R, t = self._kabsch_step(pts_src, pts_dst)
 
             return R, t
@@ -116,28 +113,23 @@ class VelocityRegistration:
         pts_src: torch.Tensor,
         pts_dst: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Single Kabsch step."""
-        # Center points
+        """Perform single Kabsch step."""
         centroid_src = pts_src.mean(dim=0)
         centroid_dst = pts_dst.mean(dim=0)
         pts_src_centered = pts_src - centroid_src
         pts_dst_centered = pts_dst - centroid_dst
 
-        # Check for degenerate case
         if torch.allclose(pts_src_centered, torch.zeros_like(pts_src_centered)):
             return torch.eye(3, device=self.device), centroid_dst - centroid_src
 
-        # Covariance matrix
         H = torch.matmul(pts_src_centered.T, pts_dst_centered)
 
         if torch.allclose(H, torch.zeros_like(H)):
             return torch.eye(3, device=self.device), centroid_dst - centroid_src
 
-        # SVD
         U, _, Vt = torch.linalg.svd(H)
         R = torch.matmul(Vt.T, U.T)
 
-        # Handle reflection
         if torch.linalg.det(R) < 0:
             Vt_corrected = Vt.clone()
             Vt_corrected[-1, :] *= -1
@@ -171,12 +163,10 @@ class VelocityRegistration:
         if start_frame == end_frame:
             return torch.eye(4, device=self.device, dtype=torch.float32)
 
-        # Check cache
         cache_key = (start_frame, end_frame)
         if cache_key in frame_transforms:
             return frame_transforms[cache_key]
 
-        # Determine direction
         direction = 1 if start_frame < end_frame else -1
         frame_range = range(start_frame, end_frame, direction)
 
@@ -189,7 +179,6 @@ class VelocityRegistration:
             if step_key in frame_transforms:
                 step_transform = frame_transforms[step_key]
             else:
-                # Compute transform
                 if frame_idx not in points_frames or frame_idx not in velocity_frames:
                     return None
 

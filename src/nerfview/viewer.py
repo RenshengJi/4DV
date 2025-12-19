@@ -67,7 +67,6 @@ class Viewer(object):
         output_dir: Optional[Path] = None,
         mode: Literal["rendering", "training"] = "rendering",
     ):
-        # Public states.
         self.server = server
         self.render_fn = render_fn
         self.mode = mode
@@ -75,13 +74,11 @@ class Viewer(object):
         self.state = "preparing"
         self.output_dir = output_dir if output_dir is not None else Path("./results")
 
-        # Private states.
         self._renderers: dict[int, Renderer] = {}
         self._step: int = 0
         self._last_update_step: int = 0
         self._last_move_time: float = 0.0
 
-        # Initialize and populate GUIs.
         server.scene.set_global_visibility(True)
         server.on_client_disconnect(self._disconnect_client)
         server.on_client_connect(self._connect_client)
@@ -146,13 +143,11 @@ class Viewer(object):
         }
 
     def _init_rendering_tab(self):
-        # Allow subclasses to override for custom rendering table
         self.render_tab_state = RenderTabState()
         self._rendering_tab_handles = {}
         self._rendering_folder = self.server.gui.add_folder("Rendering")
 
     def _populate_rendering_tab(self):
-        # Allow subclasses to override for custom rendering table
         assert self.render_tab_state is not None, "Render tab state is not initialized"
         assert self._rendering_folder is not None, "Rendering folder is not initialized"
         with self._rendering_folder:
@@ -172,7 +167,6 @@ class Viewer(object):
 
             self._rendering_tab_handles["viewer_res_slider"] = viewer_res_slider
 
-        # training tab handles should also be disabled during dumping video.
         extra_handles = self._rendering_tab_handles.copy()
         if self.mode == "training":
             extra_handles.update(self._training_tab_handles)
@@ -231,15 +225,12 @@ class Viewer(object):
     def update(self, step: int, num_train_rays_per_step: int):
         if self.mode == "rendering":
             raise ValueError("`update` method is only available in training mode.")
-        # Skip updating the viewer for the first few steps to allow
-        # `num_train_rays_per_sec` and `num_view_rays_per_sec` to stabilize.
         if step < 5:
             return
         self._step = step
         self._training_tab_handles["step_number"].value = step
         if len(self._renderers) == 0:
             return
-        # Stop training while user moves camera to make viewing smoother.
         while time.time() - self._last_move_time < 0.1:
             time.sleep(0.05)
         if (
@@ -270,8 +261,7 @@ class Viewer(object):
                     )
 
     def _after_render(self):
-        # This function will be called each time render_fn is called.
-        # It can be used to update the viewer panel.
+        """This function is called after each render and can be overridden to update the viewer panel."""
         pass
 
     def complete(self):
