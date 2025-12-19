@@ -249,6 +249,13 @@ def create_clustering_visualization(matched_clustering_results, vggt_batch, fusi
                 source_rgb = vggt_batch["images"][0, view_idx].permute(1, 2, 0)
                 source_rgb = (source_rgb * 255).cpu().numpy().astype(np.uint8)
 
+                # Check if frame_idx is within colored_results range
+                if frame_idx >= len(colored_results):
+                    print(f"[DEBUG] Warning: frame_idx {frame_idx} >= colored_results length {len(colored_results)}, using source RGB only")
+                    fused_image = source_rgb.copy()
+                    clustering_images.append(fused_image)
+                    continue
+
                 colored_result = colored_results[frame_idx]
                 point_colors = colored_result['colors']
 
@@ -515,7 +522,7 @@ def _apply_transform_to_gaussians(gaussians, transform):
 
 
 @torch.no_grad()
-def run_single_inference(model, dataset, idx, num_views, device, cfg):
+def run_single_inference(model, dataset, idx, num_context_frames, device, cfg, render_target_frames=False):
     """
     Run inference on single scene (supports multi-camera)
 
@@ -523,15 +530,17 @@ def run_single_inference(model, dataset, idx, num_views, device, cfg):
         model: VGGT model
         dataset: Dataset
         idx: Scene index
-        num_views: Number of frames per camera
+        num_context_frames: Number of context frames (sparse frames for inference)
         device: Device
         cfg: Configuration
+        render_target_frames: Whether to render target frames in addition to context frames
 
     Returns:
-        Dictionary containing visualization data
+        Dictionary containing visualization data with context/target frame distinction
     """
     print(f"\n{'='*60}")
     print(f"Processing scene index: {idx}")
+    print(f"Render target frames: {render_target_frames}")
     print(f"{'='*60}\n")
 
     try:
@@ -546,13 +555,29 @@ def run_single_inference(model, dataset, idx, num_views, device, cfg):
 
         print(f"Loaded batch: images shape = {vggt_batch['images'].shape}")
 
+        # Separate context and target frames based on is_context_frame flag
+        is_context_frame = vggt_batch.get('is_context_frame', None)
+        if is_context_frame is not None:
+            context_mask = is_context_frame[0]  # [S]
+            context_indices = torch.where(context_mask)[0]
+            target_indices = torch.where(~context_mask)[0]
+
+            print(f"Context frames: {len(context_indices)}, Target frames: {len(target_indices)}")
+            print(f"Context frame indices: {context_indices.tolist()}")
+            print(f"Target frame indices: {target_indices.tolist()}")
+        else:
+            # Backward compatibility: if no context/target distinction, all are context frames
+            context_indices = torch.arange(len(views_list), device=device)
+            target_indices = torch.tensor([], dtype=torch.long, device=device)
+            print(f"No context/target distinction found, treating all {len(views_list)} frames as context frames")
+
         camera_indices = [v.get('camera_idx', 0) for v in views_list]
         frame_indices = [v.get('frame_idx', 0) for v in views_list]
 
         num_cameras = len(set(camera_indices))
-        num_frames_per_camera = len(camera_indices) // num_cameras
+        num_total_frames = len(views_list) // num_cameras if num_cameras > 0 else len(views_list)
 
-        print(f"Loaded {len(views_list)} views: {num_cameras} cameras × {num_frames_per_camera} frames")
+        print(f"Loaded {len(views_list)} views: {num_cameras} cameras × {num_total_frames} frames")
 
         images = vggt_batch['images']
         B, S, C, H, W = images.shape
@@ -560,19 +585,28 @@ def run_single_inference(model, dataset, idx, num_views, device, cfg):
         extrinsics = vggt_batch['extrinsics']
         depthmaps = vggt_batch['depths']
 
-        print("Running model inference...")
+        # Only feed context frames to the network for inference
+        if is_context_frame is not None and len(context_indices) > 0:
+            print(f"Feeding only context frames to network: {context_indices.tolist()}")
+            context_images = images[:, context_indices]
+            context_intrinsics = intrinsics[:, context_indices]
+            context_extrinsics = extrinsics[:, context_indices]
+        else:
+            print("No context/target distinction, feeding all frames to network")
+            context_images = images
+            context_intrinsics = intrinsics
+            context_extrinsics = extrinsics
+
+        print(f"Running model inference on {context_images.shape[1]} frames...")
         preds = model(
-            images,
-            gt_extrinsics=extrinsics,
-            gt_intrinsics=intrinsics,
+            context_images,
+            gt_extrinsics=context_extrinsics,
+            gt_intrinsics=context_intrinsics,
             frame_sample_ratio=1.0
         )
 
-        pred_depth = preds.get('depth', None)
-        if pred_depth is not None:
-            pred_depth = pred_depth[0].cpu().numpy()
-            if pred_depth.ndim == 4 and pred_depth.shape[-1] == 1:
-                pred_depth = pred_depth.squeeze(-1)
+        # Note: We don't use network pred_depth for visualization anymore
+        # Instead, we'll use rendered_depth from gaussian splatting which works on all frames
 
         dynamic_processor = DynamicProcessor(
             device=device,
@@ -589,15 +623,33 @@ def run_single_inference(model, dataset, idx, num_views, device, cfg):
         if hasattr(cfg, 'use_gt_camera') and cfg.use_gt_camera and 'pose_enc' in preds_for_dynamic:
             from models.utils.pose_enc import extri_intri_to_pose_encoding
             image_size_hw = (H, W)
+            # Use context frames' camera parameters
             gt_pose_enc = extri_intri_to_pose_encoding(
-                extrinsics, intrinsics, image_size_hw, pose_encoding_type="absT_quaR_FoV"
+                context_extrinsics, context_intrinsics, image_size_hw, pose_encoding_type="absT_quaR_FoV"
             )
             preds_for_dynamic['pose_enc'] = gt_pose_enc
-            print(f"[INFO] Using GT camera parameters for dynamic object processing")
+            print(f"[INFO] Using GT camera parameters for dynamic object processing (context frames only)")
 
         auxiliary_models = {}
 
-        result = dynamic_processor.process(preds_for_dynamic, vggt_batch)
+        # Create a context-only vggt_batch for dynamic processor
+        vggt_batch_context = {
+            'images': context_images,
+            'depths': vggt_batch['depths'][:, context_indices] if is_context_frame is not None else vggt_batch['depths'],
+            'intrinsics': context_intrinsics,
+            'extrinsics': context_extrinsics,
+            'point_masks': vggt_batch['point_masks'][:, context_indices] if is_context_frame is not None and vggt_batch.get('point_masks') is not None else vggt_batch.get('point_masks'),
+            'world_points': vggt_batch['world_points'][:, context_indices] if is_context_frame is not None and vggt_batch.get('world_points') is not None else vggt_batch.get('world_points'),
+            'flowmap': vggt_batch['flowmap'][:, context_indices] if is_context_frame is not None and vggt_batch.get('flowmap') is not None else vggt_batch.get('flowmap'),
+            'segment_label': vggt_batch['segment_label'][:, context_indices] if is_context_frame is not None and vggt_batch.get('segment_label') is not None else vggt_batch.get('segment_label'),
+            'segment_mask': vggt_batch['segment_mask'][:, context_indices] if is_context_frame is not None and vggt_batch.get('segment_mask') is not None else vggt_batch.get('segment_mask'),
+            'depth_scale_factor': vggt_batch.get('depth_scale_factor'),
+            'sky_masks': vggt_batch['sky_masks'][:, context_indices] if is_context_frame is not None and vggt_batch.get('sky_masks') is not None else vggt_batch.get('sky_masks'),
+            'camera_indices': vggt_batch['camera_indices'][:, context_indices] if is_context_frame is not None and vggt_batch.get('camera_indices') is not None else vggt_batch.get('camera_indices'),
+            'frame_indices': vggt_batch['frame_indices'][:, context_indices] if is_context_frame is not None and vggt_batch.get('frame_indices') is not None else vggt_batch.get('frame_indices'),
+        }
+
+        result = dynamic_processor.process(preds_for_dynamic, vggt_batch_context)
 
         dynamic_objects_data = dynamic_processor.to_legacy_format(result)
 
@@ -609,13 +661,22 @@ def run_single_inference(model, dataset, idx, num_views, device, cfg):
         else:
             gt_velocity = torch.zeros(len(views_list), H, W, 3, device=device)
 
-        pred_velocity_tensor = preds.get('velocity', torch.zeros(1, len(views_list), H, W, 3, device=device))[0]
-        pred_velocity_tensor = pred_velocity_tensor[:, :, :, [2, 0, 1]]
-        pred_velocity_tensor[:, :, :, 2] = -pred_velocity_tensor[:, :, :, 2]
+        # pred_velocity only contains context frames
+        num_context = len(context_indices) if is_context_frame is not None else len(views_list)
+        pred_velocity_raw = preds.get('velocity', torch.zeros(1, num_context, H, W, 3, device=device))[0]
+        pred_velocity_raw = pred_velocity_raw[:, :, :, [2, 0, 1]]
+        pred_velocity_raw[:, :, :, 2] = -pred_velocity_raw[:, :, :, 2]
+
+        # Expand pred_velocity to all frames (fill target frames with zeros for visualization)
+        pred_velocity_tensor = torch.zeros(len(views_list), H, W, 3, device=device)
+        if is_context_frame is not None:
+            pred_velocity_tensor[context_indices] = pred_velocity_raw
+        else:
+            pred_velocity_tensor = pred_velocity_raw
 
         gt_seg_labels = vggt_batch.get('segment_label', None)
         gt_seg_mask = vggt_batch.get('segment_mask', None)
-        pred_seg_logits = preds.get('segment_logits', None)
+        pred_seg_logits_context = preds.get('segment_logits', None)
 
         matched_clustering_results = dynamic_objects_data.get('matched_clustering_results', []) if dynamic_objects_data is not None else []
         clustering_vis_np = create_clustering_visualization(matched_clustering_results, vggt_batch)
@@ -625,7 +686,7 @@ def run_single_inference(model, dataset, idx, num_views, device, cfg):
 
         print("Creating visualizations...")
         gt_depth_vis = visualize_depth(gt_depth)
-        pred_depth_vis = visualize_depth(pred_depth) if pred_depth is not None else np.zeros_like(gt_depth_vis)
+        # Note: pred_depth_vis will be created from rendered_depth later (after gaussian rendering)
 
         gt_velocity_vis = visualize_velocity(gt_velocity, scale=0.1)
         pred_velocity_vis = visualize_velocity(pred_velocity_tensor, scale=0.1)
@@ -633,28 +694,34 @@ def run_single_inference(model, dataset, idx, num_views, device, cfg):
         gt_velocity_vis = (gt_velocity_vis.cpu().numpy() * 255).astype(np.uint8).transpose(0, 2, 3, 1)
         pred_velocity_vis = (pred_velocity_vis.cpu().numpy() * 255).astype(np.uint8).transpose(0, 2, 3, 1)
 
-        if gt_seg_labels is not None and pred_seg_logits is not None:
+        if gt_seg_labels is not None and pred_seg_logits_context is not None:
             print(f"[DEBUG] GT seg_labels shape: {gt_seg_labels.shape}, dtype: {gt_seg_labels.dtype}")
-            print(f"[DEBUG] Pred seg_logits shape: {pred_seg_logits.shape}, dtype: {pred_seg_logits.dtype}")
+            print(f"[DEBUG] Pred seg_logits (context) shape: {pred_seg_logits_context.shape}, dtype: {pred_seg_logits_context.dtype}")
 
             gt_seg_vis = visualize_segmentation(gt_seg_labels[0], gt_seg_mask[0] if gt_seg_mask is not None else None, num_classes=4)
 
-            print(f"[DEBUG] pred_seg_logits[0] shape: {pred_seg_logits[0].shape}")
-            pred_seg_probs = torch.softmax(pred_seg_logits[0], dim=-1)
-            print(f"[DEBUG] pred_seg_probs shape: {pred_seg_probs.shape}")
-            print(f"[DEBUG] pred_seg_probs min/max: {pred_seg_probs.min().item():.4f} / {pred_seg_probs.max().item():.4f}")
+            # Expand pred_seg to all frames
+            print(f"[DEBUG] pred_seg_logits_context[0] shape: {pred_seg_logits_context[0].shape}")
+            pred_seg_probs_context = torch.softmax(pred_seg_logits_context[0], dim=-1)
+            pred_seg_labels_context = torch.argmax(pred_seg_probs_context, dim=-1)
 
-            pred_seg_labels = torch.argmax(pred_seg_probs, dim=-1)
-            print(f"[DEBUG] pred_seg_labels shape: {pred_seg_labels.shape}")
-            print(f"[DEBUG] pred_seg_labels unique values: {torch.unique(pred_seg_labels)}")
+            # Create full prediction array (fill target frames with zeros)
+            pred_seg_labels_full = torch.zeros((len(views_list), H, W), dtype=pred_seg_labels_context.dtype, device=device)
+            if is_context_frame is not None:
+                pred_seg_labels_full[context_indices] = pred_seg_labels_context
+            else:
+                pred_seg_labels_full = pred_seg_labels_context
 
-            pred_seg_vis = visualize_segmentation(pred_seg_labels, num_classes=4)
+            print(f"[DEBUG] pred_seg_labels_full shape: {pred_seg_labels_full.shape}")
+            print(f"[DEBUG] pred_seg_labels_full unique values: {torch.unique(pred_seg_labels_full)}")
+
+            pred_seg_vis = visualize_segmentation(pred_seg_labels_full, num_classes=4)
         else:
             gt_seg_vis = np.zeros((len(views_list), H, W, 3), dtype=np.uint8)
             pred_seg_vis = np.zeros((len(views_list), H, W, 3), dtype=np.uint8)
             if gt_seg_labels is None:
                 print("Warning: No GT segmentation found")
-            if pred_seg_logits is None:
+            if pred_seg_logits_context is None:
                 print("Warning: No predicted segmentation found")
 
         print("Building scene for rendering...")
@@ -673,39 +740,167 @@ def run_single_inference(model, dataset, idx, num_views, device, cfg):
         sky_colors_full = preds.get('sky_colors', None)
         sampled_frame_indices = preds.get('sampled_frame_indices', None)
 
-        if sky_colors_full is not None:
-            sky_colors = sky_colors_full[0]
+        # If render_target_frames is True, infer sky colors for target frames
+        if render_target_frames and is_context_frame is not None and len(target_indices) > 0:
+            print(f"[INFO] Inferring sky colors for {len(target_indices)} target frames...")
+
+            # Get sky_token from context frame inference
+            sky_token = preds.get('sky_token', None)
+            if sky_token is not None:
+                # Collect unique target frame indices (temporal positions)
+                target_frame_positions = sorted(set([frame_indices[idx] for idx in target_indices.tolist()]))
+
+                # Get intrinsics and extrinsics for target frames
+                target_intrinsics_list = []
+                target_extrinsics_list = []
+                target_frame_global_indices = []
+
+                for target_frame_pos in target_frame_positions:
+                    # Find all views (cameras) for this target frame
+                    for view_idx in range(len(views_list)):
+                        if frame_indices[view_idx] == target_frame_pos and view_idx in target_indices.tolist():
+                            target_intrinsics_list.append(intrinsics[0, view_idx])
+                            target_extrinsics_list.append(extrinsics[0, view_idx])
+                            target_frame_global_indices.append(view_idx)
+
+                if len(target_intrinsics_list) > 0:
+                    target_intrinsics_tensor = torch.stack(target_intrinsics_list)
+                    target_extrinsics_tensor = torch.stack(target_extrinsics_list)
+
+                    # Infer sky colors for target frames
+                    target_sky_colors = model.infer_target_frame_sky_colors(
+                        sky_token=sky_token,
+                        target_frame_intrinsics=target_intrinsics_tensor,
+                        target_frame_extrinsics=target_extrinsics_tensor,
+                        image_size=(H, W)
+                    )
+
+                    # Combine context and target sky colors
+                    all_sky_colors = torch.zeros((len(views_list), 3, H, W), device=device)
+
+                    # Fill in context frame sky colors
+                    if sky_colors_full is not None and sampled_frame_indices is not None:
+                        for i, frame_idx in enumerate(sampled_frame_indices):
+                            all_sky_colors[frame_idx] = sky_colors_full[0, i]
+
+                    # Fill in target frame sky colors
+                    for i, global_idx in enumerate(target_frame_global_indices):
+                        all_sky_colors[global_idx] = target_sky_colors[i]
+
+                    sky_colors = all_sky_colors
+                    sampled_frame_indices = torch.arange(len(views_list), device=device)
+
+                    print(f"[INFO] Generated sky colors for all {len(views_list)} frames (context + target)")
+                else:
+                    print("[WARNING] No target frames found for sky color inference")
+                    sky_colors = sky_colors_full[0] if sky_colors_full is not None else None
+            else:
+                print("[WARNING] No sky_token found, cannot infer target frame sky colors")
+                sky_colors = sky_colors_full[0] if sky_colors_full is not None else None
         else:
-            sky_colors = None
+            # Traditional mode: use context frame sky colors only
+            if sky_colors_full is not None:
+                sky_colors = sky_colors_full[0]
+            else:
+                sky_colors = None
 
         depth_scale_factor = vggt_batch.get('depth_scale_factor', None)
         if depth_scale_factor is not None and torch.is_tensor(depth_scale_factor):
             depth_scale_factor = depth_scale_factor.item()
 
+        # Determine which frames to render based on render_target_frames setting
+        if render_target_frames or is_context_frame is None:
+            # Render all frames (context + target, or all if no distinction)
+            frames_to_render_intrinsics = intrinsics[0]
+            frames_to_render_extrinsics = extrinsics[0]
+            frames_to_render_indices = list(range(len(views_list)))
+            print(f"[INFO] Rendering all {len(views_list)} frames")
+        else:
+            # Only render context frames
+            frames_to_render_intrinsics = context_intrinsics[0]
+            frames_to_render_extrinsics = context_extrinsics[0]
+            frames_to_render_indices = context_indices.cpu().tolist()
+            print(f"[INFO] Rendering only {len(frames_to_render_indices)} context frames")
+
         print("Rendering gaussians with sky...")
         rendered_rgb, rendered_depth = render_gaussians_with_sky(
-            scene, intrinsics[0], extrinsics[0], sky_colors, sampled_frame_indices, H, W, device,
+            scene, frames_to_render_intrinsics, frames_to_render_extrinsics, sky_colors, sampled_frame_indices, H, W, device,
             enable_voxel_pruning=False, voxel_size=0.05, depth_scale_factor=depth_scale_factor
         )
 
         pred_rgb_np = (rendered_rgb.cpu().numpy() * 255).astype(np.uint8).transpose(0, 2, 3, 1)
+        rendered_depth_np = rendered_depth.cpu().numpy()
+        rendered_depth_vis = visualize_depth(rendered_depth_np)
 
-        return {
-            'gt_rgb': gt_rgb,
-            'gt_depth': gt_depth_vis,
-            'pred_depth': pred_depth_vis,
-            'pred_velocity': pred_velocity_vis,
-            'pred_rgb': pred_rgb_np,
-            'gt_velocity': gt_velocity_vis,
-            'gt_segmentation': gt_seg_vis,
-            'pred_segmentation': pred_seg_vis,
-            'dynamic_clustering': clustering_vis_np,
-            'num_cameras': num_cameras,
-            'num_frames': num_frames_per_camera,
-            'camera_indices': camera_indices,
-            'frame_indices': frame_indices,
-            'success': True
-        }
+        # When render_target_frames=False, only return context frame data
+        if not render_target_frames and is_context_frame is not None and len(context_indices) > 0:
+            # Filter all visualization data to context frames only
+            gt_rgb_filtered = gt_rgb[context_indices.cpu().numpy()]
+            gt_depth_vis_filtered = gt_depth_vis[context_indices.cpu().numpy()]
+            gt_velocity_vis_filtered = gt_velocity_vis[context_indices.cpu().numpy()]
+            pred_velocity_vis_filtered = pred_velocity_vis[context_indices.cpu().numpy()]
+            gt_seg_vis_filtered = gt_seg_vis[context_indices.cpu().numpy()]
+            pred_seg_vis_filtered = pred_seg_vis[context_indices.cpu().numpy()]
+            if clustering_vis_np is not None and len(clustering_vis_np) > 0:
+                clustering_vis_np_filtered = clustering_vis_np[context_indices.cpu().numpy()]
+            else:
+                clustering_vis_np_filtered = clustering_vis_np
+
+            # Update frame and camera indices to match context frames only
+            camera_indices_filtered = [camera_indices[i] for i in context_indices.cpu().tolist()]
+            frame_indices_filtered = [frame_indices[i] for i in context_indices.cpu().tolist()]
+
+            # Remap frame_indices to be continuous [0, 1, 2, ...] for visualization
+            unique_frame_indices = sorted(set(frame_indices_filtered))
+            frame_idx_mapping = {old_idx: new_idx for new_idx, old_idx in enumerate(unique_frame_indices)}
+            frame_indices_remapped = [frame_idx_mapping[idx] for idx in frame_indices_filtered]
+            num_frames_filtered = len(unique_frame_indices)
+
+            print(f"[INFO] Filtered to {len(gt_rgb_filtered)} context frame views for visualization")
+            print(f"[DEBUG] Original frame indices: {frame_indices_filtered}")
+            print(f"[DEBUG] Remapped frame indices: {frame_indices_remapped}")
+
+            return {
+                'gt_rgb': gt_rgb_filtered,
+                'gt_depth': gt_depth_vis_filtered,
+                'pred_depth': rendered_depth_vis,
+                'pred_velocity': pred_velocity_vis_filtered,
+                'pred_rgb': pred_rgb_np,
+                'gt_velocity': gt_velocity_vis_filtered,
+                'gt_segmentation': gt_seg_vis_filtered,
+                'pred_segmentation': pred_seg_vis_filtered,
+                'dynamic_clustering': clustering_vis_np_filtered,
+                'num_cameras': num_cameras,
+                'num_frames': num_frames_filtered,
+                'camera_indices': camera_indices_filtered,
+                'frame_indices': frame_indices_remapped,  # Use remapped indices
+                'original_frame_indices': frame_indices_filtered,  # Keep original for reference
+                'context_indices': context_indices.cpu().tolist(),
+                'target_indices': [],  # No target frames in traditional mode
+                'is_context_frame': None,  # Not needed for visualization
+                'success': True
+            }
+        else:
+            # Return all frames (render_target_frames=True or no distinction)
+            return {
+                'gt_rgb': gt_rgb,
+                'gt_depth': gt_depth_vis,
+                'pred_depth': rendered_depth_vis,
+                'pred_velocity': pred_velocity_vis,
+                'pred_rgb': pred_rgb_np,
+                'gt_velocity': gt_velocity_vis,
+                'gt_segmentation': gt_seg_vis,
+                'pred_segmentation': pred_seg_vis,
+                'dynamic_clustering': clustering_vis_np,
+                'num_cameras': num_cameras,
+                'num_frames': num_total_frames,
+                'camera_indices': camera_indices,
+                'frame_indices': frame_indices,
+                'context_indices': context_indices.cpu().tolist() if context_indices.numel() > 0 else [],
+                'target_indices': target_indices.cpu().tolist() if target_indices.numel() > 0 else [],
+                'is_context_frame': is_context_frame,
+                'success': True
+            }
 
     except Exception as e:
         print(f"Error processing idx {idx}: {e}")
@@ -746,6 +941,98 @@ def add_text_label(image, text, font_scale=1.0, thickness=2):
     return np.concatenate([label_bg, image], axis=0)
 
 
+def create_context_reference_row(
+    gt_rgb,
+    context_indices,
+    num_cameras,
+    camera_indices,
+    frame_indices,
+    max_views_per_row=2
+):
+    """
+    Create context frames reference row (STORM-style)
+    Shows context frames with proper layout: white gaps and multiple rows
+
+    Args:
+        gt_rgb: [S, H, W, 3] GT RGB image
+        context_indices: List of context frame indices
+        num_cameras: Number of cameras
+        camera_indices: List of camera indices
+        frame_indices: List of frame indices
+        max_views_per_row: Maximum number of context views per row (default: 2)
+
+    Returns:
+        context_section: Vertically stacked rows of context frames
+    """
+    # Set camera order based on number of cameras
+    if num_cameras == 3:
+        camera_order = [1, 0, 2]  # Center, left, right for 3 cameras
+    else:
+        camera_order = list(range(num_cameras))
+
+    # Group context indices by frame_idx (temporal position)
+    context_by_time = {}
+    for ctx_idx in context_indices:
+        frame_idx = frame_indices[ctx_idx]
+        if frame_idx not in context_by_time:
+            context_by_time[frame_idx] = []
+        context_by_time[frame_idx].append(ctx_idx)
+
+    context_frames_labeled = []
+    for frame_idx in sorted(context_by_time.keys()):
+        view_indices = context_by_time[frame_idx]
+
+        # Sort by camera order
+        if num_cameras > 1:
+            sorted_views = []
+            for cam_order_idx in camera_order:
+                for v_idx in view_indices:
+                    if camera_indices[v_idx] == cam_order_idx:
+                        sorted_views.append(v_idx)
+                        break
+            view_indices = sorted_views
+
+        # Concatenate cameras horizontally
+        frame_concat = np.concatenate([gt_rgb[v] for v in view_indices], axis=1)
+        # Add label
+        frame_labeled = add_text_label(frame_concat, f"Context RGB (t={frame_idx})", font_scale=0.8, thickness=2)
+        context_frames_labeled.append(frame_labeled)
+
+    # Arrange context frames in rows with white gaps
+    context_rows = []
+    gap_width = 15
+    white_gap = np.ones((context_frames_labeled[0].shape[0], gap_width, 3), dtype=np.uint8) * 255
+
+    for i in range(0, len(context_frames_labeled), max_views_per_row):
+        row_frames = context_frames_labeled[i:i+max_views_per_row]
+
+        # Add white gaps between frames in the same row
+        row_with_gaps = []
+        for j, frame in enumerate(row_frames):
+            row_with_gaps.append(frame)
+            if j < len(row_frames) - 1:  # Don't add gap after last frame
+                row_with_gaps.append(white_gap)
+
+        # Concatenate frames horizontally
+        context_row = np.concatenate(row_with_gaps, axis=1)
+        context_rows.append(context_row)
+
+    # Stack rows vertically with gaps
+    if len(context_rows) > 1:
+        row_gap_height = 15
+        final_rows = []
+        for i, row in enumerate(context_rows):
+            final_rows.append(row)
+            if i < len(context_rows) - 1:  # Don't add gap after last row
+                row_gap = np.ones((row_gap_height, row.shape[1], 3), dtype=np.uint8) * 255
+                final_rows.append(row_gap)
+        context_section = np.concatenate(final_rows, axis=0)
+    else:
+        context_section = context_rows[0]
+
+    return context_section
+
+
 def create_multi_camera_grid(
     gt_rgb,
     gt_depth,
@@ -759,12 +1046,21 @@ def create_multi_camera_grid(
     gt_velocity=None,
     gt_segmentation=None,
     pred_segmentation=None,
-    dynamic_clustering=None
+    dynamic_clustering=None,
+    context_indices=None,
+    target_indices=None,
+    visualize_target_frames=False
 ):
     """
-    Create multi-camera visualization grid
-    Each row shows: GT (left-center-right) | Pred (left-center-right)
-    Camera order: center(front), left, right corresponding to camera_id [2, 1, 3]
+    Create multi-camera visualization grid with STORM-style layout for context/target frames
+
+    When context/target distinction exists and visualize_target_frames=True:
+    - Top: Context frames reference row (all context frames concatenated)
+    - Below: Target frames visualization (one frame per video frame)
+
+    Traditional mode (no context/target or visualize_target_frames=False):
+    - Each row shows: GT (left-center-right) | Pred (left-center-right)
+    - Camera order: center(front), left, right corresponding to camera_id [2, 1, 3]
 
     Layout:
     - Row 1: GT RGB (left-center-right) | Rendered RGB (left-center-right)
@@ -787,6 +1083,9 @@ def create_multi_camera_grid(
         gt_segmentation: [S, H, W, 3] GT segmentation map (visualized)
         pred_segmentation: [S, H, W, 3] Predicted segmentation map (visualized)
         dynamic_clustering: [S, H, W, 3] Dynamic clustering map (visualized)
+        context_indices: List of context frame indices
+        target_indices: List of target frame indices
+        visualize_target_frames: Whether to use STORM-style layout for target frames
 
     Returns:
         List of video frames, each frame is a grid layout
@@ -798,8 +1097,32 @@ def create_multi_camera_grid(
     print(f"  frame_indices: {frame_indices}")
     if dynamic_clustering is not None:
         print(f"  dynamic_clustering shape: {dynamic_clustering.shape}")
+    print(f"  visualize_target_frames: {visualize_target_frames}")
+    print(f"  context_indices: {context_indices}")
+    print(f"  target_indices: {target_indices}")
 
     grid_frames = []
+
+    # Check if we should use STORM-style layout
+    use_storm_layout = (visualize_target_frames and
+                        context_indices is not None and
+                        target_indices is not None and
+                        len(target_indices) > 0)
+
+    if use_storm_layout:
+        print("[INFO] Using STORM-style layout with context reference row")
+        # Create context reference row at the top
+        context_row = create_context_reference_row(
+            gt_rgb, context_indices, num_cameras, camera_indices, frame_indices
+        )
+
+        # Generate frames for target frames only
+        frames_to_visualize = sorted(set([frame_indices[idx] for idx in target_indices]))
+    else:
+        print("[INFO] Using traditional layout")
+        context_row = None
+        # Visualize all frames in traditional mode
+        frames_to_visualize = list(range(num_frames))
 
     # Set camera order based on number of cameras
     if num_cameras == 3:
@@ -807,7 +1130,7 @@ def create_multi_camera_grid(
     else:
         camera_order = list(range(num_cameras))  # Natural order for other cases
 
-    for frame_idx in range(num_frames):
+    for frame_idx in frames_to_visualize:
         frame_views_original = []
         for cam_idx in range(num_cameras):
             for view_idx in range(len(camera_indices)):
@@ -821,6 +1144,11 @@ def create_multi_camera_grid(
             print(f"[WARNING] frame_idx={frame_idx}: found {len(frame_views_original)} views, expected {num_cameras}")
             frame_views = frame_views_original
         print(f"[DEBUG] frame_idx={frame_idx}, frame_views={frame_views}")
+
+        # Skip this frame if no views were found
+        if len(frame_views) == 0:
+            print(f"[WARNING] Skipping frame_idx={frame_idx} - no views found")
+            continue
 
         # Concatenate multi-camera images without gaps
         gt_rgb_concat = np.concatenate([gt_rgb[v] for v in frame_views], axis=1)
@@ -850,6 +1178,46 @@ def create_multi_camera_grid(
         gap_depth = np.ones((gt_depth_labeled.shape[0], gap_width, 3), dtype=np.uint8) * 255
         row2 = np.concatenate([gt_depth_labeled, gap_depth, pred_depth_labeled], axis=1)
 
+        # In STORM-style layout, only show RGB and Depth (skip velocity, segmentation, clustering)
+        if use_storm_layout:
+            # Add white gaps between rows
+            row_gap_height = 15
+            row_gap = np.ones((row_gap_height, row1.shape[1], 3), dtype=np.uint8) * 255
+
+            grid_frame = np.concatenate([
+                row1,
+                row_gap,
+                row2
+            ], axis=0)
+
+            # Add context row at the top
+            if context_row is not None:
+                # Ensure context_row width matches grid_frame width
+                if context_row.shape[1] != grid_frame.shape[1]:
+                    # Pad or resize context_row to match
+                    if context_row.shape[1] < grid_frame.shape[1]:
+                        # Pad with white space
+                        pad_width = grid_frame.shape[1] - context_row.shape[1]
+                        white_pad = np.ones((context_row.shape[0], pad_width, 3), dtype=np.uint8) * 255
+                        context_row = np.concatenate([context_row, white_pad], axis=1)
+                    else:
+                        # Crop context_row (should not happen in normal cases)
+                        context_row = context_row[:, :grid_frame.shape[1], :]
+
+                # Add big gap between context row and content
+                big_gap_height = 30
+                big_gap = np.ones((big_gap_height, grid_frame.shape[1], 3), dtype=np.uint8) * 255
+
+                grid_frame = np.concatenate([
+                    context_row,
+                    big_gap,
+                    grid_frame
+                ], axis=0)
+
+            grid_frames.append(grid_frame)
+            continue  # Skip the rest for STORM layout
+
+        # Traditional layout: continue with velocity, segmentation, clustering
         if gt_velocity is not None:
             gt_velocity_concat = np.concatenate([gt_velocity[v] for v in frame_views], axis=1)
         else:
@@ -913,6 +1281,7 @@ def create_multi_camera_grid(
         row_gap_height = 15
         row_gap = np.ones((row_gap_height, row1.shape[1], 3), dtype=np.uint8) * 255
 
+        # Traditional layout (not STORM): show all rows
         grid_frame = np.concatenate([
             row1,
             row_gap,
@@ -965,8 +1334,15 @@ def run_batch_inference(model, dataset, cfg, device):
 
     indices = range(cfg.start_idx, cfg.end_idx, cfg.step)
 
+    render_target_frames = getattr(cfg, 'render_target_frames', False)
+
     for idx in tqdm(indices, desc="Batch processing"):
-        result = run_single_inference(model, dataset, idx, cfg.num_views, device, cfg)
+        result = run_single_inference(
+            model, dataset, idx,
+            cfg.num_context_frames if hasattr(cfg, 'num_context_frames') else cfg.num_views,
+            device, cfg,
+            render_target_frames=render_target_frames
+        )
 
         if result['success']:
             grid_frames = create_multi_camera_grid(
@@ -982,7 +1358,10 @@ def run_batch_inference(model, dataset, cfg, device):
                 gt_velocity=result.get('gt_velocity'),
                 gt_segmentation=result.get('gt_segmentation'),
                 pred_segmentation=result.get('pred_segmentation'),
-                dynamic_clustering=result.get('dynamic_clustering')
+                dynamic_clustering=result.get('dynamic_clustering'),
+                context_indices=result.get('context_indices'),
+                target_indices=result.get('target_indices'),
+                visualize_target_frames=render_target_frames
             )
 
             output_prefix = cfg.output_prefix if hasattr(cfg, 'output_prefix') else "multi_cam"
@@ -1043,7 +1422,14 @@ def main(cfg: OmegaConf):
         if cfg.batch_mode:
             run_batch_inference(model, dataset, cfg, device)
         else:
-            result = run_single_inference(model, dataset, cfg.single_idx, cfg.num_views, device, cfg)
+            render_target_frames = getattr(cfg, 'render_target_frames', False)
+
+            result = run_single_inference(
+                model, dataset, cfg.single_idx,
+                cfg.num_context_frames if hasattr(cfg, 'num_context_frames') else cfg.num_views,
+                device, cfg,
+                render_target_frames=render_target_frames
+            )
 
             if result['success']:
                 grid_frames = create_multi_camera_grid(
@@ -1059,7 +1445,10 @@ def main(cfg: OmegaConf):
                     gt_velocity=result.get('gt_velocity'),
                     gt_segmentation=result.get('gt_segmentation'),
                     pred_segmentation=result.get('pred_segmentation'),
-                    dynamic_clustering=result.get('dynamic_clustering')
+                    dynamic_clustering=result.get('dynamic_clustering'),
+                    context_indices=result.get('context_indices'),
+                    target_indices=result.get('target_indices'),
+                    visualize_target_frames=render_target_frames
                 )
 
                 output_prefix = cfg.output_prefix if hasattr(cfg, 'output_prefix') else "multi_cam"

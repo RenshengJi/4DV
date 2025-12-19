@@ -173,6 +173,7 @@ def train(args):
         'render_only_dynamic': getattr(args, 'stage2_render_only_dynamic', False),
         'enable_voxel_pruning': getattr(args, 'enable_voxel_pruning', True),
         'voxel_size': getattr(args, 'voxel_size', 0.002),
+        'supervise_target_frames': getattr(args, 'aggregator_all_supervise_target_frames', False),
     }
     stage2_criterion = Stage2CompleteLoss(render_loss_config=stage2_loss_config)
     stage2_criterion.to(device)
@@ -583,7 +584,8 @@ def train(args):
                                 sampled_frame_indices=sampled_frame_indices,
                                 depth_scale_factor=vggt_batch.get('depth_scale_factor', None),
                                 camera_indices=vggt_batch.get('camera_indices', None),
-                                frame_indices=vggt_batch.get('frame_indices', None)
+                                frame_indices=vggt_batch.get('frame_indices', None),
+                                is_context_frame=vggt_batch.get('is_context_frame', None)
                             )
 
 

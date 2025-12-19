@@ -16,12 +16,14 @@ infer_dataset: Waymo_Multi(
   intervals=[5],
   resolution=[(518, 336)],
   transform=ImgNorm,
-  num_views=${num_views},
+  num_views=${num_context_frames},
   multi_camera_mode=True,
   zero_ground_velocity=True)
 
-# Frames per camera
-num_views: 4
+# Number of context frames (sparse frames for inference)
+# With interval=5, total frames loaded = num_context_frames * 5
+# Example: num_context_frames=4, interval=5 -> 20 total frames (context: 0,5,10,15; target: 1-4,6-9,11-14,16-19)
+num_context_frames: 4
 
 # =============== Inference Configuration ===============
 # Batch processing mode
@@ -40,6 +42,11 @@ device: "cuda"
 fps: 10
 save_video: true
 save_images: false
+
+# Target frame visualization control
+# false: Only visualize context frames (default, traditional mode)
+# true: Use STORM-style layout with context frames at top as reference, visualize target frames below
+render_target_frames: true
 
 # =============== Gaussian Splatting Configuration ===============
 sh_degree: 0

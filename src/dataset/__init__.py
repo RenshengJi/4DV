@@ -37,6 +37,7 @@ def vggt_collate_fn(batch):
         - depth_scale_factor: [B] (optional)
         - camera_indices: [B, S] (optional, multi-camera mode)
         - frame_indices: [B, S] (optional, multi-camera mode)
+        - is_context_frame: [B, S] (bool tensor indicating context vs target frames)
     """
     batch_size = len(batch)
     num_views = len(batch[0])
@@ -53,7 +54,7 @@ def vggt_collate_fn(batch):
 
     skip_keys = {'idx', 'dataset', 'label', 'instance', 'is_video',
                  'is_metric', 'quantile', 'rng', 'true_shape', 'ray_map',
-                 'camera_idx', 'frame_idx'}
+                 'camera_idx', 'frame_idx', 'is_context_frame'}
 
     for key in sample_keys:
         if key in skip_keys:
@@ -103,6 +104,16 @@ def vggt_collate_fn(batch):
         output['camera_indices'] = None
         output['frame_indices'] = None
 
+    # Add is_context_frame flag
+    if 'is_context_frame' in batch[0][0]:
+        is_context_list = []
+        for sample in batch:
+            sample_context_flags = [view['is_context_frame'] for view in sample]
+            is_context_list.append(torch.tensor(sample_context_flags, dtype=torch.bool))
+        output['is_context_frame'] = torch.stack(is_context_list, dim=0)
+    else:
+        output['is_context_frame'] = None
+
     vggt_batch = {
         'images': output.get('img'),
         'depths': output.get('depthmap'),
@@ -117,6 +128,7 @@ def vggt_collate_fn(batch):
         'sky_masks': output.get('sky_mask'),
         'camera_indices': output.get('camera_indices'),
         'frame_indices': output.get('frame_indices'),
+        'is_context_frame': output.get('is_context_frame'),
     }
 
     return vggt_batch

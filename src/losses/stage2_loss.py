@@ -209,7 +209,13 @@ def prune_gaussians_by_voxel(means, scales, rotations, opacities, colors, voxel_
 
 
 class Stage2RenderLoss(nn.Module):
-    """Stage 2 rendering loss."""
+    """
+    Stage 2 rendering loss.
+
+    Supports rendering and supervision on both context frames and target frames.
+    Context frames: Sparse frames used for network inference
+    Target frames: Dense frames for additional supervision (optional)
+    """
 
     def __init__(
         self,
@@ -219,7 +225,8 @@ class Stage2RenderLoss(nn.Module):
         render_only_dynamic: bool = False,
         sh_degree: int = 0,
         enable_voxel_pruning: bool = True,
-        voxel_size: float = 0.002
+        voxel_size: float = 0.002,
+        supervise_target_frames: bool = False
     ):
         super().__init__()
         self.rgb_weight = rgb_weight
@@ -229,6 +236,7 @@ class Stage2RenderLoss(nn.Module):
         self.sh_degree = sh_degree
         self.enable_voxel_pruning = enable_voxel_pruning
         self.voxel_size = voxel_size
+        self.supervise_target_frames = supervise_target_frames
 
     def forward(
         self,
@@ -240,7 +248,8 @@ class Stage2RenderLoss(nn.Module):
         sky_masks: Optional[torch.Tensor] = None,
         sky_colors: Optional[torch.Tensor] = None,
         sampled_frame_indices: Optional[torch.Tensor] = None,
-        depth_scale_factor: Optional[torch.Tensor] = None
+        depth_scale_factor: Optional[torch.Tensor] = None,
+        is_context_frame: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
         Compute stage 2 rendering loss.
@@ -255,6 +264,7 @@ class Stage2RenderLoss(nn.Module):
             sky_colors: [B, num_frames, 3, H, W] - Sky colors for compositing
             sampled_frame_indices: [num_frames] - Sampled frame indices
             depth_scale_factor: Depth scale factor for voxel pruning
+            is_context_frame: [B, S] - Boolean mask indicating context frames (True) vs target frames (False)
 
         Returns:
             loss_dict: Loss dictionary
@@ -262,12 +272,29 @@ class Stage2RenderLoss(nn.Module):
         B, S, C, H, W = gt_images.shape
         device = gt_images.device
 
+        # Determine which frames to supervise
+        if is_context_frame is not None:
+            if self.supervise_target_frames:
+                # Supervise all frames (both context and target)
+                supervise_mask = torch.ones(S, dtype=torch.bool, device=device)
+            else:
+                # Only supervise context frames
+                supervise_mask = is_context_frame[0]  # [S]
+        else:
+            # If no context/target distinction, supervise all frames (backward compatibility)
+            supervise_mask = torch.ones(S, dtype=torch.bool, device=device)
+
         rendered_images = []
         rendered_depths = []
+        frame_indices_to_render = []
 
         actual_S = min(S, intrinsics.shape[1], extrinsics.shape[1])
 
         for frame_idx in range(actual_S):
+            # Skip frames that don't need supervision
+            if not supervise_mask[frame_idx]:
+                continue
+
             frame_intrinsic = intrinsics[0, frame_idx]
             frame_extrinsic = extrinsics[0, frame_idx]
 
@@ -290,6 +317,7 @@ class Stage2RenderLoss(nn.Module):
 
             rendered_images.append(rendered_rgb)
             rendered_depths.append(rendered_depth)
+            frame_indices_to_render.append(frame_idx)
 
         if len(rendered_images) == 0:
             dummy_param = None
@@ -323,8 +351,11 @@ class Stage2RenderLoss(nn.Module):
 
         pred_rgb = torch.stack(rendered_images, dim=0)
         pred_depth = torch.stack(rendered_depths, dim=0)
-        gt_rgb = gt_images[0, :actual_S]
-        gt_depth = gt_depths[0, :actual_S]
+
+        # Select GT frames that were supervised
+        frame_indices_tensor = torch.tensor(frame_indices_to_render, device=device)
+        gt_rgb = gt_images[0, frame_indices_tensor]
+        gt_depth = gt_depths[0, frame_indices_tensor]
 
         rgb_loss = F.l1_loss(pred_rgb, gt_rgb)
 
@@ -350,9 +381,10 @@ class Stage2RenderLoss(nn.Module):
         loss_dict['stage2_total_loss'] = sum(loss_dict.values())
 
         if sky_masks is not None and len(rendered_images) > 0:
-            sky_masks_bool = sky_masks[0, :actual_S].bool()
+            # Select sky masks for supervised frames only
+            sky_masks_supervised = sky_masks[0, frame_indices_tensor].bool()
 
-            sky_mask_3ch = sky_masks_bool.unsqueeze(1).expand(-1, 3, -1, -1)
+            sky_mask_3ch = sky_masks_supervised.unsqueeze(1).expand(-1, 3, -1, -1)
             nonsky_mask_3ch = ~sky_mask_3ch
 
             if sky_mask_3ch.any():
@@ -577,7 +609,8 @@ class Stage2CompleteLoss(nn.Module):
         sampled_frame_indices: Optional[torch.Tensor] = None,
         depth_scale_factor: Optional[torch.Tensor] = None,
         camera_indices: Optional[torch.Tensor] = None,
-        frame_indices: Optional[torch.Tensor] = None
+        frame_indices: Optional[torch.Tensor] = None,
+        is_context_frame: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
         Compute stage 2 complete loss.
@@ -595,6 +628,7 @@ class Stage2CompleteLoss(nn.Module):
             depth_scale_factor: Depth scale factor for voxel pruning
             camera_indices: [B, S_total] - Camera indices for multi-camera mode
             frame_indices: [B, S_total] - Frame indices for multi-camera mode
+            is_context_frame: [B, S] - Boolean mask indicating context vs target frames
 
         Returns:
             complete_loss_dict: Complete loss dictionary
@@ -603,7 +637,7 @@ class Stage2CompleteLoss(nn.Module):
             refined_scene, gt_images, gt_depths,
             intrinsics, extrinsics, sky_masks,
             sky_colors, sampled_frame_indices,
-            depth_scale_factor
+            depth_scale_factor, is_context_frame
         )
 
         complete_loss_dict = render_loss_dict.copy()

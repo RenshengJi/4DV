@@ -16,6 +16,12 @@ class WaymoDataset(BaseDataset):
     """
     Waymo outdoor street scenes dataset.
     Loads multi-view images with camera parameters, depth, flow, and segmentation.
+
+    Frame sampling modes:
+    - Context frames: Sparse frames used for network inference (e.g., 0, 5, 10, 15 with interval=5)
+    - Target frames: Dense frames between context frames (e.g., 1-4, 6-9, 11-14, 16-19)
+
+    Total frames loaded: num_context_frames * interval
     """
 
     def __init__(
@@ -131,7 +137,8 @@ class WaymoDataset(BaseDataset):
         idx,
         camera_idx,
         frame_idx,
-        interval
+        interval,
+        is_context_frame=True
     ):
         """
         Load a single view with all associated data.
@@ -147,6 +154,7 @@ class WaymoDataset(BaseDataset):
             camera_idx: Camera index in multi-camera mode (0, 1, 2, ...)
             frame_idx: Frame index within camera sequence (0, 1, 2, ...)
             interval: Frame interval for velocity scaling
+            is_context_frame: Whether this is a context frame (vs target frame)
 
         Returns:
             view_dict: Dictionary containing all view data
@@ -274,6 +282,7 @@ class WaymoDataset(BaseDataset):
             instance=osp.join(scene_dir, impath + ".jpg"),
             quantile=np.array(0.98, dtype=np.float32),
             rng=int.from_bytes(rng.bytes(4), "big"),
+            is_context_frame=is_context_frame,
         )
 
         if flowmap_tensor is not None:
@@ -292,8 +301,19 @@ class WaymoDataset(BaseDataset):
         Load views for a given scene index.
         Supports both single-camera and multi-camera modes.
 
-        Single-camera mode: Randomly samples one camera and loads num_views frames from it.
-        Multi-camera mode: Loads num_views frames from ALL cameras in valid_camera_id_list.
+        Frame loading strategy:
+        - num_views now represents num_context_frames
+        - Total frames loaded: num_context_frames * interval
+        - Context frames: Frames at positions [0, interval, 2*interval, ...]
+        - Target frames: All other frames in between
+
+        Example: num_context_frames=4, interval=5
+        - Total frames: 20 (0-19)
+        - Context frames: [0, 5, 10, 15]
+        - Target frames: [1,2,3,4, 6,7,8,9, 11,12,13,14, 16,17,18,19]
+
+        Single-camera mode: Randomly samples one camera and loads frames from it.
+        Multi-camera mode: Loads frames from ALL cameras in valid_camera_id_list.
 
         Args:
             idx: Scene index (0 to len(scene_names)-1)
@@ -310,9 +330,9 @@ class WaymoDataset(BaseDataset):
         resolution = self._resolutions[ar_idx]
 
         if self.num_views_range is not None:
-            num_views = rng.integers(self.num_views_range[0], self.num_views_range[1] + 1)
+            num_context_frames = rng.integers(self.num_views_range[0], self.num_views_range[1] + 1)
         else:
-            num_views = self.num_views
+            num_context_frames = self.num_views
 
         views = []
 
@@ -324,29 +344,35 @@ class WaymoDataset(BaseDataset):
 
             interval = rng.choice(self._intervals)
 
-            required_frames = 1 + (num_views - 1) * interval
+            # New frame calculation: total frames = num_context_frames * interval
+            required_frames = num_context_frames * interval
 
             if min_frames < required_frames:
-                max_possible_interval = (min_frames - 1) // (num_views - 1) if num_views > 1 else 1
+                max_possible_interval = min_frames // num_context_frames if num_context_frames > 0 else 1
                 if max_possible_interval < 1:
                     raise ValueError(
                         f"Scene {scene_name} has cameras with only {min_frames} frames, "
-                        f"need at least {num_views} frames"
+                        f"need at least {required_frames} frames (num_context_frames={num_context_frames}, interval={interval})"
                     )
                 interval = min(interval, max_possible_interval)
-                required_frames = 1 + (num_views - 1) * interval
+                required_frames = num_context_frames * interval
 
             max_start_pos = min_frames - required_frames
             start_pos = rng.integers(0, max_start_pos + 1)
 
-            sampled_positions = [start_pos + i * interval for i in range(num_views)]
+            # Generate all frame positions (0 to required_frames-1)
+            all_positions = [start_pos + i for i in range(required_frames)]
+            # Context frame positions: every interval-th frame
+            context_positions = [start_pos + i * interval for i in range(num_context_frames)]
 
             for camera_idx, camera_id in enumerate(selected_cameras):
                 frame_ids = seq2frames[camera_id]
 
-                sampled_frame_ids = [frame_ids[pos] for pos in sampled_positions]
+                # Load all frames (both context and target)
+                for frame_idx_in_sequence, pos in enumerate(all_positions):
+                    frame_id = frame_ids[pos]
+                    is_context = pos in context_positions
 
-                for frame_idx_in_camera, frame_id in enumerate(sampled_frame_ids):
                     view_dict = self._load_single_view(
                         scene_dir=scene_dir,
                         camera_id=camera_id,
@@ -356,8 +382,9 @@ class WaymoDataset(BaseDataset):
                         scene_name=scene_name,
                         idx=idx,
                         camera_idx=camera_idx,
-                        frame_idx=frame_idx_in_camera,
-                        interval=interval
+                        frame_idx=frame_idx_in_sequence,
+                        interval=interval,
+                        is_context_frame=is_context
                     )
                     views.append(view_dict)
 
@@ -368,25 +395,31 @@ class WaymoDataset(BaseDataset):
 
             interval = rng.choice(self._intervals)
 
-            required_frames = 1 + (num_views - 1) * interval
+            # New frame calculation: total frames = num_context_frames * interval
+            required_frames = num_context_frames * interval
 
             if len(frame_ids) < required_frames:
-                max_possible_interval = (len(frame_ids) - 1) // (num_views - 1) if num_views > 1 else 1
+                max_possible_interval = len(frame_ids) // num_context_frames if num_context_frames > 0 else 1
                 if max_possible_interval < 1:
                     raise ValueError(
                         f"Scene {scene_name} camera {camera_id} has only {len(frame_ids)} frames, "
-                        f"need at least {num_views} frames"
+                        f"need at least {required_frames} frames (num_context_frames={num_context_frames}, interval={interval})"
                     )
                 interval = min(interval, max_possible_interval)
-                required_frames = 1 + (num_views - 1) * interval
+                required_frames = num_context_frames * interval
 
             max_start_pos = len(frame_ids) - required_frames
             start_pos = rng.integers(0, max_start_pos + 1)
 
-            sampled_positions = [start_pos + i * interval for i in range(num_views)]
-            sampled_frame_ids = [frame_ids[pos] for pos in sampled_positions]
+            # Generate all frame positions (0 to required_frames-1)
+            all_positions = [start_pos + i for i in range(required_frames)]
+            # Context frame positions: every interval-th frame
+            context_positions = [start_pos + i * interval for i in range(num_context_frames)]
 
-            for v, frame_id in enumerate(sampled_frame_ids):
+            for frame_idx_in_sequence, pos in enumerate(all_positions):
+                frame_id = frame_ids[pos]
+                is_context = pos in context_positions
+
                 view_dict = self._load_single_view(
                     scene_dir=scene_dir,
                     camera_id=camera_id,
@@ -396,8 +429,9 @@ class WaymoDataset(BaseDataset):
                     scene_name=scene_name,
                     idx=idx,
                     camera_idx=0,
-                    frame_idx=v,
-                    interval=interval
+                    frame_idx=frame_idx_in_sequence,
+                    interval=interval,
+                    is_context_frame=is_context
                 )
                 views.append(view_dict)
 

@@ -1,6 +1,6 @@
 # Stage 1 Online Training Configuration for VGGT
 
-debug: true
+# debug: true
 
 # =============== Model Configuration ===============
 model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=0, use_gs_head=True, use_gs_head_velocity=True, use_gs_head_segment=False, use_gt_camera=True, velocity_head_small_init=False)"
@@ -24,7 +24,7 @@ model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=0, use_gs_he
 
 # pretrained: model.pt
 # pretrained_velocity: False
-pretrained_velocity: "src/checkpoints/new/start/checkpoint-epoch_0_19533.pth"
+pretrained_velocity: "checkpoints/new/start/checkpoint-epoch_0_4166.pth"
 
 # VGGT freeze strategy configuration
 # Options: "none", "noap", null (null means no freeze strategy, keep model default behavior)
@@ -44,7 +44,7 @@ long_context: True
 fixed_length: False
 resume: null
 benchmark: False
-num_views: 4
+num_context_frames: 4  # Number of context frames (previously num_views)
 num_test_views: 16
 
 # =============== Stage 1 Loss Weight Configuration ===============
@@ -60,7 +60,7 @@ self_render_depth_weight: 0.0              # Depth loss weight
 gt_flow_loss_ours_weight: 1.0              # Custom GT flowmap loss weight
 
 # Sky Opacity Loss (supervises gaussian head opacity parameter)
-sky_opacity_weight: 0.0                    # Sky region opacity constraint
+sky_opacity_weight: 1.0                    # Sky region opacity constraint
 
 # Velocity Regularization Loss (constrains velocity values)
 velocity_reg_weight: 0.0                   # Velocity regularization constraint
@@ -82,13 +82,16 @@ scale_loss_weight: 1.0                     # Scene scale prediction loss weight
 
 # Aggregator_all Render Loss (replaces Stage2 refine network rendering loss)
 # This loss directly uses dynamic object processing + rendering supervision in Stage1, skipping Stage2 refine network
-aggregator_all_start_iter: 0               # Iteration to start aggregator_all loss (default 50k)
+aggregator_all_start_iter: 10000               # Iteration to start aggregator_all loss (default 50k)
 aggregator_all_render_rgb_weight: 1.0      # Aggregator_all RGB rendering loss weight
 aggregator_all_render_depth_weight: 1.0    # Aggregator_all depth rendering loss weight
 aggregator_all_render_lpips_weight: 0.1    # Aggregator_all LPIPS rendering loss weight
 aggregator_all_detach_velocity: true       # Detach velocity to prevent gradient backprop to velocity head
                                            # true: velocity.detach() prevents gradient backprop, only use velocity to supervise dynamic objects
                                            # false: Allow rendering loss gradient backprop to velocity head (default)
+aggregator_all_supervise_target_frames: false  # Whether to supervise target frames in addition to context frames
+                                           # false: Only supervise context frames (default)
+                                           # true: Supervise both context and target frames
 # Stage2 configuration (rendering config for aggregator_all loss)
 stage2_render_only_dynamic: false          # Render only dynamic objects
 stage2_supervise_only_dynamic: false       # Supervise only dynamic regions
@@ -116,7 +119,7 @@ train_dataset: 500000 @ Waymo_Multi(
   valid_camera_id_list=["1", "2", "3"],
   intervals=[5],
   resolution=[(518, 336)], transform=ImgNorm,
-  num_views=${num_views}, zero_ground_velocity=True,
+  num_views=${num_context_frames}, zero_ground_velocity=True,
   multi_camera_mode=True)  # Enable multi-camera mode
 
 test_dataset: 1000 @ Waymo_Multi(
