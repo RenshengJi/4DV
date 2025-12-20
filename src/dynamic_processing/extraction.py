@@ -110,12 +110,20 @@ def extract_object_gaussians(
             reference_frame=reference_frame
         )
     else:
+        # Extract velocities for pedestrians
+        frame_velocities = None
+        if object_class == 'pedestrian' and preds is not None:
+            frame_velocities = _extract_pedestrian_velocities(
+                frame_pixel_indices, preds
+            )
+
         return DynamicObject(
             object_id=object_id,
             object_class=object_class,
             frame_gaussians=frame_gaussians,
             frame_pixel_indices=frame_pixel_indices,
-            frame_existence=frame_existence
+            frame_existence=frame_existence,
+            frame_velocities=frame_velocities
         )
 
 
@@ -286,3 +294,49 @@ def extract_static_gaussians(
         return torch.cat(static_list, dim=0)
     else:
         return torch.empty(0, gaussian_params.shape[-1], device=device)
+
+
+def _extract_pedestrian_velocities(
+    frame_pixel_indices: Dict[int, Dict[int, List[int]]],
+    preds: Dict
+) -> Optional[Dict[int, torch.Tensor]]:
+    """
+    Extract average velocity for each frame from prediction velocity maps.
+
+    Args:
+        frame_pixel_indices: {frame_idx: {view_idx: [pixel_indices]}}
+        preds: Model predictions containing 'velocity_global'
+
+    Returns:
+        {frame_idx: avg_velocity_tensor} or None
+    """
+    velocity_global = preds.get('velocity_global', None)
+    if velocity_global is None:
+        return None
+
+    frame_velocities = {}
+
+    for frame_idx, view_dict in frame_pixel_indices.items():
+        frame_vel_list = []
+
+        for view_idx, pixel_list in view_dict.items():
+            if len(pixel_list) == 0:
+                continue
+
+            vel_map = velocity_global[0, view_idx]  # [H, W, 3]
+            H_vel, W_vel = vel_map.shape[:2]
+
+            # Extract velocities for these pixels
+            for pixel_idx in pixel_list:
+                v = pixel_idx // W_vel
+                u = pixel_idx % W_vel
+                if v < H_vel and u < W_vel:
+                    pixel_vel = vel_map[v, u]
+                    frame_vel_list.append(pixel_vel)
+
+        if frame_vel_list:
+            # Average velocity for this frame
+            avg_velocity = torch.stack(frame_vel_list).mean(dim=0)
+            frame_velocities[frame_idx] = avg_velocity
+
+    return frame_velocities if frame_velocities else None

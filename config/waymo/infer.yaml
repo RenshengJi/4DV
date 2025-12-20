@@ -1,6 +1,6 @@
 # Multi-Camera Inference Configuration for VGGT
 
-# debug: true
+debug: true
 
 # =============== Model Configuration ===============
 model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=0, use_gs_head=True, use_gs_head_velocity=True, use_gs_head_segment=False, use_gt_camera=True, velocity_head_small_init=False)"
@@ -51,6 +51,10 @@ render_target_frames: true
 # =============== Gaussian Splatting Configuration ===============
 sh_degree: 0
 use_gt_camera: true              # Use GT camera parameters
+
+# Rendering configuration
+enable_voxel_pruning: false      # Enable voxel pruning during rendering
+voxel_size: 0.05                 # Voxel size for pruning (metric scale, meters)
 
 # =============== Dynamic Object Processing Configuration ===============
 # Velocity transform mode: "simple" (translation only) or "procrustes" (rotation+translation)

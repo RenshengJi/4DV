@@ -98,7 +98,7 @@ stage2_supervise_only_dynamic: false       # Supervise only dynamic regions
 
 # Rendering configuration (for self_render_loss and aggregator_all_loss)
 enable_voxel_pruning: true                 # Enable voxel pruning
-voxel_size: 0.002                          # Voxel size (metric scale, meters)
+voxel_size: 0.05                          # Voxel size (metric scale, meters)
 
 # Dynamic processor configuration (for aggregator_all loss dynamic object processing)
 min_object_size: 500                       # Minimum object size (points)

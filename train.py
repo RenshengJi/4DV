@@ -550,6 +550,19 @@ def train(args):
                             dynamic_objects_people = dynamic_objects_data.get('dynamic_objects_people', []) if has_valid_dynamic else []
                             static_gaussians = dynamic_objects_data.get('static_gaussians')
 
+                            # If supervising target frames, prepare target frame transforms
+                            supervise_target_frames = stage2_loss_config.get('supervise_target_frames', False)
+                            is_context_frame = vggt_batch.get('is_context_frame', None)
+                            if supervise_target_frames and is_context_frame is not None and len(dynamic_objects_cars) > 0:
+                                # Import rendering utilities for target frame transform preparation
+                                from src.rendering import prepare_target_frame_transforms
+
+                                # Get total number of frames
+                                frame_indices = vggt_batch.get('frame_indices', None)
+                                if frame_indices is not None:
+                                    num_total_frames = len(torch.unique(frame_indices))
+                                    prepare_target_frame_transforms(dynamic_objects_cars, num_total_frames, device)
+
                             aggregator_all_scene = {
                                 'static_gaussians': static_gaussians,
                                 'dynamic_objects_cars': dynamic_objects_cars,

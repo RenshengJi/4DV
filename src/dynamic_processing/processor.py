@@ -116,7 +116,7 @@ class DynamicProcessor:
                     object_id, object_class, tracked_results,
                     gaussian_params, view_mapping,
                     registration=self.registration if object_class == 'car' else None,
-                    preds=preds if object_class == 'car' else None
+                    preds=preds
                 )
 
                 if object_class == 'car':
@@ -203,6 +203,9 @@ class DynamicProcessor:
 
             if obj.frame_gaussians is not None:
                 legacy['frame_gaussians'] = obj.frame_gaussians
+
+            if obj.frame_velocities is not None:
+                legacy['frame_velocities'] = obj.frame_velocities
 
             return legacy
 

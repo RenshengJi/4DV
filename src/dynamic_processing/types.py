@@ -86,6 +86,7 @@ class DynamicObject:
     frame_transforms: Optional[Dict[int, torch.Tensor]] = None  # {frame_idx: [4,4]} for cars
     frame_existence: Optional[torch.Tensor] = None  # [num_frames] bool
     reference_frame: Optional[int] = None
+    frame_velocities: Optional[Dict[int, torch.Tensor]] = None  # {frame_idx: [3]} for pedestrians
 
     @property
     def is_aggregated(self) -> bool:

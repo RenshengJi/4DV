@@ -471,5 +471,17 @@ class WaymoDataset(BaseDataset):
             view['pts3d'] = view['pts3d'] * depth_scale_factor
             view['flowmap'][..., :3] = view['flowmap'][..., :3] * depth_scale_factor if 'flowmap' in view else None
             view['depth_scale_factor'] = depth_scale_factor
-            
+
+        # Add metadata for multi-camera scenes
+        if self.multi_camera_mode:
+            num_cameras = len(selected_cameras)
+            num_total_frames = len(all_positions)
+        else:
+            num_cameras = 1
+            num_total_frames = len(all_positions)
+
+        for view in views:
+            view['num_cameras'] = num_cameras
+            view['num_total_frames'] = num_total_frames
+
         return views

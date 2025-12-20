@@ -3,11 +3,6 @@ EasyDataset - Support for dataset multiplication and resizing operators.
 Migrated from dust3r for compatibility with config syntax.
 """
 import numpy as np
-from dataset.batched_sampler import (
-    BatchedRandomSampler,
-    CustomRandomSampler,
-)
-
 
 class EasyDataset:
     """

@@ -6,7 +6,6 @@ from .waymo import WaymoDataset
 from .easy_dataset import EasyDataset, MulDataset, ResizedDataset, CatDataset
 
 from .transforms import ImgNorm
-from .batched_sampler import BatchedRandomSampler
 
 from accelerate import Accelerator
 import torch
@@ -38,6 +37,8 @@ def vggt_collate_fn(batch):
         - camera_indices: [B, S] (optional, multi-camera mode)
         - frame_indices: [B, S] (optional, multi-camera mode)
         - is_context_frame: [B, S] (bool tensor indicating context vs target frames)
+        - num_cameras: [B] (int tensor, number of cameras per sample)
+        - num_total_frames: [B] (int tensor, total number of frames per camera)
     """
     batch_size = len(batch)
     num_views = len(batch[0])
@@ -54,7 +55,8 @@ def vggt_collate_fn(batch):
 
     skip_keys = {'idx', 'dataset', 'label', 'instance', 'is_video',
                  'is_metric', 'quantile', 'rng', 'true_shape', 'ray_map',
-                 'camera_idx', 'frame_idx', 'is_context_frame'}
+                 'camera_idx', 'frame_idx', 'is_context_frame',
+                 'num_cameras', 'num_total_frames'}
 
     for key in sample_keys:
         if key in skip_keys:
@@ -114,6 +116,19 @@ def vggt_collate_fn(batch):
     else:
         output['is_context_frame'] = None
 
+    # Add num_cameras and num_total_frames metadata
+    if 'num_cameras' in batch[0][0]:
+        num_cameras_list = [sample[0]['num_cameras'] for sample in batch]
+        output['num_cameras'] = torch.tensor(num_cameras_list, dtype=torch.long)
+    else:
+        output['num_cameras'] = None
+
+    if 'num_total_frames' in batch[0][0]:
+        num_total_frames_list = [sample[0]['num_total_frames'] for sample in batch]
+        output['num_total_frames'] = torch.tensor(num_total_frames_list, dtype=torch.long)
+    else:
+        output['num_total_frames'] = None
+
     vggt_batch = {
         'images': output.get('img'),
         'depths': output.get('depthmap'),
@@ -129,6 +144,8 @@ def vggt_collate_fn(batch):
         'camera_indices': output.get('camera_indices'),
         'frame_indices': output.get('frame_indices'),
         'is_context_frame': output.get('is_context_frame'),
+        'num_cameras': output.get('num_cameras'),
+        'num_total_frames': output.get('num_total_frames'),
     }
 
     return vggt_batch
@@ -206,7 +223,6 @@ __all__ = [
     'ResizedDataset',
     'CatDataset',
     'ImgNorm',
-    'BatchedRandomSampler',
     'get_data_loader',
     'vggt_collate_fn',
 ]
