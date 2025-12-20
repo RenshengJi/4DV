@@ -215,18 +215,12 @@ def create_clustering_visualization(matched_clustering_results, vggt_batch, fusi
     try:
         B, S, C, image_height, image_width = vggt_batch["images"].shape
 
-        print(f"[DEBUG] create_clustering_visualization:")
-        print(f"  vggt_batch['images'] shape: {vggt_batch['images'].shape}")
-        print(f"  matched_clustering_results length: {len(matched_clustering_results) if matched_clustering_results else 0}")
-
         if not matched_clustering_results or len(matched_clustering_results) == 0:
             images_np = (vggt_batch["images"][0].cpu().numpy() * 255).astype(np.uint8)
             images_np = images_np.transpose(0, 2, 3, 1)
-            print(f"[DEBUG] No clustering results, returning RGB images: {images_np.shape}")
             return images_np
 
         colored_results = visualize_clustering_results(matched_clustering_results, num_colors=20)
-        print(f"[DEBUG] colored_results length: {len(colored_results)}")
 
         camera_indices = vggt_batch.get('camera_indices', None)
         frame_indices = vggt_batch.get('frame_indices', None)
@@ -239,8 +233,6 @@ def create_clustering_visualization(matched_clustering_results, vggt_batch, fusi
             num_cameras = len(np.unique(camera_indices))
             num_frames = len(colored_results)
 
-            print(f"[DEBUG] Multi-camera mode: {num_cameras} cameras, {num_frames} frames")
-
             clustering_images = []
             for view_idx in range(S):
                 cam_idx = camera_indices[view_idx]
@@ -251,7 +243,6 @@ def create_clustering_visualization(matched_clustering_results, vggt_batch, fusi
 
                 # Check if frame_idx is within colored_results range
                 if frame_idx >= len(colored_results):
-                    print(f"[DEBUG] Warning: frame_idx {frame_idx} >= colored_results length {len(colored_results)}, using source RGB only")
                     fused_image = source_rgb.copy()
                     clustering_images.append(fused_image)
                     continue
@@ -277,25 +268,20 @@ def create_clustering_visualization(matched_clustering_results, vggt_batch, fusi
         else:
             clustering_images = []
             for frame_idx, colored_result in enumerate(colored_results):
-                print(f"[DEBUG] Processing frame {frame_idx}, num_clusters: {colored_result['num_clusters']}")
-
                 source_rgb = vggt_batch["images"][0, frame_idx].permute(1, 2, 0)
                 source_rgb = (source_rgb * 255).cpu().numpy().astype(np.uint8)
 
                 if colored_result['num_clusters'] > 0:
                     point_colors = colored_result['colors']
-                    print(f"[DEBUG] point_colors shape: {point_colors.shape}, non-zero: {np.sum(np.any(point_colors > 0, axis=1))}")
                     clustering_image = point_colors.reshape(image_height, image_width, 3)
 
                     mask = np.any(clustering_image > 0, axis=2)
-                    print(f"[DEBUG] mask sum: {np.sum(mask)}, total pixels: {mask.size}")
                     mask = mask[:, :, np.newaxis]
 
                     fused_image = np.where(mask,
                                          (fusion_alpha * clustering_image + (1 - fusion_alpha) * source_rgb).astype(np.uint8),
                                          source_rgb)
                 else:
-                    print(f"[DEBUG] No clusters for frame {frame_idx}")
                     fused_image = source_rgb.copy()
                     cv2.putText(fused_image, "No Dynamic Objects", (10, 30),
                                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
@@ -313,8 +299,93 @@ def create_clustering_visualization(matched_clustering_results, vggt_batch, fusi
         return images_np
 
 
+def _prepare_target_frame_transforms(dynamic_objects_cars, num_total_frames, device):
+    """
+    Pre-compute interpolated transforms for target frames for all cars.
+    Updates frame_transforms and frame_existence in-place.
+
+    Args:
+        dynamic_objects_cars: List of car objects
+        num_total_frames: Total number of frames (including target frames)
+        device: torch device
+    """
+    for car in dynamic_objects_cars:
+        if 'frame_transforms' not in car:
+            continue
+
+        frame_transforms = car['frame_transforms']
+        available_frames = sorted(frame_transforms.keys())
+
+        if len(available_frames) == 0:
+            continue
+
+        # Get current frame_existence
+        frame_existence = car.get('frame_existence')
+        if frame_existence is None:
+            # Create frame_existence based on available transforms
+            max_frame = max(available_frames)
+            frame_existence = torch.zeros(max_frame + 1, dtype=torch.bool, device=device)
+            for f in available_frames:
+                frame_existence[f] = True
+
+        # Extend frame_existence to cover all frames
+        if len(frame_existence) < num_total_frames:
+            extended_existence = torch.zeros(num_total_frames, dtype=torch.bool, device=device)
+            extended_existence[:len(frame_existence)] = frame_existence
+            frame_existence = extended_existence
+            car['frame_existence'] = frame_existence
+
+        # For each target frame, compute interpolated transform
+        for frame_idx in range(num_total_frames):
+            # Skip if this is already a context frame
+            if frame_idx in frame_transforms:
+                continue
+
+            # Find nearest context frames
+            frames_before = [f for f in available_frames if f < frame_idx]
+            frames_after = [f for f in available_frames if f > frame_idx]
+
+            interpolated_transform = None
+
+            if len(frames_before) > 0 and len(frames_after) > 0:
+                # Interpolate between closest before and after frames
+                frame_before = frames_before[-1]
+                frame_after = frames_after[0]
+
+                transform_before = frame_transforms[frame_before]
+                transform_after = frame_transforms[frame_after]
+
+                # Calculate interpolation factor
+                alpha = (frame_idx - frame_before) / (frame_after - frame_before)
+
+                # Interpolate: frame_transforms stores frame_to_canonical, so interpolate those directly
+                interpolated_transform = _interpolate_transforms(
+                    transform_before, transform_after, alpha, device
+                )
+
+            elif len(frames_before) > 0:
+                # Only frames before: use the closest one
+                frame_before = frames_before[-1]
+                interpolated_transform = frame_transforms[frame_before].clone()
+
+            elif len(frames_after) > 0:
+                # Only frames after: use the closest one
+                frame_after = frames_after[0]
+                interpolated_transform = frame_transforms[frame_after].clone()
+
+            # Add interpolated transform to frame_transforms
+            if interpolated_transform is not None:
+                frame_transforms[frame_idx] = interpolated_transform
+                # Mark this frame as existing
+                frame_existence[frame_idx] = True
+
+        # Update frame_existence
+        car['frame_existence'] = frame_existence
+
+
 def render_gaussians_with_sky(scene, intrinsics, extrinsics, sky_colors, sampled_frame_indices, H, W, device,
-                              enable_voxel_pruning=True, voxel_size=0.002, depth_scale_factor=None):
+                              enable_voxel_pruning=True, voxel_size=0.002, depth_scale_factor=None,
+                              temporal_frame_indices=None):
     """
     Render Gaussian scene with sky color alpha blending
     Frame-by-frame rendering for correct dynamic object transforms
@@ -323,6 +394,8 @@ def render_gaussians_with_sky(scene, intrinsics, extrinsics, sky_colors, sampled
         enable_voxel_pruning: bool, whether to enable voxel pruning
         voxel_size: float, voxel size in metric scale (meters)
         depth_scale_factor: float, depth scaling factor
+        temporal_frame_indices: list or None, mapping from loop index to temporal frame index
+            Used for dynamic object transform lookup (same for all cameras at same time)
     """
     from gsplat import rasterization
 
@@ -330,7 +403,13 @@ def render_gaussians_with_sky(scene, intrinsics, extrinsics, sky_colors, sampled
     rendered_images = []
     rendered_depths = []
 
-    for frame_idx in range(S):
+    for view_idx in range(S):
+        # Determine temporal frame index for dynamic object lookup
+        if temporal_frame_indices is not None:
+            temporal_frame_idx = temporal_frame_indices[view_idx]
+        else:
+            temporal_frame_idx = view_idx
+
         all_means = []
         all_scales = []
         all_colors = []
@@ -348,14 +427,14 @@ def render_gaussians_with_sky(scene, intrinsics, extrinsics, sky_colors, sampled
 
         dynamic_objects_cars = scene.get('dynamic_objects_cars', [])
         for obj_data in dynamic_objects_cars:
-            if not _object_exists_in_frame(obj_data, frame_idx):
+            if not _object_exists_in_frame(obj_data, temporal_frame_idx):
                 continue
 
             canonical_gaussians = obj_data.get('canonical_gaussians')
             if canonical_gaussians is None or canonical_gaussians.shape[0] == 0:
                 continue
 
-            frame_transform = _get_object_transform_to_frame(obj_data, frame_idx)
+            frame_transform = _get_object_transform_to_frame(obj_data, temporal_frame_idx)
             if frame_transform is None:
                 transformed_gaussians = canonical_gaussians
             else:
@@ -373,10 +452,64 @@ def render_gaussians_with_sky(scene, intrinsics, extrinsics, sky_colors, sampled
         dynamic_objects_people = scene.get('dynamic_objects_people', [])
         for obj_data in dynamic_objects_people:
             frame_gaussians = obj_data.get('frame_gaussians', {})
-            if frame_idx not in frame_gaussians:
-                continue
 
-            current_frame_gaussians = frame_gaussians[frame_idx]
+            # If target frame, try to extrapolate from nearest context frame
+            if temporal_frame_idx not in frame_gaussians:
+                # Find nearest context frame with gaussians
+                available_frames = sorted(frame_gaussians.keys())
+                if len(available_frames) == 0:
+                    continue
+
+                # Find frames before and after target
+                frames_before = [f for f in available_frames if f < temporal_frame_idx]
+                frames_after = [f for f in available_frames if f > temporal_frame_idx]
+
+                # Determine which frames to use for interpolation
+                if len(frames_before) > 0 and len(frames_after) > 0:
+                    # Target is between two context frames - use velocity from frame before
+                    frame_from = frames_before[-1]  # Closest frame before target
+                    frame_to = frames_after[0]      # Next context frame (velocity points to this)
+
+                    # Get gaussians and velocity from frame_from
+                    gaussians_from = frame_gaussians[frame_from]
+                    if gaussians_from is None or gaussians_from.shape[0] == 0:
+                        continue
+
+                    frame_velocities = obj_data.get('frame_velocities', {})
+                    if frame_from in frame_velocities:
+                        velocity = frame_velocities[frame_from]
+
+                        # Velocity points from frame_from to frame_to
+                        # Compute interpolation factor: alpha = (target - from) / (to - from)
+                        alpha = (temporal_frame_idx - frame_from) / (frame_to - frame_from)
+
+                        # Interpolate position: new_pos = old_pos + velocity * alpha
+                        extrapolated_gaussians = gaussians_from.clone()
+                        extrapolated_gaussians[:, :3] = gaussians_from[:, :3] + velocity * alpha
+
+                        current_frame_gaussians = extrapolated_gaussians
+                    else:
+                        # No velocity, use gaussians from nearest frame
+                        current_frame_gaussians = gaussians_from
+
+                elif len(frames_before) > 0:
+                    # Target is after all context frames - use last frame
+                    nearest_frame = frames_before[-1]
+                    current_frame_gaussians = frame_gaussians[nearest_frame]
+                    if current_frame_gaussians is None or current_frame_gaussians.shape[0] == 0:
+                        continue
+
+                elif len(frames_after) > 0:
+                    # Target is before all context frames - use first frame
+                    nearest_frame = frames_after[0]
+                    current_frame_gaussians = frame_gaussians[nearest_frame]
+                    if current_frame_gaussians is None or current_frame_gaussians.shape[0] == 0:
+                        continue
+                else:
+                    continue
+            else:
+                current_frame_gaussians = frame_gaussians[temporal_frame_idx]
+
             if current_frame_gaussians is None or current_frame_gaussians.shape[0] == 0:
                 continue
 
@@ -410,8 +543,8 @@ def render_gaussians_with_sky(scene, intrinsics, extrinsics, sky_colors, sampled
         rotations = torch.nan_to_num(rotations, nan=0.0, posinf=1.0, neginf=-1.0)
         opacities = torch.nan_to_num(opacities, nan=0.5, posinf=1.0, neginf=0.0)
 
-        K = intrinsics[frame_idx]
-        w2c = extrinsics[frame_idx]
+        K = intrinsics[view_idx]
+        w2c = extrinsics[view_idx]
 
         try:
             render_result = rasterization(
@@ -433,7 +566,8 @@ def render_gaussians_with_sky(scene, intrinsics, extrinsics, sky_colors, sampled
                 if not isinstance(sampled_frame_indices, torch.Tensor):
                     sampled_frame_indices = torch.tensor(sampled_frame_indices, device=device)
 
-                matches = (sampled_frame_indices == frame_idx)
+                # Use view_idx to lookup sky color
+                matches = (sampled_frame_indices == view_idx)
                 if matches.any():
                     sky_idx = matches.nonzero(as_tuple=True)[0].item()
                     frame_sky_color = sky_colors[sky_idx]
@@ -445,7 +579,7 @@ def render_gaussians_with_sky(scene, intrinsics, extrinsics, sky_colors, sampled
             rendered_depths.append(rendered_depth)
 
         except Exception as e:
-            print(f"Error rendering frame {frame_idx}: {e}")
+            print(f"Error rendering view {view_idx} (temporal frame {temporal_frame_idx}): {e}")
             rendered_images.append(torch.zeros(3, H, W, device=device))
             rendered_depths.append(torch.zeros(H, W, device=device))
 
@@ -475,26 +609,159 @@ def render_self(vggt_batch, preds, sh_degree=0, enable_voxel_pruning=True, voxel
 
 
 def _object_exists_in_frame(obj_data, frame_idx):
-    """Check if dynamic object exists in specified frame"""
+    """Check if dynamic object exists in specified frame (including interpolated frames)"""
+    frame_existence = obj_data.get('frame_existence')
+    if frame_existence is not None and frame_idx < len(frame_existence):
+        return frame_existence[frame_idx].item()
+
+    # Fallback: check if frame_transforms exists for this frame
     if 'frame_transforms' in obj_data:
         frame_transforms = obj_data['frame_transforms']
         if frame_idx in frame_transforms:
             return True
+
     return False
 
 
+def _interpolate_transforms(transform1, transform2, alpha, device):
+    """
+    Interpolate between two 4x4 transformation matrices using LERP for translation and SLERP for rotation.
+
+    Args:
+        transform1: 4x4 transformation matrix at t=0
+        transform2: 4x4 transformation matrix at t=1
+        alpha: interpolation factor in [0, 1]
+        device: torch device
+
+    Returns:
+        Interpolated 4x4 transformation matrix
+    """
+    import torch.nn.functional as F
+
+    # Extract rotation matrices (3x3) and translations (3x1)
+    R1 = transform1[:3, :3]
+    t1 = transform1[:3, 3]
+    R2 = transform2[:3, :3]
+    t2 = transform2[:3, 3]
+
+    # LERP for translation
+    t_interp = (1 - alpha) * t1 + alpha * t2
+
+    # Convert rotation matrices to quaternions for SLERP
+    # Using a simple approach: convert to quaternion, interpolate, convert back
+    q1 = _rotation_matrix_to_quaternion(R1)
+    q2 = _rotation_matrix_to_quaternion(R2)
+
+    # Ensure shortest path interpolation
+    if torch.dot(q1, q2) < 0:
+        q2 = -q2
+
+    # SLERP for rotation (quaternion interpolation)
+    q_interp = _slerp_quaternion(q1, q2, alpha)
+    R_interp = _quaternion_to_rotation_matrix(q_interp)
+
+    # Construct interpolated transform
+    transform_interp = torch.eye(4, dtype=transform1.dtype, device=device)
+    transform_interp[:3, :3] = R_interp
+    transform_interp[:3, 3] = t_interp
+
+    return transform_interp
+
+
+def _rotation_matrix_to_quaternion(R):
+    """Convert 3x3 rotation matrix to quaternion [w, x, y, z]"""
+    trace = R[0, 0] + R[1, 1] + R[2, 2]
+
+    if trace > 0:
+        s = 0.5 / torch.sqrt(trace + 1.0)
+        w = 0.25 / s
+        x = (R[2, 1] - R[1, 2]) * s
+        y = (R[0, 2] - R[2, 0]) * s
+        z = (R[1, 0] - R[0, 1]) * s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = 2.0 * torch.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+        w = (R[2, 1] - R[1, 2]) / s
+        x = 0.25 * s
+        y = (R[0, 1] + R[1, 0]) / s
+        z = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = 2.0 * torch.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+        w = (R[0, 2] - R[2, 0]) / s
+        x = (R[0, 1] + R[1, 0]) / s
+        y = 0.25 * s
+        z = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = 2.0 * torch.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+        w = (R[1, 0] - R[0, 1]) / s
+        x = (R[0, 2] + R[2, 0]) / s
+        y = (R[1, 2] + R[2, 1]) / s
+        z = 0.25 * s
+
+    q = torch.stack([w, x, y, z])
+    return q / torch.norm(q)  # Normalize
+
+
+def _quaternion_to_rotation_matrix(q):
+    """Convert quaternion [w, x, y, z] to 3x3 rotation matrix"""
+    w, x, y, z = q[0], q[1], q[2], q[3]
+
+    R = torch.zeros(3, 3, dtype=q.dtype, device=q.device)
+    R[0, 0] = 1 - 2*y*y - 2*z*z
+    R[0, 1] = 2*x*y - 2*w*z
+    R[0, 2] = 2*x*z + 2*w*y
+    R[1, 0] = 2*x*y + 2*w*z
+    R[1, 1] = 1 - 2*x*x - 2*z*z
+    R[1, 2] = 2*y*z - 2*w*x
+    R[2, 0] = 2*x*z - 2*w*y
+    R[2, 1] = 2*y*z + 2*w*x
+    R[2, 2] = 1 - 2*x*x - 2*y*y
+
+    return R
+
+
+def _slerp_quaternion(q1, q2, alpha):
+    """Spherical linear interpolation between two quaternions"""
+    dot = torch.dot(q1, q2)
+
+    # Clamp dot product to avoid numerical issues
+    dot = torch.clamp(dot, -1.0, 1.0)
+
+    # If quaternions are very close, use linear interpolation
+    if dot > 0.9995:
+        result = q1 + alpha * (q2 - q1)
+        return result / torch.norm(result)
+
+    # Calculate angle between quaternions
+    theta = torch.acos(dot)
+    sin_theta = torch.sin(theta)
+
+    # SLERP formula
+    w1 = torch.sin((1 - alpha) * theta) / sin_theta
+    w2 = torch.sin(alpha * theta) / sin_theta
+
+    result = w1 * q1 + w2 * q2
+    return result / torch.norm(result)
+
+
 def _get_object_transform_to_frame(obj_data, frame_idx):
-    """Get transform matrix from canonical space to specified frame"""
+    """
+    Get transform matrix from canonical space to specified frame.
+    Note: Transforms should be pre-computed by _prepare_target_frame_transforms for target frames.
+    """
     reference_frame = obj_data.get('reference_frame', 0)
     if frame_idx == reference_frame:
         return None
 
-    if 'frame_transforms' in obj_data:
-        frame_transforms = obj_data['frame_transforms']
-        if frame_idx in frame_transforms:
-            frame_to_canonical = frame_transforms[frame_idx]
-            canonical_to_frame = torch.inverse(frame_to_canonical)
-            return canonical_to_frame
+    if 'frame_transforms' not in obj_data:
+        return None
+
+    frame_transforms = obj_data['frame_transforms']
+
+    # Direct lookup (works for both context and pre-computed target frames)
+    if frame_idx in frame_transforms:
+        frame_to_canonical = frame_transforms[frame_idx]
+        canonical_to_frame = torch.inverse(frame_to_canonical)
+        return canonical_to_frame
 
     return None
 
@@ -553,23 +820,11 @@ def run_single_inference(model, dataset, idx, num_context_frames, device, cfg, r
             if isinstance(vggt_batch[key], torch.Tensor):
                 vggt_batch[key] = vggt_batch[key].to(device)
 
-        print(f"Loaded batch: images shape = {vggt_batch['images'].shape}")
-
         # Separate context and target frames based on is_context_frame flag
         is_context_frame = vggt_batch.get('is_context_frame', None)
-        if is_context_frame is not None:
-            context_mask = is_context_frame[0]  # [S]
-            context_indices = torch.where(context_mask)[0]
-            target_indices = torch.where(~context_mask)[0]
-
-            print(f"Context frames: {len(context_indices)}, Target frames: {len(target_indices)}")
-            print(f"Context frame indices: {context_indices.tolist()}")
-            print(f"Target frame indices: {target_indices.tolist()}")
-        else:
-            # Backward compatibility: if no context/target distinction, all are context frames
-            context_indices = torch.arange(len(views_list), device=device)
-            target_indices = torch.tensor([], dtype=torch.long, device=device)
-            print(f"No context/target distinction found, treating all {len(views_list)} frames as context frames")
+        context_mask = is_context_frame[0]  # [S]
+        context_indices = torch.where(context_mask)[0]
+        target_indices = torch.where(~context_mask)[0]
 
         camera_indices = [v.get('camera_idx', 0) for v in views_list]
         frame_indices = [v.get('frame_idx', 0) for v in views_list]
@@ -577,7 +832,7 @@ def run_single_inference(model, dataset, idx, num_context_frames, device, cfg, r
         num_cameras = len(set(camera_indices))
         num_total_frames = len(views_list) // num_cameras if num_cameras > 0 else len(views_list)
 
-        print(f"Loaded {len(views_list)} views: {num_cameras} cameras × {num_total_frames} frames")
+        print(f"Loaded {len(views_list)} views: {num_cameras} cameras × {num_total_frames} frames ( context frames: {len(context_indices)}, target frames: {len(target_indices)} )")
 
         images = vggt_batch['images']
         B, S, C, H, W = images.shape
@@ -585,28 +840,14 @@ def run_single_inference(model, dataset, idx, num_context_frames, device, cfg, r
         extrinsics = vggt_batch['extrinsics']
         depthmaps = vggt_batch['depths']
 
-        # Only feed context frames to the network for inference
-        if is_context_frame is not None and len(context_indices) > 0:
-            print(f"Feeding only context frames to network: {context_indices.tolist()}")
-            context_images = images[:, context_indices]
-            context_intrinsics = intrinsics[:, context_indices]
-            context_extrinsics = extrinsics[:, context_indices]
-        else:
-            print("No context/target distinction, feeding all frames to network")
-            context_images = images
-            context_intrinsics = intrinsics
-            context_extrinsics = extrinsics
 
-        print(f"Running model inference on {context_images.shape[1]} frames...")
+        print(f"Running model inference on {images[:, context_indices].shape[1]} frames...")
         preds = model(
-            context_images,
-            gt_extrinsics=context_extrinsics,
-            gt_intrinsics=context_intrinsics,
+            images[:, context_indices],
+            gt_extrinsics=extrinsics[:, context_indices],
+            gt_intrinsics=intrinsics[:, context_indices],
             frame_sample_ratio=1.0
         )
-
-        # Note: We don't use network pred_depth for visualization anymore
-        # Instead, we'll use rendered_depth from gaussian splatting which works on all frames
 
         dynamic_processor = DynamicProcessor(
             device=device,
@@ -619,25 +860,25 @@ def run_single_inference(model, dataset, idx, num_context_frames, device, cfg, r
             use_registration=True
         )
 
-        preds_for_dynamic = preds.copy() if isinstance(preds, dict) else preds
-        if hasattr(cfg, 'use_gt_camera') and cfg.use_gt_camera and 'pose_enc' in preds_for_dynamic:
-            from models.utils.pose_enc import extri_intri_to_pose_encoding
-            image_size_hw = (H, W)
-            # Use context frames' camera parameters
-            gt_pose_enc = extri_intri_to_pose_encoding(
-                context_extrinsics, context_intrinsics, image_size_hw, pose_encoding_type="absT_quaR_FoV"
-            )
-            preds_for_dynamic['pose_enc'] = gt_pose_enc
-            print(f"[INFO] Using GT camera parameters for dynamic object processing (context frames only)")
-
-        auxiliary_models = {}
-
         # Create a context-only vggt_batch for dynamic processor
+        # Remap frame_indices to continuous [0, 1, 2, ...] for processor
+        context_frame_indices = None
+        frame_mapping = None  # {global_idx: context_idx}
+        if is_context_frame is not None and vggt_batch.get('frame_indices') is not None:
+            original_frame_indices = vggt_batch['frame_indices'][:, context_indices]
+            unique_frames = torch.unique(original_frame_indices, sorted=True)
+            frame_mapping = {int(old.item()): new for new, old in enumerate(unique_frames)}
+            context_frame_indices = torch.zeros_like(original_frame_indices)
+            for i, old_idx in enumerate(original_frame_indices[0]):
+                context_frame_indices[0, i] = frame_mapping[int(old_idx.item())]
+        elif vggt_batch.get('frame_indices') is not None:
+            context_frame_indices = vggt_batch['frame_indices']
+
         vggt_batch_context = {
-            'images': context_images,
+            'images': images[:, context_indices],
             'depths': vggt_batch['depths'][:, context_indices] if is_context_frame is not None else vggt_batch['depths'],
-            'intrinsics': context_intrinsics,
-            'extrinsics': context_extrinsics,
+            'intrinsics': intrinsics[:, context_indices],
+            'extrinsics': extrinsics[:, context_indices],
             'point_masks': vggt_batch['point_masks'][:, context_indices] if is_context_frame is not None and vggt_batch.get('point_masks') is not None else vggt_batch.get('point_masks'),
             'world_points': vggt_batch['world_points'][:, context_indices] if is_context_frame is not None and vggt_batch.get('world_points') is not None else vggt_batch.get('world_points'),
             'flowmap': vggt_batch['flowmap'][:, context_indices] if is_context_frame is not None and vggt_batch.get('flowmap') is not None else vggt_batch.get('flowmap'),
@@ -646,12 +887,117 @@ def run_single_inference(model, dataset, idx, num_context_frames, device, cfg, r
             'depth_scale_factor': vggt_batch.get('depth_scale_factor'),
             'sky_masks': vggt_batch['sky_masks'][:, context_indices] if is_context_frame is not None and vggt_batch.get('sky_masks') is not None else vggt_batch.get('sky_masks'),
             'camera_indices': vggt_batch['camera_indices'][:, context_indices] if is_context_frame is not None and vggt_batch.get('camera_indices') is not None else vggt_batch.get('camera_indices'),
-            'frame_indices': vggt_batch['frame_indices'][:, context_indices] if is_context_frame is not None and vggt_batch.get('frame_indices') is not None else vggt_batch.get('frame_indices'),
+            'frame_indices': context_frame_indices,
         }
 
-        result = dynamic_processor.process(preds_for_dynamic, vggt_batch_context)
+        result = dynamic_processor.process(preds, vggt_batch_context)
 
         dynamic_objects_data = dynamic_processor.to_legacy_format(result)
+
+        # Remap dynamic objects frame indices from context to global
+        if is_context_frame is not None and dynamic_objects_data is not None and frame_mapping is not None:
+            # Create inverse mapping: context frame idx -> global frame idx
+            # frame_mapping is {global_idx: context_idx}, so inverse is {context_idx: global_idx}
+            context_to_global_frame = {ctx_idx: global_idx for global_idx, ctx_idx in frame_mapping.items()}
+
+            # Remap cars
+            for car in dynamic_objects_data.get('dynamic_objects_cars', []):
+                # Remap frame_transforms keys
+                if car.get('frame_transforms') is not None:
+                    car['frame_transforms'] = {
+                        context_to_global_frame[ctx_frame]: transform
+                        for ctx_frame, transform in car['frame_transforms'].items()
+                    }
+                # Remap frame_pixel_indices keys (outer dict: frame_idx, inner dict: view_idx stays the same)
+                if car.get('frame_pixel_indices') is not None:
+                    car['frame_pixel_indices'] = {
+                        context_to_global_frame[ctx_frame]: view_dict
+                        for ctx_frame, view_dict in car['frame_pixel_indices'].items()
+                    }
+                # Remap frame_existence: rebuild tensor based on which global frames the object exists in
+                if car.get('frame_existence') is not None:
+                    context_existence = car['frame_existence']  # [max_context_frame + 1]
+                    # Find which context frames the object exists in
+                    existing_context_frames = [i for i in range(len(context_existence)) if context_existence[i]]
+                    # Map to global frames
+                    existing_global_frames = [context_to_global_frame[ctx_f] for ctx_f in existing_context_frames]
+                    # Create new frame_existence tensor
+                    if existing_global_frames:
+                        max_global_frame = max(existing_global_frames)
+                        global_existence = torch.zeros(max_global_frame + 1, dtype=torch.bool, device=device)
+                        for global_f in existing_global_frames:
+                            global_existence[global_f] = True
+                        car['frame_existence'] = global_existence
+                    else:
+                        car['frame_existence'] = torch.tensor([], dtype=torch.bool, device=device)
+                # Remap reference_frame
+                if car.get('reference_frame') is not None:
+                    car['reference_frame'] = context_to_global_frame[car['reference_frame']]
+
+            # Remap pedestrians
+            for person in dynamic_objects_data.get('dynamic_objects_people', []):
+                # Remap frame_gaussians keys
+                if person.get('frame_gaussians') is not None:
+                    person['frame_gaussians'] = {
+                        context_to_global_frame[ctx_frame]: gaussians
+                        for ctx_frame, gaussians in person['frame_gaussians'].items()
+                    }
+                # Remap frame_pixel_indices keys
+                if person.get('frame_pixel_indices') is not None:
+                    person['frame_pixel_indices'] = {
+                        context_to_global_frame[ctx_frame]: view_dict
+                        for ctx_frame, view_dict in person['frame_pixel_indices'].items()
+                    }
+                # Remap frame_existence: rebuild tensor based on which global frames the object exists in
+                if person.get('frame_existence') is not None:
+                    context_existence = person['frame_existence']  # [max_context_frame + 1]
+                    # Find which context frames the object exists in
+                    existing_context_frames = [i for i in range(len(context_existence)) if context_existence[i]]
+                    # Map to global frames
+                    existing_global_frames = [context_to_global_frame[ctx_f] for ctx_f in existing_context_frames]
+                    # Create new frame_existence tensor
+                    if existing_global_frames:
+                        max_global_frame = max(existing_global_frames)
+                        global_existence = torch.zeros(max_global_frame + 1, dtype=torch.bool, device=device)
+                        for global_f in existing_global_frames:
+                            global_existence[global_f] = True
+                        person['frame_existence'] = global_existence
+                    else:
+                        person['frame_existence'] = torch.tensor([], dtype=torch.bool, device=device)
+
+                # Add velocity information for extrapolation to target frames
+                # Extract average velocity from pixel indices
+                person['frame_velocities'] = {}
+                frame_pixel_indices = person.get('frame_pixel_indices', {})
+                pred_velocity_global = preds.get('velocity_global', None)
+
+                if pred_velocity_global is not None and frame_pixel_indices:
+                    for global_frame_idx, view_dict in frame_pixel_indices.items():
+                        # Collect velocities from all views for this frame
+                        frame_velocities = []
+                        for view_idx, pixel_list in view_dict.items():
+                            if len(pixel_list) == 0:
+                                continue
+                            # Find the context view index corresponding to this view_idx
+                            # view_idx is relative to context views, need to map to actual context_indices
+                            if view_idx < len(context_indices):
+                                actual_view_idx = context_indices[view_idx].item()
+                                vel_map = pred_velocity_global[0, view_idx]  # [H, W, 3]
+                                H_vel, W_vel = vel_map.shape[:2]
+
+                                # Extract velocities for these pixels
+                                for pixel_idx in pixel_list:
+                                    v = pixel_idx // W_vel
+                                    u = pixel_idx % W_vel
+                                    if v < H_vel and u < W_vel:
+                                        pixel_vel = vel_map[v, u]
+                                        frame_velocities.append(pixel_vel)
+
+                        if frame_velocities:
+                            # Average velocity for this person in this frame
+                            avg_velocity = torch.stack(frame_velocities).mean(dim=0)
+                            person['frame_velocities'][global_frame_idx] = avg_velocity
+
 
         gt_velocity = vggt_batch.get('flowmap', None)
         if gt_velocity is not None:
@@ -695,13 +1041,9 @@ def run_single_inference(model, dataset, idx, num_context_frames, device, cfg, r
         pred_velocity_vis = (pred_velocity_vis.cpu().numpy() * 255).astype(np.uint8).transpose(0, 2, 3, 1)
 
         if gt_seg_labels is not None and pred_seg_logits_context is not None:
-            print(f"[DEBUG] GT seg_labels shape: {gt_seg_labels.shape}, dtype: {gt_seg_labels.dtype}")
-            print(f"[DEBUG] Pred seg_logits (context) shape: {pred_seg_logits_context.shape}, dtype: {pred_seg_logits_context.dtype}")
-
             gt_seg_vis = visualize_segmentation(gt_seg_labels[0], gt_seg_mask[0] if gt_seg_mask is not None else None, num_classes=4)
 
             # Expand pred_seg to all frames
-            print(f"[DEBUG] pred_seg_logits_context[0] shape: {pred_seg_logits_context[0].shape}")
             pred_seg_probs_context = torch.softmax(pred_seg_logits_context[0], dim=-1)
             pred_seg_labels_context = torch.argmax(pred_seg_probs_context, dim=-1)
 
@@ -711,9 +1053,6 @@ def run_single_inference(model, dataset, idx, num_context_frames, device, cfg, r
                 pred_seg_labels_full[context_indices] = pred_seg_labels_context
             else:
                 pred_seg_labels_full = pred_seg_labels_context
-
-            print(f"[DEBUG] pred_seg_labels_full shape: {pred_seg_labels_full.shape}")
-            print(f"[DEBUG] pred_seg_labels_full unique values: {torch.unique(pred_seg_labels_full)}")
 
             pred_seg_vis = visualize_segmentation(pred_seg_labels_full, num_classes=4)
         else:
@@ -729,6 +1068,13 @@ def run_single_inference(model, dataset, idx, num_context_frames, device, cfg, r
         dynamic_objects_people = dynamic_objects_data.get('dynamic_objects_people', []) if dynamic_objects_data is not None else []
         static_gaussians = dynamic_objects_data.get('static_gaussians') if dynamic_objects_data is not None else None
 
+        # Pre-compute interpolated transforms for target frames
+        if render_target_frames and is_context_frame is not None and len(target_indices) > 0:
+            print(f"[INFO] Pre-computing interpolated transforms for target frames...")
+            num_total_frames = len(torch.unique(vggt_batch['frame_indices']))
+            _prepare_target_frame_transforms(dynamic_objects_cars, num_total_frames, device)
+            print(f"[INFO] Transforms prepared for all {num_total_frames} frames")
+
         scene = {
             'static_gaussians': static_gaussians,
             'dynamic_objects_cars': dynamic_objects_cars,
@@ -742,11 +1088,22 @@ def run_single_inference(model, dataset, idx, num_context_frames, device, cfg, r
 
         # If render_target_frames is True, infer sky colors for target frames
         if render_target_frames and is_context_frame is not None and len(target_indices) > 0:
-            print(f"[INFO] Inferring sky colors for {len(target_indices)} target frames...")
+            print(f"[INFO] Inferring sky colors for all frames (context + target)...")
 
             # Get sky_token from context frame inference
             sky_token = preds.get('sky_token', None)
             if sky_token is not None:
+                # First, generate sky colors for ALL context frames (not just sampled ones)
+                context_intrinsics = intrinsics[0, context_indices]
+                context_extrinsics = extrinsics[0, context_indices]
+
+                context_sky_colors = model.infer_target_frame_sky_colors(
+                    sky_token=sky_token,
+                    target_frame_intrinsics=context_intrinsics,
+                    target_frame_extrinsics=context_extrinsics,
+                    image_size=(H, W)
+                )
+
                 # Collect unique target frame indices (temporal positions)
                 target_frame_positions = sorted(set([frame_indices[idx] for idx in target_indices.tolist()]))
 
@@ -778,10 +1135,9 @@ def run_single_inference(model, dataset, idx, num_context_frames, device, cfg, r
                     # Combine context and target sky colors
                     all_sky_colors = torch.zeros((len(views_list), 3, H, W), device=device)
 
-                    # Fill in context frame sky colors
-                    if sky_colors_full is not None and sampled_frame_indices is not None:
-                        for i, frame_idx in enumerate(sampled_frame_indices):
-                            all_sky_colors[frame_idx] = sky_colors_full[0, i]
+                    # Fill in ALL context frame sky colors
+                    for i, global_view_idx in enumerate(context_indices):
+                        all_sky_colors[global_view_idx] = context_sky_colors[i]
 
                     # Fill in target frame sky colors
                     for i, global_idx in enumerate(target_frame_global_indices):
@@ -793,7 +1149,12 @@ def run_single_inference(model, dataset, idx, num_context_frames, device, cfg, r
                     print(f"[INFO] Generated sky colors for all {len(views_list)} frames (context + target)")
                 else:
                     print("[WARNING] No target frames found for sky color inference")
-                    sky_colors = sky_colors_full[0] if sky_colors_full is not None else None
+                    # Still generate sky colors for all context frames
+                    all_sky_colors = torch.zeros((len(views_list), 3, H, W), device=device)
+                    for i, global_view_idx in enumerate(context_indices):
+                        all_sky_colors[global_view_idx] = context_sky_colors[i]
+                    sky_colors = all_sky_colors
+                    sampled_frame_indices = torch.arange(len(views_list), device=device)
             else:
                 print("[WARNING] No sky_token found, cannot infer target frame sky colors")
                 sky_colors = sky_colors_full[0] if sky_colors_full is not None else None
@@ -814,18 +1175,23 @@ def run_single_inference(model, dataset, idx, num_context_frames, device, cfg, r
             frames_to_render_intrinsics = intrinsics[0]
             frames_to_render_extrinsics = extrinsics[0]
             frames_to_render_indices = list(range(len(views_list)))
+            # Create mapping from loop index to temporal frame index
+            frames_to_render_temporal_indices = [frame_indices[i] for i in frames_to_render_indices]
             print(f"[INFO] Rendering all {len(views_list)} frames")
         else:
             # Only render context frames
-            frames_to_render_intrinsics = context_intrinsics[0]
-            frames_to_render_extrinsics = context_extrinsics[0]
+            frames_to_render_intrinsics = intrinsics[0, context_indices]
+            frames_to_render_extrinsics = extrinsics[0, context_indices]
             frames_to_render_indices = context_indices.cpu().tolist()
+            # Create mapping from loop index to temporal frame index
+            frames_to_render_temporal_indices = [frame_indices[i] for i in frames_to_render_indices]
             print(f"[INFO] Rendering only {len(frames_to_render_indices)} context frames")
 
         print("Rendering gaussians with sky...")
         rendered_rgb, rendered_depth = render_gaussians_with_sky(
             scene, frames_to_render_intrinsics, frames_to_render_extrinsics, sky_colors, sampled_frame_indices, H, W, device,
-            enable_voxel_pruning=False, voxel_size=0.05, depth_scale_factor=depth_scale_factor
+            enable_voxel_pruning=False, voxel_size=0.05, depth_scale_factor=depth_scale_factor,
+            temporal_frame_indices=frames_to_render_temporal_indices
         )
 
         pred_rgb_np = (rendered_rgb.cpu().numpy() * 255).astype(np.uint8).transpose(0, 2, 3, 1)
@@ -857,8 +1223,6 @@ def run_single_inference(model, dataset, idx, num_context_frames, device, cfg, r
             num_frames_filtered = len(unique_frame_indices)
 
             print(f"[INFO] Filtered to {len(gt_rgb_filtered)} context frame views for visualization")
-            print(f"[DEBUG] Original frame indices: {frame_indices_filtered}")
-            print(f"[DEBUG] Remapped frame indices: {frame_indices_remapped}")
 
             return {
                 'gt_rgb': gt_rgb_filtered,
@@ -1090,11 +1454,6 @@ def create_multi_camera_grid(
     Returns:
         List of video frames, each frame is a grid layout
     """
-    print(f"[DEBUG] create_multi_camera_grid inputs:")
-    print(f"  gt_rgb shape: {gt_rgb.shape}")
-    print(f"  num_cameras: {num_cameras}, num_frames: {num_frames}")
-    print(f"  camera_indices: {camera_indices}")
-    print(f"  frame_indices: {frame_indices}")
     if dynamic_clustering is not None:
         print(f"  dynamic_clustering shape: {dynamic_clustering.shape}")
     print(f"  visualize_target_frames: {visualize_target_frames}")
@@ -1116,8 +1475,8 @@ def create_multi_camera_grid(
             gt_rgb, context_indices, num_cameras, camera_indices, frame_indices
         )
 
-        # Generate frames for target frames only
-        frames_to_visualize = sorted(set([frame_indices[idx] for idx in target_indices]))
+        # Generate frames for all frames (context + target) to avoid jumpy video
+        frames_to_visualize = list(range(num_frames))
     else:
         print("[INFO] Using traditional layout")
         context_row = None
@@ -1143,7 +1502,6 @@ def create_multi_camera_grid(
         else:
             print(f"[WARNING] frame_idx={frame_idx}: found {len(frame_views_original)} views, expected {num_cameras}")
             frame_views = frame_views_original
-        print(f"[DEBUG] frame_idx={frame_idx}, frame_views={frame_views}")
 
         # Skip this frame if no views were found
         if len(frame_views) == 0:

@@ -165,7 +165,8 @@ class DynamicProcessor:
             camera_indices = camera_indices[0]
             frame_indices = frame_indices[0]
             num_cameras = int(camera_indices.max().item()) + 1
-            num_frames = int(frame_indices.max().item()) + 1
+            # Use actual number of unique frames instead of max index
+            num_frames = len(torch.unique(frame_indices))
 
             return ViewMapping(
                 num_views=num_views,
