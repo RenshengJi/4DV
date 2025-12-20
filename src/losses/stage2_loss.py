@@ -222,7 +222,6 @@ class Stage2RenderLoss(nn.Module):
         rgb_weight: float = 1.0,
         depth_weight: float = 0.0,
         lpips_weight: float = 0.0,
-        render_only_dynamic: bool = False,
         sh_degree: int = 0,
         enable_voxel_pruning: bool = True,
         voxel_size: float = 0.002,
@@ -232,7 +231,6 @@ class Stage2RenderLoss(nn.Module):
         self.rgb_weight = rgb_weight
         self.depth_weight = depth_weight
         self.lpips_weight = lpips_weight
-        self.render_only_dynamic = render_only_dynamic
         self.sh_degree = sh_degree
         self.enable_voxel_pruning = enable_voxel_pruning
         self.voxel_size = voxel_size
@@ -249,6 +247,8 @@ class Stage2RenderLoss(nn.Module):
         sky_colors: Optional[torch.Tensor] = None,
         sampled_frame_indices: Optional[torch.Tensor] = None,
         depth_scale_factor: Optional[torch.Tensor] = None,
+        camera_indices: Optional[torch.Tensor] = None,
+        frame_indices: Optional[torch.Tensor] = None,
         is_context_frame: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
@@ -264,6 +264,8 @@ class Stage2RenderLoss(nn.Module):
             sky_colors: [B, num_frames, 3, H, W] - Sky colors for compositing
             sampled_frame_indices: [num_frames] - Sampled frame indices
             depth_scale_factor: Depth scale factor for voxel pruning
+            camera_indices: [B, S] - Camera indices for multi-camera mode
+            frame_indices: [B, S] - Frame indices for multi-camera mode (temporal frame indices)
             is_context_frame: [B, S] - Boolean mask indicating context frames (True) vs target frames (False)
 
         Returns:
@@ -298,9 +300,13 @@ class Stage2RenderLoss(nn.Module):
             frame_intrinsic = intrinsics[0, frame_idx]
             frame_extrinsic = extrinsics[0, frame_idx]
 
+            # Extract temporal frame index for dynamic object transform lookup
+            temporal_frame_idx = frame_idx
+            if frame_indices is not None:
+                temporal_frame_idx = int(frame_indices[0, frame_idx].item())
+
             rendered_rgb, rendered_depth, rendered_alpha = self._render_frame(
-                refined_scene, frame_intrinsic, frame_extrinsic, H, W, frame_idx,
-                render_only_dynamic=self.render_only_dynamic,
+                refined_scene, frame_intrinsic, frame_extrinsic, H, W, temporal_frame_idx,
                 depth_scale_factor=depth_scale_factor
             )
 
@@ -412,7 +418,6 @@ class Stage2RenderLoss(nn.Module):
         width: int,
         frame_idx: int = 0,
         sky_colors: Optional[torch.Tensor] = None,
-        render_only_dynamic: bool = False,
         depth_scale_factor: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -425,7 +430,6 @@ class Stage2RenderLoss(nn.Module):
             height, width: Image dimensions
             frame_idx: Current frame index
             sky_colors: [H, W, 3] - Sky colors (optional)
-            render_only_dynamic: Whether to render only dynamic objects
             depth_scale_factor: Depth scale factor for voxel pruning
 
         Returns:
@@ -441,7 +445,7 @@ class Stage2RenderLoss(nn.Module):
         all_opacities = []
         all_colors = []
 
-        if not render_only_dynamic and refined_scene.get('static_gaussians') is not None:
+        if refined_scene.get('static_gaussians') is not None:
             static_gaussians = refined_scene['static_gaussians']
             if static_gaussians.shape[0] > 0:
                 all_means.append(static_gaussians[:, :3])
@@ -475,13 +479,68 @@ class Stage2RenderLoss(nn.Module):
                 all_rotations.append(transformed_gaussians[:, 9:13])
                 all_opacities.append(transformed_gaussians[:, 13])
 
+        # Add dynamic people gaussians
         dynamic_objects_people = refined_scene.get('dynamic_objects_people', [])
         for obj_data in dynamic_objects_people:
             frame_gaussians = obj_data.get('frame_gaussians', {})
-            if frame_idx not in frame_gaussians:
-                continue
 
-            current_frame_gaussians = frame_gaussians[frame_idx]
+            # If target frame, try to extrapolate from nearest context frame
+            if frame_idx not in frame_gaussians:
+                # Find nearest context frame with gaussians
+                available_frames = sorted(frame_gaussians.keys())
+                if len(available_frames) == 0:
+                    continue
+
+                # Find frames before and after target
+                frames_before = [f for f in available_frames if f < frame_idx]
+                frames_after = [f for f in available_frames if f > frame_idx]
+
+                # Determine which frames to use for interpolation
+                if len(frames_before) > 0 and len(frames_after) > 0:
+                    # Target is between two context frames - use velocity from frame before
+                    frame_from = frames_before[-1]  # Closest frame before target
+                    frame_to = frames_after[0]      # Next context frame (velocity points to this)
+
+                    # Get gaussians and velocity from frame_from
+                    gaussians_from = frame_gaussians[frame_from]
+                    if gaussians_from is None or gaussians_from.shape[0] == 0:
+                        continue
+
+                    frame_velocities = obj_data.get('frame_velocities', {})
+                    if frame_from in frame_velocities:
+                        velocity = frame_velocities[frame_from]
+
+                        # Velocity points from frame_from to frame_to
+                        # Compute interpolation factor: alpha = (target - from) / (to - from)
+                        alpha = (frame_idx - frame_from) / (frame_to - frame_from)
+
+                        # Interpolate position: new_pos = old_pos + velocity * alpha
+                        extrapolated_gaussians = gaussians_from.clone()
+                        extrapolated_gaussians[:, :3] = gaussians_from[:, :3] + velocity * alpha
+
+                        current_frame_gaussians = extrapolated_gaussians
+                    else:
+                        # No velocity, use gaussians from nearest frame
+                        current_frame_gaussians = gaussians_from
+
+                elif len(frames_before) > 0:
+                    # Target is after all context frames - use last frame
+                    nearest_frame = frames_before[-1]
+                    current_frame_gaussians = frame_gaussians[nearest_frame]
+                    if current_frame_gaussians is None or current_frame_gaussians.shape[0] == 0:
+                        continue
+
+                elif len(frames_after) > 0:
+                    # Target is before all context frames - use first frame
+                    nearest_frame = frames_after[0]
+                    current_frame_gaussians = frame_gaussians[nearest_frame]
+                    if current_frame_gaussians is None or current_frame_gaussians.shape[0] == 0:
+                        continue
+                else:
+                    continue
+            else:
+                current_frame_gaussians = frame_gaussians[frame_idx]
+
             if current_frame_gaussians is None or current_frame_gaussians.shape[0] == 0:
                 continue
 
@@ -598,7 +657,6 @@ class Stage2CompleteLoss(nn.Module):
 
     def forward(
         self,
-        refinement_results: Dict,
         refined_scene: Dict,
         gt_images: torch.Tensor,
         gt_depths: torch.Tensor,
@@ -616,7 +674,6 @@ class Stage2CompleteLoss(nn.Module):
         Compute stage 2 complete loss.
 
         Args:
-            refinement_results: Output from Stage2Refiner
             refined_scene: Refined scene representation
             gt_images: Ground truth images
             gt_depths: Ground truth depths
@@ -637,7 +694,7 @@ class Stage2CompleteLoss(nn.Module):
             refined_scene, gt_images, gt_depths,
             intrinsics, extrinsics, sky_masks,
             sky_colors, sampled_frame_indices,
-            depth_scale_factor, is_context_frame
+            depth_scale_factor, camera_indices, frame_indices, is_context_frame
         )
 
         complete_loss_dict = render_loss_dict.copy()

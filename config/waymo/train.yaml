@@ -92,9 +92,6 @@ aggregator_all_detach_velocity: true       # Detach velocity to prevent gradient
 aggregator_all_supervise_target_frames: false  # Whether to supervise target frames in addition to context frames
                                            # false: Only supervise context frames (default)
                                            # true: Supervise both context and target frames
-# Stage2 configuration (rendering config for aggregator_all loss)
-stage2_render_only_dynamic: false          # Render only dynamic objects
-stage2_supervise_only_dynamic: false       # Supervise only dynamic regions
 
 # Rendering configuration (for self_render_loss and aggregator_all_loss)
 enable_voxel_pruning: true                 # Enable voxel pruning

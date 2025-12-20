@@ -52,6 +52,8 @@ from src.dynamic_processing import DynamicProcessor
 from src.dataset import get_data_loader
 from src.utils import training as misc
 from src.utils import NativeScalerWithGradNormCount as NativeScaler
+from src.utils.training_utils import strip_module, setup_for_distributed, save_current_code
+
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.autograd.set_detect_anomaly(True)
@@ -60,72 +62,6 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 
 printer = get_logger(__name__, log_level="DEBUG")
 
-def strip_module(state_dict):
-    """
-    Removes the 'module.' prefix from the keys of a state_dict.
-    Args:
-        state_dict (dict): The original state_dict with possible 'module.' prefixes.
-    Returns:
-        OrderedDict: A new state_dict with 'module.' prefixes removed.
-    """
-    new_state_dict = OrderedDict()
-    for k, v in state_dict.items():
-        name = k[7:] if k.startswith("module.") else k
-        new_state_dict[name] = v
-    return new_state_dict
-
-
-def setup_for_distributed(accelerator: Accelerator):
-    """
-    This function disables printing when not in master process
-    """
-    builtin_print = builtins.print
-
-    def print(*args, **kwargs):
-        force = kwargs.pop("force", False)
-        force = force or (accelerator.num_processes > 8)
-        if accelerator.is_main_process or force:
-            now = datetime.datetime.now().time()
-            builtin_print("[{}] ".format(now), end="")
-            builtin_print(*args, **kwargs)
-
-    builtins.print = print
-
-
-def save_current_code(outdir):
-    now = datetime.datetime.now()
-    date_time = now.strftime("%m_%d-%H:%M:%S")
-    src_dir = "."
-    dst_dir = os.path.join(outdir, "code", "{}".format(date_time))
-    shutil.copytree(
-        src_dir,
-        dst_dir,
-        ignore=shutil.ignore_patterns(
-            ".vscode*",
-            ".claude*",
-            "data*",
-            "results*",
-            "configs*",
-            "assets*",
-            "example*",
-            "checkpoints*",
-            "OLD*",
-            "logs*",
-            "out*",
-            "runs*",
-            "*.png",
-            "*.mp4",
-            "*__pycache__*",
-            "*.git*",
-            "*.idea*",
-            "*.zip",
-            "*.jpg",
-            "*.pt",
-            "*.pth",
-        ),
-        dirs_exist_ok=True,
-    )
-    return dst_dir
 
 
 def train(args):
@@ -170,7 +106,6 @@ def train(args):
         'rgb_weight': getattr(args, 'aggregator_all_render_rgb_weight', 1.0),
         'depth_weight': getattr(args, 'aggregator_all_render_depth_weight', 1.0),
         'lpips_weight': getattr(args, 'aggregator_all_render_lpips_weight', 0.1),
-        'render_only_dynamic': getattr(args, 'stage2_render_only_dynamic', False),
         'enable_voxel_pruning': getattr(args, 'enable_voxel_pruning', True),
         'voxel_size': getattr(args, 'voxel_size', 0.002),
         'supervise_target_frames': getattr(args, 'aggregator_all_supervise_target_frames', False),
@@ -212,19 +147,6 @@ def train(args):
         test=False,
         fixed_length=args.fixed_length
     )
-    # printer.info("Building test dataset %s", args.test_dataset)
-    # data_loader_test = {
-    #     dataset.split("(")[0]: build_dataset(
-    #         dataset,
-    #         args.batch_size,
-    #         args.num_workers,
-    #         accelerator=accelerator,
-    #         test=True,
-    #         fixed_length=True
-    #     )
-    #     for dataset in args.test_dataset.split("+")
-    # }
-
 
     printer.info("Loading model: %s", args.model)
     model = eval(args.model)
@@ -258,49 +180,6 @@ def train(args):
     # Load auxiliary models
     auxiliary_model_configs = getattr(args, "auxiliary_models", None)
     auxiliary_models = dict()
-    if auxiliary_model_configs is not None:
-        for model_name, model_config in auxiliary_model_configs.items():
-            if "DepthAnythingV2" in model_config:
-                try:
-                    dam2_path = os.path.join(os.path.dirname(__file__), 'src/dam2')
-                    if dam2_path not in sys.path:
-                        sys.path.insert(0, dam2_path)
-                    from depth_anything_v2.dpt import DepthAnythingV2
-
-                    encoder_match = re.search(r"encoder\s*=\s*\"([^\"]+)\"", model_config)
-                    offload_match = re.search(r"offload\s*=\s*(\"True\"|False)\b", model_config, re.IGNORECASE)
-
-                    if encoder_match:
-                        encoder = encoder_match.group(1)
-                        ckpt_path = os.path.join(os.path.dirname(__file__), f"src/depth_anything_v2_{encoder}.pth")
-                        offload = offload_match.group(1).lower() == "true" if offload_match else False
-
-
-                        model_configs = {
-                            'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
-                            'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
-                            'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
-                            'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
-                        }
-
-                        dam2_model = DepthAnythingV2(**model_configs[encoder])
-                        state_dict = torch.load(ckpt_path, map_location="cpu" if offload else device, weights_only=True)
-                        dam2_model.load_state_dict(state_dict)
-
-                        if not offload:
-                            dam2_model.to(device)
-
-                        dam2_model.eval()
-                        dam2_model.requires_grad_(False)
-
-
-                        auxiliary_models[model_name] = dam2_model
-                        printer.info(f"successfully load DAM2 model: {model_name}")
-                    else:
-                        printer.warning(f"Missing encoder or path for DAM2 model: {model_name}")
-                except Exception as e:
-                    printer.warning(f"Failed to load DAM2 model {model_name}: {e}")
-                    printer.info("Skipping DAM2 model loading due to error")
 
 
     param_groups = misc.get_parameter_groups(model, args.weight_decay)
@@ -363,13 +242,43 @@ def train(args):
                 if data_iter_step % args.accum_iter == 0:
                     misc.adjust_learning_rate(optimizer, epoch_f, args)
 
-                frame_sample_ratio = getattr(args, 'aggregator_frame_sample_ratio', 1.0)
+                # Always infer only context frames (like infer.py)
+                is_context_frame = vggt_batch.get('is_context_frame', None)
+
+                if is_context_frame is not None:
+                    context_mask = is_context_frame[0]
+                    context_indices = torch.where(context_mask)[0]
+                else:
+                    # If no context/target distinction, all frames are context frames
+                    context_indices = torch.arange(vggt_batch["images"].shape[1], device=vggt_batch["images"].device)
+
+                images = vggt_batch["images"]
+                intrinsics = vggt_batch.get("intrinsics")
+                extrinsics = vggt_batch.get("extrinsics")
+
                 preds = model(
-                    vggt_batch["images"],
-                    gt_extrinsics=vggt_batch.get("extrinsics"),
-                    gt_intrinsics=vggt_batch.get("intrinsics"),
-                    frame_sample_ratio=frame_sample_ratio
+                    images[:, context_indices],
+                    gt_extrinsics=extrinsics[:, context_indices] if extrinsics is not None else None,
+                    gt_intrinsics=intrinsics[:, context_indices] if intrinsics is not None else None,
+                    frame_sample_ratio=1.0
                 )
+
+                # Create context-only batch for all non-aggregator losses
+                vggt_batch_context = {
+                    'images': images[:, context_indices],
+                    'depths': vggt_batch.get('depths', None)[:, context_indices] if vggt_batch.get('depths') is not None else None,
+                    'intrinsics': intrinsics[:, context_indices] if intrinsics is not None else None,
+                    'extrinsics': extrinsics[:, context_indices] if extrinsics is not None else None,
+                    'point_masks': vggt_batch.get('point_masks', None)[:, context_indices] if vggt_batch.get('point_masks') is not None else None,
+                    'world_points': vggt_batch.get('world_points', None)[:, context_indices] if vggt_batch.get('world_points') is not None else None,
+                    'flowmap': vggt_batch.get('flowmap', None)[:, context_indices] if vggt_batch.get('flowmap') is not None else None,
+                    'segment_label': vggt_batch.get('segment_label', None)[:, context_indices] if vggt_batch.get('segment_label') is not None else None,
+                    'segment_mask': vggt_batch.get('segment_mask', None)[:, context_indices] if vggt_batch.get('segment_mask') is not None else None,
+                    'depth_scale_factor': vggt_batch.get('depth_scale_factor'),
+                    'sky_masks': vggt_batch.get('sky_masks', None)[:, context_indices] if vggt_batch.get('sky_masks') is not None else None,
+                    'camera_indices': vggt_batch.get('camera_indices', None)[:, context_indices] if vggt_batch.get('camera_indices') is not None else None,
+                    'frame_indices': vggt_batch.get('frame_indices', None)[:, context_indices] if vggt_batch.get('frame_indices') is not None else None,
+                }
 
                 # Stage 1 training logic
                 loss = 0.0
@@ -397,10 +306,10 @@ def train(args):
                 interval = getattr(args, 'flow_interval', 2)
 
                 # Self Render Loss
-                if loss_weights['self_render_weight'] > 0 and vggt_batch.get("images") is not None and vggt_batch.get("depths") is not None:
+                if loss_weights['self_render_weight'] > 0 and vggt_batch_context.get("images") is not None and vggt_batch_context.get("depths") is not None:
                     try:
                         self_loss_dict, _ = self_render_and_loss(
-                            vggt_batch=vggt_batch,
+                            vggt_batch=vggt_batch_context,
                             preds=preds,
                             enable_voxel_pruning=getattr(args, 'enable_voxel_pruning', True),
                             voxel_size=getattr(args, 'voxel_size', 0.002)
@@ -420,11 +329,11 @@ def train(args):
                 # GT Flow Loss Ours
                 if loss_weights['gt_flow_loss_ours_weight'] > 0 and \
                    preds.get("velocity") is not None and \
-                   vggt_batch.get("flowmap") is not None:
+                   vggt_batch_context.get("flowmap") is not None:
                     try:
                         gt_flow_loss_ours_dict = gt_flow_loss_ours(
                             preds["velocity"],
-                            vggt_batch
+                            vggt_batch_context
                         )
                         gt_flow_ours = gt_flow_loss_ours_dict.get("gt_flow_loss", 0.0)
                         loss += loss_weights['gt_flow_loss_ours_weight'] * gt_flow_ours
@@ -439,11 +348,11 @@ def train(args):
                         traceback.print_exc()
 
                 # Sky Opacity Loss
-                if loss_weights['sky_opacity_weight'] > 0 and preds.get("gaussian_params") is not None and vggt_batch.get("sky_masks") is not None:
+                if loss_weights['sky_opacity_weight'] > 0 and preds.get("gaussian_params") is not None and vggt_batch_context.get("sky_masks") is not None:
                     try:
                         sky_opacity_loss_dict = sky_opacity_loss(
                             preds["gaussian_params"],
-                            vggt_batch["sky_masks"],
+                            vggt_batch_context["sky_masks"],
                             weight=1.0
                         )
                         sky_opacity_loss_value = sky_opacity_loss_dict.get("sky_opacity_loss", 0.0)
@@ -467,7 +376,7 @@ def train(args):
                         segment_loss_dict = segment_loss(
                             preds["segment_logits"],
                             preds["segment_conf"],
-                            vggt_batch
+                            vggt_batch_context
                         )
                         segment_loss_value = segment_loss_dict.get("segment_loss", 0.0)
                         loss += loss_weights['segment_loss_weight'] * segment_loss_value
@@ -480,7 +389,7 @@ def train(args):
                     try:
                         camera_loss_dict = camera_loss(
                             [preds["pose_enc"]],
-                            vggt_batch,
+                            vggt_batch_context,
                         )
                         camera_loss_value = camera_loss_dict.get("loss_camera", 0.0)
                         loss += loss_weights['camera_loss_weight'] * camera_loss_value
@@ -494,7 +403,7 @@ def train(args):
                         depth_loss_dict = depth_loss(
                             preds["depth"],
                             preds["depth_conf"],
-                            vggt_batch,
+                            vggt_batch_context,
                             gradient_loss="grad",
                             valid_range=0.98
                         )
@@ -536,10 +445,29 @@ def train(args):
                         if args.aggregator_all_detach_velocity and 'velocity_global' in preds_for_dynamic:
                             preds_for_dynamic['velocity_global'] = preds_for_dynamic['velocity_global'].detach()
 
-                        result = dynamic_processor.process(preds_for_dynamic, vggt_batch)
+                        # Dynamic processor always uses context frames
+                        # Need to remap frame indices to continuous [0, 1, 2, ...] for processor
+                        original_frame_indices = vggt_batch.get('frame_indices', None)
+                        context_frame_indices_original = original_frame_indices[:, context_indices]
+                        unique_frames = torch.unique(context_frame_indices_original, sorted=True)
+                        frame_mapping = {int(f.item()): i for i, f in enumerate(unique_frames)}
 
+                        context_frame_indices_remapped = torch.tensor(
+                            [[frame_mapping[int(idx.item())] for idx in context_frame_indices_original[0]]],
+                            device=device
+                        )
+
+                        # Create batch with remapped frame indices for dynamic processor
+                        vggt_batch_for_dynamic = vggt_batch_context.copy()
+                        vggt_batch_for_dynamic['frame_indices'] = context_frame_indices_remapped
+
+                        result = dynamic_processor.process(preds_for_dynamic, vggt_batch_for_dynamic)
+
+                        # Remap dynamic objects frame indices from context back to global
+                        from src.utils.frame_mapping import remap_dynamic_objects_frame_indices
                         dynamic_objects_data = dynamic_processor.to_legacy_format(result)
-
+                        if frame_mapping is not None:
+                            remap_dynamic_objects_frame_indices(dynamic_objects_data, frame_mapping, device)
 
                         num_cars = len(dynamic_objects_data.get('dynamic_objects_cars', [])) if dynamic_objects_data else 0
                         num_people = len(dynamic_objects_data.get('dynamic_objects_people', [])) if dynamic_objects_data else 0
@@ -573,20 +501,67 @@ def train(args):
                             gt_images = vggt_batch['images']
                             gt_depths = vggt_batch.get('depths', torch.ones(B, S, H, W, device=device) * 5.0)
 
-                            intrinsics = preds['intrinsics']
-                            extrinsics = preds['extrinsics']
+                            # Handle intrinsics and extrinsics
+                            if supervise_target_frames and is_context_frame is not None:
+                                # When supervising target frames, use GT intrinsics/extrinsics for all frames
+                                intrinsics = vggt_batch.get('intrinsics')
+                                extrinsics = vggt_batch.get('extrinsics')
+                            else:
+                                # Original behavior: use predicted intrinsics/extrinsics
+                                intrinsics = preds['intrinsics']
+                                extrinsics = preds['extrinsics']
 
                             sky_masks = vggt_batch.get('sky_masks', None)
 
-                            sky_colors = preds.get('sky_colors', None)
-                            sampled_frame_indices = preds.get('sampled_frame_indices', None)
+                            # Handle sky colors
+                            context_sky_colors = preds.get('sky_colors', None)
+                            context_sampled_indices = preds.get('sampled_frame_indices', None)
+
+                            if not (supervise_target_frames and is_context_frame is not None):
+                                # Original behavior: only use context frame sky colors
+                                sky_colors = context_sky_colors
+                                sampled_frame_indices = context_sampled_indices
+                            elif context_sky_colors is None or context_sampled_indices is None:
+                                # No sky colors available
+                                sky_colors = None
+                                sampled_frame_indices = None
+                            else:
+                                # Supervise target frames: concatenate context + target sky colors
+                                target_mask = ~is_context_frame[0]
+                                target_indices = torch.where(target_mask)[0]
+
+                                # If no target frames or no sky_token, use only context sky colors
+                                sky_token = preds.get('sky_token', None)
+                                if len(target_indices) == 0 or sky_token is None:
+                                    sky_colors = context_sky_colors
+                                    sampled_frame_indices = context_sampled_indices
+                                else:
+                                    # Infer target frame sky colors
+                                    target_intrinsics = intrinsics[0, target_indices]
+                                    target_extrinsics = extrinsics[0, target_indices]
+                                    target_sky_colors = model.infer_target_frame_sky_colors(
+                                        sky_token=sky_token,
+                                        target_frame_intrinsics=target_intrinsics,
+                                        target_frame_extrinsics=target_extrinsics,
+                                        image_size=(H, W)
+                                    ).unsqueeze(0)
+
+                                    # Merge context and target sky colors in correct frame order
+                                    context_indices = torch.where(is_context_frame[0])[0]
+                                    num_frames = len(context_indices) + len(target_indices)
+
+                                    sky_colors = torch.zeros(
+                                        1, num_frames, 3, H, W,
+                                        dtype=context_sky_colors.dtype,
+                                        device=context_sky_colors.device
+                                    )
+                                    sky_colors[:, context_indices] = context_sky_colors
+                                    sky_colors[:, target_indices] = target_sky_colors
+
+                                    sampled_frame_indices = torch.arange(num_frames, device=device)
 
 
                             aggregator_all_loss_dict = stage2_criterion(
-                                refinement_results={
-                                    'refined_dynamic_objects_cars': dynamic_objects_cars,
-                                    'refined_dynamic_objects_people': dynamic_objects_people
-                                },
                                 refined_scene=aggregator_all_scene,
                                 gt_images=gt_images,
                                 gt_depths=gt_depths,
