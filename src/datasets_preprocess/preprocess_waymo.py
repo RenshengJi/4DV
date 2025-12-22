@@ -23,7 +23,6 @@ import numpy as np
 
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 import sys
-# 添加vggt路径
 sys.path.append(os.path.join(os.path.dirname(__file__), '../src/'))
 import cv2
 
@@ -32,14 +31,11 @@ import gc
 
 tf.enable_eager_execution()
 
-import path_to_root  # noqa
-from src.dust3r.utils.geometry import geotrf, inv
-from src.dust3r.utils.image import imread_cv2
-from src.dust3r.utils.parallel import parallel_processes as parallel_map
+from src.utils.geometry import geotrf, inv
+from src.utils.image import imread_cv2
+from src.utils.parallel import parallel_processes as parallel_map
 from datasets_preprocess.utils import cropping
 
-# 导入SAM预处理模块
-from sam_preprocessing import SAMPreprocessor
 
 
 def project_vehicle_to_image(vehicle_pose, calibration, points):
@@ -88,35 +84,14 @@ def get_parser():
     parser.add_argument("--precomputed_pairs")
     parser.add_argument("--output_dir", default="data/waymo/train_full_test")
     parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument("--enable_sam", action="store_true", help="Enable SAM mask generation")
-    parser.add_argument("--sam_model_type", default="sam2", choices=["sam2", "sam"], help="SAM model type")
-    parser.add_argument("--sam_device", default="cuda", help="Device for SAM model")
-    parser.add_argument("--sam_config_file", help="SAM2 config file")
-    parser.add_argument("--sam_ckpt_path", help="SAM model checkpoint path")
     parser.add_argument("--start", type=int, default=0, help="Start index of sequences to process (inclusive)")
     parser.add_argument("--end", type=int, default=None, help="End index of sequences to process (exclusive)")
     return parser
 
 
-def main(waymo_root, pairs_path, output_dir, workers=1, enable_sam=False, sam_model_type="sam2",
-         sam_device="cuda", sam_config_file=None, sam_ckpt_path=None, start=0, end=None):
+def main(waymo_root, pairs_path, output_dir, workers=1, start=0, end=None):
     extract_frames(waymo_root, output_dir, workers=workers, start=start, end=end)
-    make_crops(output_dir, workers=args.workers, enable_sam=enable_sam, sam_model_type=sam_model_type,
-               sam_device=sam_device, sam_config_file=sam_config_file, sam_ckpt_path=sam_ckpt_path,
-               start=start, end=end)
-
-    # # make sure all pairs are there
-    # with np.load(pairs_path) as data:
-    #     scenes = data["scenes"]
-    #     frames = data["frames"]
-    #     pairs = data["pairs"]  # (array of (scene_id, img1_id, img2_id)
-
-    # for scene_id, im1_id, im2_id in pairs:
-    #     for im_id in (im1_id, im2_id):
-    #         path = osp.join(output_dir, scenes[scene_id], frames[im_id] + ".jpg")
-    #         assert osp.isfile(
-    #             path
-    #         ), f"Missing a file at {path=}\nDid you download all .tfrecord files?"
+    make_crops(output_dir, workers=args.workers, start=start, end=end)
 
     shutil.rmtree(osp.join(output_dir, "tmp"))
     print("Done! all data generated at", output_dir)
@@ -668,39 +643,23 @@ def extract_frames_one_seq_generator(filename):
         gc.collect()
 
 
-def make_crops(output_dir, workers=16, enable_sam=False, sam_model_type="sam2",
-               sam_device="cuda", sam_config_file=None, sam_ckpt_path=None, start=0, end=None, **kw):
+def make_crops(output_dir, workers=16, start=0, end=None, **kw):
     tmp_dir = osp.join(output_dir, "tmp")
     sequences = _list_sequences(tmp_dir)
     # Select sequences based on start and end indices
     if end is None:
         end = len(sequences)
     sequences = sequences[start:end]
-    args = [(tmp_dir, output_dir, seq, enable_sam, sam_model_type, sam_device, sam_config_file, sam_ckpt_path) for seq in sequences]
+    args = [(tmp_dir, output_dir, seq) for seq in sequences]
     parallel_map(crop_one_seq, args, star_args=True, workers=workers, front_num=0)
 
 
-def crop_one_seq(input_dir, output_dir, seq, enable_sam=False, sam_model_type="sam2", 
-                 sam_device="cuda", sam_config_file=None, sam_ckpt_path=None, resolution=512):
+def crop_one_seq(input_dir, output_dir, seq, resolution=512):
     seq_dir = osp.join(input_dir, seq)
     out_dir = osp.join(output_dir, seq)
     if osp.isfile(osp.join(out_dir, "00100_1.jpg")):
         return
     os.makedirs(out_dir, exist_ok=True)
-    
-    # 初始化SAM预处理器
-    sam_preprocessor = None
-    if enable_sam:
-        try:
-            sam_preprocessor = SAMPreprocessor(
-                model_type=sam_model_type,
-                device=sam_device,
-                config_file=sam_config_file,
-                ckpt_path=sam_ckpt_path
-            )
-        except Exception as e:
-            print(f"Failed to initialize SAM preprocessor for sequence {seq}: {e}")
-            enable_sam = False
 
     # load calibration file
     try:
@@ -730,8 +689,6 @@ def crop_one_seq(input_dir, output_dir, seq, enable_sam=False, sam_model_type="s
 
     frames = sorted(f[:-3] for f in os.listdir(seq_dir) if f.endswith(".jpg"))
 
-    # from dust3r.viz import SceneViz
-    # viz = SceneViz()
 
     for frame in tqdm(frames, leave=False):
         cam_idx = frame[-2]  # cam index
@@ -881,22 +838,6 @@ def crop_one_seq(input_dir, output_dir, seq, enable_sam=False, sam_model_type="s
             cam2world=cam2world,
             distortion=cam_distortion[cam_idx],
         )
-        
-        # 生成SAM掩码
-        if enable_sam and sam_preprocessor is not None:
-            try:
-                # 创建SAM掩码输出目录
-                sam_output_dir = osp.join(out_dir, "sam_masks")
-                os.makedirs(sam_output_dir, exist_ok=True)
-                
-                # 生成SAM掩码文件路径
-                sam_output_path = osp.join(sam_output_dir, frame + "json")
-                
-                if not osp.exists(sam_output_path):  # 避免重复处理
-                    masks = sam_preprocessor.generate_masks(image)
-                    sam_preprocessor.save_masks(masks, sam_output_path)
-            except Exception as e:
-                print(f"Error generating SAM masks for {seq}/{frame}: {e}")
 
         # viz.add_rgbd(np.asarray(image), depthmap, intrinsics2, cam2world)
     # viz.show()
@@ -912,6 +853,4 @@ if __name__ == "__main__":
     # debugpy.wait_for_client()
 
     main(args.waymo_dir, args.precomputed_pairs, args.output_dir, workers=args.workers,
-         enable_sam=args.enable_sam, sam_model_type=args.sam_model_type, sam_device=args.sam_device,
-         sam_config_file=args.sam_config_file, sam_ckpt_path=args.sam_ckpt_path,
          start=args.start, end=args.end)

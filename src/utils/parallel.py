@@ -1,24 +1,23 @@
-# Copyright (C) 2024-present Naver Corporation. All rights reserved.
-# Licensed under CC BY-NC-SA 4.0 (non-commercial use only).
-#
-# --------------------------------------------------------
-# utilitary functions for multiprocessing
-# --------------------------------------------------------
+"""Parallel execution utility functions extracted from dust3r."""
+
 from tqdm import tqdm
 from multiprocessing.dummy import Pool as ThreadPool
 from multiprocessing import cpu_count
 
 
-def parallel_threads(
-    function,
-    args,
-    workers=0,
-    star_args=False,
-    kw_args=False,
-    front_num=1,
-    Pool=ThreadPool,
-    **tqdm_kw
-):
+def starcall(args):
+    """Convenient wrapper for Process.Pool."""
+    function, args = args
+    return function(*args)
+
+
+def starstarcall(args):
+    """Convenient wrapper for Process.Pool."""
+    function, args = args
+    return function(**args)
+
+
+def parallel_threads(function, args, workers=0, star_args=False, kw_args=False, front_num=1, Pool=ThreadPool, **tqdm_kw):
     """tqdm but with parallel execution.
 
     Will essentially return
@@ -27,14 +26,27 @@ def parallel_threads(
               function(**arg) # if kw_args is True
               for arg in args]
 
+    Args:
+        function: Function to apply to each argument.
+        args: Iterable of arguments.
+        workers: Number of worker threads/processes (0 means use all CPUs).
+        star_args: If True, unpack args as *args.
+        kw_args: If True, unpack args as **kwargs.
+        front_num: Number of first elements to execute sequentially (useful for debugging).
+        Pool: Pool class to use (ThreadPool or multiprocessing.Pool).
+        **tqdm_kw: Additional keyword arguments for tqdm.
+
+    Returns:
+        List of results from applying function to each arg.
+
     Note:
-        the <front_num> first elements of args will not be parallelized.
+        The <front_num> first elements of args will not be parallelized.
         This can be useful for debugging.
     """
     while workers <= 0:
         workers += cpu_count()
     if workers == 1:
-        front_num = float("inf")
+        front_num = float('inf')
 
     # convert into an iterable
     try:
@@ -50,9 +62,7 @@ def parallel_threads(
             a = next(args)
         except StopIteration:
             return front  # end of the iterable
-        front.append(
-            function(*a) if star_args else function(**a) if kw_args else function(a)
-        )
+        front.append(function(*a) if star_args else function(**a) if kw_args else function(a))
 
     # then parallel execution
     out = []
@@ -71,20 +81,11 @@ def parallel_threads(
 
 
 def parallel_processes(*args, **kwargs):
-    """Same as parallel_threads, with processes"""
+    """Same as parallel_threads, with processes.
+
+    Uses multiprocessing.Pool instead of ThreadPool for true parallelism
+    across CPU cores rather than cooperative multitasking.
+    """
     import multiprocessing as mp
-
-    kwargs["Pool"] = mp.Pool
+    kwargs['Pool'] = mp.Pool
     return parallel_threads(*args, **kwargs)
-
-
-def starcall(args):
-    """convenient wrapper for Process.Pool"""
-    function, args = args
-    return function(*args)
-
-
-def starstarcall(args):
-    """convenient wrapper for Process.Pool"""
-    function, args = args
-    return function(**args)
