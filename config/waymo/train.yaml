@@ -24,7 +24,7 @@ model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=0, use_gs_he
 
 # pretrained: model.pt
 # pretrained_velocity: False
-pretrained_velocity: "checkpoints/new/start/checkpoint-epoch_0_4166.pth"
+pretrained_velocity: "checkpoints/new/start/checkpoint-final.pth"
 
 # VGGT freeze strategy configuration
 # Options: "none", "noap", null (null means no freeze strategy, keep model default behavior)
@@ -82,7 +82,7 @@ scale_loss_weight: 1.0                     # Scene scale prediction loss weight
 
 # Aggregator_all Render Loss (replaces Stage2 refine network rendering loss)
 # This loss directly uses dynamic object processing + rendering supervision in Stage1, skipping Stage2 refine network
-aggregator_all_start_iter: 10000               # Iteration to start aggregator_all loss (default 50k)
+aggregator_all_start_iter: 0               # Iteration to start aggregator_all loss (default 50k)
 aggregator_all_render_rgb_weight: 1.0      # Aggregator_all RGB rendering loss weight
 aggregator_all_render_depth_weight: 1.0    # Aggregator_all depth rendering loss weight
 aggregator_all_render_lpips_weight: 0.1    # Aggregator_all LPIPS rendering loss weight
@@ -111,7 +111,7 @@ velocity_transform_mode: "procrustes"      # Velocity transform mode: "simple"(T
 
 # =============== Dataset Configuration ===============
 
-train_dataset: 500000 @ Waymo_Multi(
+train_dataset: 200000 @ Waymo_Multi(
   ROOT="data/waymo/train_full",
   valid_camera_id_list=["1", "2", "3"],
   intervals=[5],
@@ -134,7 +134,7 @@ gradient_checkpointing: True
 epochs: 1
 start_epoch: 0
 weight_decay: 0.05
-lr: 3e-5
+lr: 1e-5
 min_lr: 1e-8
 warmup_epochs: 0.02
 amp: 1
@@ -158,7 +158,7 @@ num_imgs_vis: 4
 
 # =============== Output Configuration ===============
 save_dir: 'checkpoints/new'
-exp_name: 'start'
+exp_name: 'resume_fix'
 task: 'cut3r'
 logdir: ./${save_dir}/${exp_name}/logs
 output_dir: ./${save_dir}/${exp_name}/

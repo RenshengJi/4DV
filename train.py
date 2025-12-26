@@ -63,6 +63,35 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 printer = get_logger(__name__, log_level="DEBUG")
 
 
+def _prepare_all_frame_sky_colors(preds, model, intrinsics, extrinsics, is_context_frame, H, W, device):
+    """Prepare sky colors for all frames (context + target)."""
+    context_sky_colors = preds.get('sky_colors', None)
+    if context_sky_colors is None:
+        return None
+
+    sky_token = preds.get('sky_token', None)
+    target_indices = torch.where(~is_context_frame[0])[0]
+
+    if len(target_indices) == 0 or sky_token is None:
+        return context_sky_colors
+
+    # Infer target frame sky colors
+    target_sky_colors = model.infer_target_frame_sky_colors(
+        sky_token=sky_token,
+        target_frame_intrinsics=intrinsics[0, target_indices],
+        target_frame_extrinsics=extrinsics[0, target_indices],
+        image_size=(H, W)
+    ).unsqueeze(0)
+
+    # Merge context and target sky colors
+    context_indices = torch.where(is_context_frame[0])[0]
+    S = len(context_indices) + len(target_indices)
+    sky_colors = torch.zeros(1, S, 3, H, W, dtype=context_sky_colors.dtype, device=device)
+    sky_colors[:, context_indices] = context_sky_colors
+    sky_colors[:, target_indices] = target_sky_colors
+
+    return sky_colors
+
 
 def train(args):
 
@@ -500,66 +529,20 @@ def train(args):
                             B, S, C, H, W = vggt_batch['images'].shape
                             gt_images = vggt_batch['images']
                             gt_depths = vggt_batch.get('depths', torch.ones(B, S, H, W, device=device) * 5.0)
-
-                            # Handle intrinsics and extrinsics
-                            if supervise_target_frames and is_context_frame is not None:
-                                # When supervising target frames, use GT intrinsics/extrinsics for all frames
-                                intrinsics = vggt_batch.get('intrinsics')
-                                extrinsics = vggt_batch.get('extrinsics')
-                            else:
-                                # Original behavior: use predicted intrinsics/extrinsics
-                                intrinsics = preds['intrinsics']
-                                extrinsics = preds['extrinsics']
-
                             sky_masks = vggt_batch.get('sky_masks', None)
 
-                            # Handle sky colors
-                            context_sky_colors = preds.get('sky_colors', None)
-                            context_sampled_indices = preds.get('sampled_frame_indices', None)
+                            use_all_frames = supervise_target_frames and is_context_frame is not None
 
-                            if not (supervise_target_frames and is_context_frame is not None):
-                                # Original behavior: only use context frame sky colors
-                                sky_colors = context_sky_colors
-                                sampled_frame_indices = context_sampled_indices
-                            elif context_sky_colors is None or context_sampled_indices is None:
-                                # No sky colors available
-                                sky_colors = None
-                                sampled_frame_indices = None
+                            if use_all_frames:
+                                intrinsics = vggt_batch.get('intrinsics')
+                                extrinsics = vggt_batch.get('extrinsics')
+                                sky_colors = _prepare_all_frame_sky_colors(
+                                    preds, model, intrinsics, extrinsics, is_context_frame, H, W, device
+                                )
                             else:
-                                # Supervise target frames: concatenate context + target sky colors
-                                target_mask = ~is_context_frame[0]
-                                target_indices = torch.where(target_mask)[0]
-
-                                # If no target frames or no sky_token, use only context sky colors
-                                sky_token = preds.get('sky_token', None)
-                                if len(target_indices) == 0 or sky_token is None:
-                                    sky_colors = context_sky_colors
-                                    sampled_frame_indices = context_sampled_indices
-                                else:
-                                    # Infer target frame sky colors
-                                    target_intrinsics = intrinsics[0, target_indices]
-                                    target_extrinsics = extrinsics[0, target_indices]
-                                    target_sky_colors = model.infer_target_frame_sky_colors(
-                                        sky_token=sky_token,
-                                        target_frame_intrinsics=target_intrinsics,
-                                        target_frame_extrinsics=target_extrinsics,
-                                        image_size=(H, W)
-                                    ).unsqueeze(0)
-
-                                    # Merge context and target sky colors in correct frame order
-                                    context_indices = torch.where(is_context_frame[0])[0]
-                                    num_frames = len(context_indices) + len(target_indices)
-
-                                    sky_colors = torch.zeros(
-                                        1, num_frames, 3, H, W,
-                                        dtype=context_sky_colors.dtype,
-                                        device=context_sky_colors.device
-                                    )
-                                    sky_colors[:, context_indices] = context_sky_colors
-                                    sky_colors[:, target_indices] = target_sky_colors
-
-                                    sampled_frame_indices = torch.arange(num_frames, device=device)
-
+                                intrinsics = preds['intrinsics']
+                                extrinsics = preds['extrinsics']
+                                sky_colors = preds.get('sky_colors', None)
 
                             aggregator_all_loss_dict = stage2_criterion(
                                 refined_scene=aggregator_all_scene,
@@ -569,7 +552,6 @@ def train(args):
                                 extrinsics=extrinsics,
                                 sky_masks=sky_masks,
                                 sky_colors=sky_colors,
-                                sampled_frame_indices=sampled_frame_indices,
                                 depth_scale_factor=vggt_batch.get('depth_scale_factor', None),
                                 camera_indices=vggt_batch.get('camera_indices', None),
                                 frame_indices=vggt_batch.get('frame_indices', None),

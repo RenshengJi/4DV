@@ -314,29 +314,30 @@ def _extract_pedestrian_velocities(
     if velocity_global is None:
         return None
 
+    num_views = velocity_global.shape[1]
     frame_velocities = {}
 
     for frame_idx, view_dict in frame_pixel_indices.items():
         frame_vel_list = []
 
         for view_idx, pixel_list in view_dict.items():
-            if len(pixel_list) == 0:
+            if len(pixel_list) == 0 or view_idx >= num_views:
                 continue
 
             vel_map = velocity_global[0, view_idx]  # [H, W, 3]
             H_vel, W_vel = vel_map.shape[:2]
 
-            # Extract velocities for these pixels
-            for pixel_idx in pixel_list:
-                v = pixel_idx // W_vel
-                u = pixel_idx % W_vel
-                if v < H_vel and u < W_vel:
-                    pixel_vel = vel_map[v, u]
-                    frame_vel_list.append(pixel_vel)
+            pixel_tensor = torch.tensor(pixel_list, dtype=torch.long, device=vel_map.device)
+            v_coords = pixel_tensor // W_vel
+            u_coords = pixel_tensor % W_vel
+            valid = (v_coords >= 0) & (v_coords < H_vel) & (u_coords >= 0) & (u_coords < W_vel)
+
+            if valid.any():
+                pixel_vels = vel_map[v_coords[valid], u_coords[valid]]
+                frame_vel_list.append(pixel_vels)
 
         if frame_vel_list:
-            # Average velocity for this frame
-            avg_velocity = torch.stack(frame_vel_list).mean(dim=0)
-            frame_velocities[frame_idx] = avg_velocity
+            all_vels = torch.cat(frame_vel_list, dim=0)
+            frame_velocities[frame_idx] = all_vels.mean(dim=0)
 
     return frame_velocities if frame_velocities else None

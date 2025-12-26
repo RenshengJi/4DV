@@ -71,6 +71,13 @@ def _remap_object_frame_indices(
             for ctx_frame, gaussians in obj_data['frame_gaussians'].items()
         }
 
+    # Remap frame_velocities (for people)
+    if obj_data.get('frame_velocities') is not None:
+        obj_data['frame_velocities'] = {
+            context_to_global[ctx_frame]: velocity
+            for ctx_frame, velocity in obj_data['frame_velocities'].items()
+        }
+
     # Remap frame_pixel_indices
     if obj_data.get('frame_pixel_indices') is not None:
         obj_data['frame_pixel_indices'] = {

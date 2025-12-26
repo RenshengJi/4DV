@@ -245,7 +245,6 @@ class Stage2RenderLoss(nn.Module):
         extrinsics: torch.Tensor,
         sky_masks: Optional[torch.Tensor] = None,
         sky_colors: Optional[torch.Tensor] = None,
-        sampled_frame_indices: Optional[torch.Tensor] = None,
         depth_scale_factor: Optional[torch.Tensor] = None,
         camera_indices: Optional[torch.Tensor] = None,
         frame_indices: Optional[torch.Tensor] = None,
@@ -261,8 +260,7 @@ class Stage2RenderLoss(nn.Module):
             intrinsics: [B, S, 3, 3] - Camera intrinsics
             extrinsics: [B, S, 4, 4] - Camera extrinsics
             sky_masks: [B, S, H, W] - Sky region masks
-            sky_colors: [B, num_frames, 3, H, W] - Sky colors for compositing
-            sampled_frame_indices: [num_frames] - Sampled frame indices
+            sky_colors: [B, S, 3, H, W] - Sky colors for compositing
             depth_scale_factor: Depth scale factor for voxel pruning
             camera_indices: [B, S] - Camera indices for multi-camera mode
             frame_indices: [B, S] - Frame indices for multi-camera mode (temporal frame indices)
@@ -290,37 +288,30 @@ class Stage2RenderLoss(nn.Module):
         rendered_depths = []
         frame_indices_to_render = []
 
-        actual_S = min(S, intrinsics.shape[1], extrinsics.shape[1])
+        num_camera_frames = intrinsics.shape[1]
+        camera_idx = 0
 
-        for frame_idx in range(actual_S):
-            # Skip frames that don't need supervision
+        for frame_idx in range(S):
             if not supervise_mask[frame_idx]:
                 continue
+            if camera_idx >= num_camera_frames:
+                break
 
-            frame_intrinsic = intrinsics[0, frame_idx]
-            frame_extrinsic = extrinsics[0, frame_idx]
-
-            # Extract temporal frame index for dynamic object transform lookup
-            temporal_frame_idx = frame_idx
-            if frame_indices is not None:
-                temporal_frame_idx = int(frame_indices[0, frame_idx].item())
+            frame_intrinsic = intrinsics[0, camera_idx]
+            frame_extrinsic = extrinsics[0, camera_idx]
+            temporal_frame_idx = int(frame_indices[0, frame_idx].item())
 
             rendered_rgb, rendered_depth, rendered_alpha = self._render_frame(
                 refined_scene, frame_intrinsic, frame_extrinsic, H, W, temporal_frame_idx,
                 depth_scale_factor=depth_scale_factor
             )
 
-            if sky_colors is not None and sampled_frame_indices is not None:
-                if not isinstance(sampled_frame_indices, torch.Tensor):
-                    sampled_frame_indices = torch.tensor(sampled_frame_indices, device=device)
+            if sky_colors is not None:
+                frame_sky_color = sky_colors[0, camera_idx]
+                alpha_3ch = rendered_alpha.unsqueeze(0)
+                rendered_rgb = alpha_3ch * rendered_rgb + (1 - alpha_3ch) * frame_sky_color
 
-                matches = (sampled_frame_indices == frame_idx)
-                if matches.any():
-                    sky_idx = matches.nonzero(as_tuple=True)[0].item()
-                    frame_sky_color = sky_colors[0, sky_idx]
-                    alpha_3ch = rendered_alpha.unsqueeze(0)
-                    rendered_rgb = alpha_3ch * rendered_rgb + (1 - alpha_3ch) * frame_sky_color
-
+            camera_idx += 1
             rendered_images.append(rendered_rgb)
             rendered_depths.append(rendered_depth)
             frame_indices_to_render.append(frame_idx)
@@ -664,7 +655,6 @@ class Stage2CompleteLoss(nn.Module):
         extrinsics: torch.Tensor,
         sky_masks: Optional[torch.Tensor] = None,
         sky_colors: Optional[torch.Tensor] = None,
-        sampled_frame_indices: Optional[torch.Tensor] = None,
         depth_scale_factor: Optional[torch.Tensor] = None,
         camera_indices: Optional[torch.Tensor] = None,
         frame_indices: Optional[torch.Tensor] = None,
@@ -680,8 +670,7 @@ class Stage2CompleteLoss(nn.Module):
             intrinsics: Camera intrinsics
             extrinsics: Camera extrinsics
             sky_masks: Sky region masks
-            sky_colors: [B, num_frames, 3, H, W] - Sky colors
-            sampled_frame_indices: [num_frames] - Sampled frame indices
+            sky_colors: [B, S, 3, H, W] - Sky colors
             depth_scale_factor: Depth scale factor for voxel pruning
             camera_indices: [B, S_total] - Camera indices for multi-camera mode
             frame_indices: [B, S_total] - Frame indices for multi-camera mode
@@ -693,8 +682,7 @@ class Stage2CompleteLoss(nn.Module):
         render_loss_dict = self.render_loss(
             refined_scene, gt_images, gt_depths,
             intrinsics, extrinsics, sky_masks,
-            sky_colors, sampled_frame_indices,
-            depth_scale_factor, camera_indices, frame_indices, is_context_frame
+            sky_colors, depth_scale_factor, camera_indices, frame_indices, is_context_frame
         )
 
         complete_loss_dict = render_loss_dict.copy()
