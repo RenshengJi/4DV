@@ -35,6 +35,10 @@ step: 1
 # Single sample mode (used when batch_mode=false)
 single_idx: 0
 
+# Start frame position (null for random, int for fixed position)
+# Useful for testing specific frame ranges in a scene
+start_frame: null
+
 # Device configuration
 device: "cuda"
 

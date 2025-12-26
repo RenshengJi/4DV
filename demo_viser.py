@@ -115,9 +115,16 @@ def load_dataset(dataset_cfg: str):
     return dataset
 
 
-def prepare_scene_data(model, dataset, idx: int, device: torch.device) -> Dict:
+def prepare_scene_data(model, dataset, idx: int, device: torch.device, start_frame: int = None) -> Dict:
     """
     Run inference and prepare scene data for visualization.
+
+    Args:
+        model: VGGT model
+        dataset: Dataset
+        idx: Scene index
+        device: Device
+        start_frame: Start frame position (None for random, int for fixed)
 
     Returns dict with:
         - images: (S, 3, H, W)
@@ -131,9 +138,14 @@ def prepare_scene_data(model, dataset, idx: int, device: torch.device) -> Dict:
         - H, W: image dimensions
     """
     print(f"\nProcessing scene index: {idx}")
+    if start_frame is not None:
+        print(f"Start frame: {start_frame}")
 
     from dataset import vggt_collate_fn
-    views_list = dataset[idx]
+    if start_frame is not None and hasattr(dataset, 'get_views_with_start_frame'):
+        views_list = dataset.get_views_with_start_frame(idx, start_frame=start_frame)
+    else:
+        views_list = dataset[idx]
     vggt_batch = vggt_collate_fn([views_list])
 
     for key in vggt_batch:
@@ -679,6 +691,7 @@ def main(cfg: OmegaConf):
     parser = argparse.ArgumentParser(description="Viser 3D Visualization Demo")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint")
     parser.add_argument("--data_idx", type=int, default=None, help="Scene index to visualize")
+    parser.add_argument("--start_frame", type=int, default=None, help="Start frame position")
     parser.add_argument("--port", type=int, default=8080, help="Viser server port")
     parser.add_argument("--conf_threshold", type=float, default=50.0, help="Confidence percentile threshold")
     parser.add_argument("--background_mode", action="store_true", help="Run in background mode")
@@ -701,10 +714,11 @@ def main(cfg: OmegaConf):
     dataset = load_dataset(cfg.infer_dataset)
 
     idx = args.data_idx if args.data_idx is not None else cfg.single_idx
+    start_frame = args.start_frame if args.start_frame is not None else cfg.get('start_frame', None)
 
     with tf32_off():
         with torch.no_grad():
-            scene_data = prepare_scene_data(model, dataset, idx, device)
+            scene_data = prepare_scene_data(model, dataset, idx, device, start_frame=start_frame)
 
     viser_wrapper(
         scene_data,

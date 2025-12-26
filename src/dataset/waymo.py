@@ -485,3 +485,130 @@ class WaymoDataset(BaseDataset):
             view['num_total_frames'] = num_total_frames
 
         return views
+
+    def get_views_with_start_frame(self, idx, start_frame=0, camera_id=None):
+        """
+        Load views for a given scene with specified start frame (for inference/testing).
+
+        Args:
+            idx: Scene index
+            start_frame: Start frame position (default 0)
+            camera_id: Specific camera ID to use (default None, uses first available)
+
+        Returns:
+            List of view dictionaries
+        """
+        rng = np.random.default_rng(seed=idx)
+
+        scene_name = self.scene_names[idx]
+        scene_dir = osp.join(self.ROOT, scene_name)
+        seq2frames = self.scene_data[scene_name]
+
+        resolution = self._resolutions[0]
+        num_context_frames = self.num_views
+        interval = self._intervals[0]
+
+        views = []
+
+        if self.multi_camera_mode:
+            available_cameras = sorted(list(seq2frames.keys()))
+            selected_cameras = available_cameras
+            min_frames = min(len(seq2frames[cam_id]) for cam_id in selected_cameras)
+
+            required_frames = num_context_frames * interval
+            if start_frame + required_frames > min_frames:
+                start_frame = max(0, min_frames - required_frames)
+
+            all_positions = [start_frame + i for i in range(required_frames)]
+            context_positions = [start_frame + i * interval for i in range(num_context_frames)]
+
+            for camera_idx, cam_id in enumerate(selected_cameras):
+                frame_ids = seq2frames[cam_id]
+                for frame_idx_in_sequence, pos in enumerate(all_positions):
+                    frame_id = frame_ids[pos]
+                    is_context = pos in context_positions
+                    view_dict = self._load_single_view(
+                        scene_dir=scene_dir,
+                        camera_id=cam_id,
+                        frame_id=frame_id,
+                        resolution=resolution,
+                        rng=rng,
+                        scene_name=scene_name,
+                        idx=idx,
+                        camera_idx=camera_idx,
+                        frame_idx=frame_idx_in_sequence,
+                        interval=interval,
+                        is_context_frame=is_context
+                    )
+                    views.append(view_dict)
+
+            num_cameras = len(selected_cameras)
+            num_total_frames = len(all_positions)
+        else:
+            available_cameras = sorted(list(seq2frames.keys()))
+            cam_id = camera_id if camera_id in available_cameras else available_cameras[0]
+            frame_ids = seq2frames[cam_id]
+
+            required_frames = num_context_frames * interval
+            if start_frame + required_frames > len(frame_ids):
+                start_frame = max(0, len(frame_ids) - required_frames)
+
+            all_positions = [start_frame + i for i in range(required_frames)]
+            context_positions = [start_frame + i * interval for i in range(num_context_frames)]
+
+            for frame_idx_in_sequence, pos in enumerate(all_positions):
+                frame_id = frame_ids[pos]
+                is_context = pos in context_positions
+                view_dict = self._load_single_view(
+                    scene_dir=scene_dir,
+                    camera_id=cam_id,
+                    frame_id=frame_id,
+                    resolution=resolution,
+                    rng=rng,
+                    scene_name=scene_name,
+                    idx=idx,
+                    camera_idx=0,
+                    frame_idx=frame_idx_in_sequence,
+                    interval=interval,
+                    is_context_frame=is_context
+                )
+                views.append(view_dict)
+
+            num_cameras = 1
+            num_total_frames = len(all_positions)
+
+        # Apply same transformations as _get_views
+        reference_cam_pose = views[0]['camera_pose']
+        world_to_ref = torch.linalg.inv(reference_cam_pose)
+
+        for view in views:
+            pts3d_cam = view['pts3d']
+            H, W, _ = pts3d_cam.shape
+            cam_to_world = view['camera_pose']
+            cam_to_ref = torch.matmul(world_to_ref, cam_to_world)
+            pts3d_flat = pts3d_cam.reshape(-1, 3)
+            pts3d_ref = torch.matmul(cam_to_ref[:3, :3], pts3d_flat.T).T + cam_to_ref[:3, 3]
+            view['pts3d'] = pts3d_ref.reshape(H, W, 3)
+            view['camera_pose'] = torch.linalg.inv(cam_to_ref)
+
+        all_pts = []
+        for view in views:
+            pts = view['pts3d']
+            mask = view['valid_mask'].bool()
+            all_pts.append(pts[mask])
+
+        all_pts = torch.cat(all_pts, dim=0)
+        dist_avg = all_pts.norm(dim=-1).mean()
+        depth_scale_factor = 1.0 / dist_avg
+
+        for view in views:
+            view['depthmap'] = view['depthmap'] * depth_scale_factor
+            view['camera_pose'][:3, 3] = view['camera_pose'][:3, 3] * depth_scale_factor
+            view['pts3d'] = view['pts3d'] * depth_scale_factor
+            if 'flowmap' in view and view['flowmap'] is not None:
+                view['flowmap'][..., :3] = view['flowmap'][..., :3] * depth_scale_factor
+            view['depth_scale_factor'] = depth_scale_factor
+            view['num_cameras'] = num_cameras
+            view['num_total_frames'] = num_total_frames
+
+        return views

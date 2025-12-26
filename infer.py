@@ -90,7 +90,7 @@ def load_dataset(dataset_cfg):
 
 
 @torch.no_grad()
-def run_single_inference(model, dataset, idx, num_context_frames, device, cfg, render_target_frames=False):
+def run_single_inference(model, dataset, idx, num_context_frames, device, cfg, render_target_frames=False, start_frame=None):
     """
     Run inference on single scene (supports multi-camera)
 
@@ -102,6 +102,7 @@ def run_single_inference(model, dataset, idx, num_context_frames, device, cfg, r
         device: Device
         cfg: Configuration
         render_target_frames: Whether to render target frames in addition to context frames
+        start_frame: Start frame position (None for random, int for fixed)
 
     Returns:
         Dictionary containing visualization data with context/target frame distinction
@@ -109,11 +110,16 @@ def run_single_inference(model, dataset, idx, num_context_frames, device, cfg, r
     print(f"\n{'='*60}")
     print(f"Processing scene index: {idx}")
     print(f"Render target frames: {render_target_frames}")
+    if start_frame is not None:
+        print(f"Start frame: {start_frame}")
     print(f"{'='*60}\n")
 
     try:
         # ==================== Load and Prepare Data ====================
-        views_list = dataset[idx]
+        if start_frame is not None and hasattr(dataset, 'get_views_with_start_frame'):
+            views_list = dataset.get_views_with_start_frame(idx, start_frame=start_frame)
+        else:
+            views_list = dataset[idx]
 
         from dataset import vggt_collate_fn
         vggt_batch = vggt_collate_fn([views_list])
@@ -452,13 +458,15 @@ def run_batch_inference(model, dataset, cfg, device):
     indices = range(cfg.start_idx, cfg.end_idx, cfg.step)
 
     render_target_frames = getattr(cfg, 'render_target_frames', False)
+    start_frame = getattr(cfg, 'start_frame', None)
 
     for idx in tqdm(indices, desc="Batch processing"):
         result = run_single_inference(
             model, dataset, idx,
             cfg.num_context_frames if hasattr(cfg, 'num_context_frames') else cfg.num_views,
             device, cfg,
-            render_target_frames=render_target_frames
+            render_target_frames=render_target_frames,
+            start_frame=start_frame
         )
 
         if result['success']:
@@ -540,12 +548,14 @@ def main(cfg: OmegaConf):
             run_batch_inference(model, dataset, cfg, device)
         else:
             render_target_frames = getattr(cfg, 'render_target_frames', False)
+            start_frame = getattr(cfg, 'start_frame', None)
 
             result = run_single_inference(
                 model, dataset, cfg.single_idx,
                 cfg.num_context_frames if hasattr(cfg, 'num_context_frames') else cfg.num_views,
                 device, cfg,
-                render_target_frames=render_target_frames
+                render_target_frames=render_target_frames,
+                start_frame=start_frame
             )
 
             if result['success']:
