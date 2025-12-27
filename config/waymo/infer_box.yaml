@@ -1,0 +1,58 @@
+# Box-based Inference Configuration
+# Uses GT 3D bounding boxes for dynamic/static separation
+
+debug: true
+
+# Model config
+model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=0, use_gs_head=True, use_gs_head_velocity=True, use_gs_head_segment=False, use_gt_camera=True, velocity_head_small_init=False)"
+model_path: "checkpoints/new/resume_fix/checkpoint-epoch_0_23324.pth"
+
+# Dataset config (with load_boxes=True)
+infer_dataset: Waymo_Multi(
+  ROOT="data/waymo/train_full_box",
+  valid_camera_id_list=["1", "2", "3"],
+  intervals=[5],
+  resolution=[(518, 336)],
+  transform=ImgNorm,
+  num_views=${num_views},
+  multi_camera_mode=True,
+  zero_ground_velocity=True,
+  load_boxes=True)
+
+num_views: 4
+
+# Inference config - single scene mode
+single_idx: 1
+start_frame: 120
+device: "cuda"
+
+# Batch mode config
+batch_mode: false
+start_idx: 0
+end_idx: 800
+step: 1
+continue_on_error: true
+
+# Visualization
+fps: 10
+save_video: true
+
+# Gaussian Splatting config
+sh_degree: 0
+use_gt_camera: true
+
+# Voxel pruning
+enable_voxel_pruning: true
+voxel_size: 0.05
+
+# Box margin in meters (for points_in_box tolerance)
+box_margin_meters: 0.2
+
+# Output
+output_dir: "./results/box_based"
+
+# Hydra config
+hydra:
+  verbose: False
+  run:
+    dir: ${output_dir}/hydra_logs

@@ -12,6 +12,44 @@ from dataset.utils import depthmap_to_absolute_camera_coordinates
 from src.utils import imread_cv2
 
 
+def get_box_corners_3d(center, size, heading):
+    """
+    Compute 8 corners of a 3D bounding box.
+
+    Args:
+        center: [x, y, z] box center
+        size: [length, width, height]
+        heading: yaw angle (rotation around z-axis)
+
+    Returns:
+        corners: [8, 3] array of corner coordinates
+    """
+    l, w, h = size
+    x, y, z = center
+
+    corners_local = np.array([
+        [l / 2, w / 2, h / 2],
+        [l / 2, -w / 2, h / 2],
+        [-l / 2, -w / 2, h / 2],
+        [-l / 2, w / 2, h / 2],
+        [l / 2, w / 2, -h / 2],
+        [l / 2, -w / 2, -h / 2],
+        [-l / 2, -w / 2, -h / 2],
+        [-l / 2, w / 2, -h / 2],
+    ])
+
+    cos_h = np.cos(heading)
+    sin_h = np.sin(heading)
+    rot = np.array([
+        [cos_h, -sin_h, 0],
+        [sin_h, cos_h, 0],
+        [0, 0, 1]
+    ])
+
+    corners_world = (rot @ corners_local.T).T + np.array([x, y, z])
+    return corners_world
+
+
 class WaymoDataset(BaseDataset):
     """
     Waymo outdoor street scenes dataset.
@@ -31,6 +69,7 @@ class WaymoDataset(BaseDataset):
         intervals=[1],
         zero_ground_velocity=True,
         multi_camera_mode=False,
+        load_boxes=False,
         **kwargs
     ):
         self.ROOT = ROOT
@@ -39,6 +78,7 @@ class WaymoDataset(BaseDataset):
         self.valid_camera_id_list = valid_camera_id_list
         self.zero_ground_velocity = zero_ground_velocity
         self.multi_camera_mode = multi_camera_mode
+        self.load_boxes = load_boxes
 
         if not isinstance(intervals, list):
             intervals = [intervals]
@@ -46,6 +86,8 @@ class WaymoDataset(BaseDataset):
 
         super().__init__(**kwargs)
         self._load_data()
+        if self.load_boxes:
+            self._load_box_data()
 
     def _get_cache_filename(self):
         """
@@ -118,6 +160,170 @@ class WaymoDataset(BaseDataset):
             print("Cache saved successfully")
         except Exception as e:
             print(f"Warning: Failed to save cache file ({e}), cache will not be available for next run")
+
+    def _load_box_data(self):
+        """
+        Load 3D bounding box data for all scenes.
+        New format from preprocess_waymo_box.py:
+            - track/track_info.txt: Per-frame box info
+            - track/track_camera_vis.json: Camera visibility
+            - track/track_ids.json: Object ID mapping
+        """
+        self.track_data = {}  # scene_name -> {frame_id -> [boxes]}
+        self.track_camera_vis = {}  # scene_name -> {track_id -> {frame_id -> [cam_ids]}}
+        self.track_ids = {}  # scene_name -> {original_id -> track_id}
+        scenes_with_boxes = 0
+
+        for scene_name in self.scene_names:
+            track_dir = osp.join(self.ROOT, scene_name, "track")
+            track_info_path = osp.join(track_dir, "track_info.txt")
+
+            if not osp.exists(track_info_path):
+                self.track_data[scene_name] = {}
+                self.track_camera_vis[scene_name] = {}
+                self.track_ids[scene_name] = {}
+                continue
+
+            try:
+                # Parse track_info.txt
+                frame_boxes = {}  # frame_id -> [boxes]
+                with open(track_info_path, 'r') as f:
+                    lines = f.readlines()[1:]  # Skip header
+                    for line in lines:
+                        parts = line.strip().split()
+                        if len(parts) < 13:
+                            continue
+                        frame_id = int(parts[0])
+                        box = {
+                            'track_id': int(parts[1]),
+                            'class': parts[2],
+                            'height': float(parts[4]),
+                            'width': float(parts[5]),
+                            'length': float(parts[6]),
+                            'center_x': float(parts[7]),
+                            'center_y': float(parts[8]),
+                            'center_z': float(parts[9]),
+                            'heading': float(parts[10]),
+                            'speed_x': float(parts[11]),
+                            'speed_y': float(parts[12]),
+                        }
+                        if frame_id not in frame_boxes:
+                            frame_boxes[frame_id] = []
+                        frame_boxes[frame_id].append(box)
+
+                self.track_data[scene_name] = frame_boxes
+
+                # Load camera visibility
+                vis_path = osp.join(track_dir, "track_camera_vis.json")
+                if osp.exists(vis_path):
+                    with open(vis_path, 'r') as f:
+                        self.track_camera_vis[scene_name] = json.load(f)
+                else:
+                    self.track_camera_vis[scene_name] = {}
+
+                # Load track IDs
+                ids_path = osp.join(track_dir, "track_ids.json")
+                if osp.exists(ids_path):
+                    with open(ids_path, 'r') as f:
+                        self.track_ids[scene_name] = json.load(f)
+                else:
+                    self.track_ids[scene_name] = {}
+
+                scenes_with_boxes += 1
+            except Exception as e:
+                print(f"Warning: Failed to load track data for {scene_name}: {e}")
+                self.track_data[scene_name] = {}
+                self.track_camera_vis[scene_name] = {}
+                self.track_ids[scene_name] = {}
+
+        print(f"Loaded track data for {scenes_with_boxes}/{len(self.scene_names)} scenes")
+
+    def get_boxes_for_frame(self, scene_name, frame_id, camera_id=None):
+        """
+        Get 3D bounding boxes for a specific frame (in world coordinates).
+
+        Args:
+            scene_name: Name of the scene
+            frame_id: Frame ID (int or string, e.g., 0 or "00000")
+            camera_id: If provided, only return boxes visible in this camera
+
+        Returns:
+            List of box dictionaries, each containing:
+                - track_id: Unique track ID for this object
+                - class: "vehicle", "pedestrian", or "cyclist"
+                - center: [x, y, z] in world coordinates
+                - size: [length, width, height]
+                - heading: yaw angle in world frame
+                - speed: [speed_x, speed_y] in vehicle frame
+                - corners: [8, 3] array of corner coordinates in world frame
+        """
+        if not self.load_boxes or scene_name not in self.track_data:
+            return []
+
+        # Convert frame_id to int
+        if isinstance(frame_id, str):
+            frame_id = int(frame_id)
+
+        boxes = self.track_data[scene_name].get(frame_id, [])
+
+        # Filter by camera visibility if requested
+        if camera_id is not None and scene_name in self.track_camera_vis:
+            cam_vis = self.track_camera_vis[scene_name]
+            filtered_boxes = []
+            for box in boxes:
+                track_id = str(box['track_id'])
+                if track_id in cam_vis:
+                    frame_vis = cam_vis[track_id].get(str(frame_id), [])
+                    if camera_id in frame_vis:
+                        filtered_boxes.append(box)
+            boxes = filtered_boxes
+
+        # Compute corners for each box
+        result = []
+        for box in boxes:
+            box_copy = box.copy()
+            center = [box['center_x'], box['center_y'], box['center_z']]
+            size = [box['length'], box['width'], box['height']]
+            box_copy['center'] = center
+            box_copy['size'] = size
+            box_copy['speed'] = [box['speed_x'], box['speed_y']]
+            box_copy['corners'] = get_box_corners_3d(center, size, box['heading'])
+            result.append(box_copy)
+
+        return result
+
+    def get_all_boxes_for_scene(self, scene_name):
+        """
+        Get all boxes for all frames in a scene.
+
+        Args:
+            scene_name: Name of the scene
+
+        Returns:
+            Dict: {frame_id: [boxes]} where each box contains world-frame coordinates
+        """
+        if not self.load_boxes or scene_name not in self.track_data:
+            return {}
+
+        all_boxes = {}
+        for frame_id in self.track_data[scene_name].keys():
+            all_boxes[frame_id] = self.get_boxes_for_frame(scene_name, frame_id)
+
+        return all_boxes
+
+    def get_track_info(self, scene_name):
+        """
+        Get track information for a scene.
+
+        Returns:
+            Dict containing:
+                - track_ids: {original_id -> track_id}
+                - camera_vis: {track_id -> {frame_id -> [cam_ids]}}
+        """
+        return {
+            'track_ids': self.track_ids.get(scene_name, {}),
+            'camera_vis': self.track_camera_vis.get(scene_name, {}),
+        }
 
     def __len__(self):
         """Return number of scenes"""
@@ -438,6 +644,8 @@ class WaymoDataset(BaseDataset):
         reference_view_idx = 0
 
         reference_cam_pose = views[reference_view_idx]['camera_pose']
+        # Save original ref_cam_to_world before modification (for box transformation)
+        original_ref_cam_to_world = reference_cam_pose.clone()
 
         world_to_ref = torch.linalg.inv(reference_cam_pose)
 
@@ -471,6 +679,7 @@ class WaymoDataset(BaseDataset):
             view['pts3d'] = view['pts3d'] * depth_scale_factor
             view['flowmap'][..., :3] = view['flowmap'][..., :3] * depth_scale_factor if 'flowmap' in view else None
             view['depth_scale_factor'] = depth_scale_factor
+            view['original_ref_cam_to_world'] = original_ref_cam_to_world
 
         # Add metadata for multi-camera scenes
         if self.multi_camera_mode:
@@ -579,6 +788,8 @@ class WaymoDataset(BaseDataset):
 
         # Apply same transformations as _get_views
         reference_cam_pose = views[0]['camera_pose']
+        # Save original ref_cam_to_world before modification (for box transformation)
+        original_ref_cam_to_world = reference_cam_pose.clone()
         world_to_ref = torch.linalg.inv(reference_cam_pose)
 
         for view in views:
@@ -608,6 +819,7 @@ class WaymoDataset(BaseDataset):
             if 'flowmap' in view and view['flowmap'] is not None:
                 view['flowmap'][..., :3] = view['flowmap'][..., :3] * depth_scale_factor
             view['depth_scale_factor'] = depth_scale_factor
+            view['original_ref_cam_to_world'] = original_ref_cam_to_world
             view['num_cameras'] = num_cameras
             view['num_total_frames'] = num_total_frames
 
