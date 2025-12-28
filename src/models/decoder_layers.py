@@ -42,8 +42,33 @@ class ModulatedLinearLayer(nn.Module):
         x = x.reshape(*x_shape[:-1], -1)
         return x
 
-    def forward(self, x, c):
-        if self.gradient_checkpointing and self.training:
-            return checkpoint(self._forward_impl, x, c, use_reentrant=False)
-        else:
-            return self._forward_impl(x, c)
+    def forward(self, x, c, chunk_size=None):
+        """
+        Forward pass with optional chunking.
+
+        Args:
+            x: Input tensor [N, ..., in_channels]
+            c: Condition tensor [1, embed_dim] or [N, embed_dim]
+            chunk_size: If specified, process N views in chunks to save memory
+
+        Returns:
+            Output tensor [N, ..., out_channels]
+        """
+        if chunk_size is None or x.shape[0] <= chunk_size:
+            if self.gradient_checkpointing and self.training:
+                return checkpoint(self._forward_impl, x, c, use_reentrant=False)
+            else:
+                return self._forward_impl(x, c)
+
+        # Process in chunks
+        results = []
+        N = x.shape[0]
+        for start in range(0, N, chunk_size):
+            end = min(start + chunk_size, N)
+            chunk_x = x[start:end]
+            if self.gradient_checkpointing and self.training:
+                chunk_out = checkpoint(self._forward_impl, chunk_x, c, use_reentrant=False)
+            else:
+                chunk_out = self._forward_impl(chunk_x, c)
+            results.append(chunk_out)
+        return torch.cat(results, dim=0)

@@ -13,6 +13,7 @@ from .training import (
     load_model,
     save_on_master,
 )
+from .parallel import parallel_processes
 
 __all__ = [
     'tf32_off',

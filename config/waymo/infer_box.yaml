@@ -1,7 +1,7 @@
 # Box-based Inference Configuration
 # Uses GT 3D bounding boxes for dynamic/static separation
 
-debug: true
+# debug: true
 
 # Model config
 model: "VGGT(img_size=518, patch_size=14, embed_dim=1024, sh_degree=0, use_gs_head=True, use_gs_head_velocity=True, use_gs_head_segment=False, use_gt_camera=True, velocity_head_small_init=False)"
@@ -19,10 +19,10 @@ infer_dataset: Waymo_Multi(
   zero_ground_velocity=True,
   load_boxes=True)
 
-num_views: 4
+num_views: 8
 
 # Inference config - single scene mode
-single_idx: 1
+single_idx: 0
 start_frame: 120
 device: "cuda"
 
@@ -46,7 +46,7 @@ enable_voxel_pruning: true
 voxel_size: 0.05
 
 # Box margin in meters (for points_in_box tolerance)
-box_margin_meters: 0.2
+box_margin_meters: 0.4
 
 # Output
 output_dir: "./results/box_based"

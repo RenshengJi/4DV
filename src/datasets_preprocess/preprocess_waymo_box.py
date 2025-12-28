@@ -50,7 +50,7 @@ def get_parser():
                         help="Path to raw Waymo tfrecord files")
     parser.add_argument("--output_dir", default="data/waymo/train_full_test",
                         help="Path to existing preprocessed dataset")
-    parser.add_argument("--workers", type=int, default=1, help="Number of workers")
+    parser.add_argument("--workers", type=int, default=80, help="Number of workers")
     parser.add_argument("--start", type=int, default=0, help="Start index of sequences")
     parser.add_argument("--end", type=int, default=None, help="End index of sequences")
     return parser
@@ -365,8 +365,8 @@ def main(waymo_dir, output_dir, workers=1, start=0, end=None):
                 traceback.print_exc()
     else:
         import sys
-        sys.path.append(osp.join(osp.dirname(__file__), '../src/'))
-        from src.utils.parallel import parallel_processes as parallel_map
+        sys.path.append(osp.join(osp.dirname(__file__), '..'))
+        from utils.parallel import parallel_processes as parallel_map
 
         args = [(waymo_dir, output_dir, seq) for seq in sequences]
         parallel_map(process_one_sequence, args, star_args=True, workers=workers)

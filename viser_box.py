@@ -47,14 +47,33 @@ CAMERA_COLORS = {
 }
 
 
-def get_box_corners_3d(center, size, heading):
+def heading_to_rotation_matrix(heading):
+    """
+    Convert heading angle to 3x3 rotation matrix.
+
+    Args:
+        heading: yaw angle (rotation around z-axis)
+
+    Returns:
+        R: [3, 3] rotation matrix (box_to_world)
+    """
+    cos_h = np.cos(heading)
+    sin_h = np.sin(heading)
+    return np.array([
+        [cos_h, -sin_h, 0],
+        [sin_h, cos_h, 0],
+        [0, 0, 1]
+    ], dtype=np.float32)
+
+
+def get_box_corners_3d(center, size, rotation):
     """
     Compute 8 corners of a 3D bounding box in vehicle frame.
 
     Args:
         center: [x, y, z] box center
         size: [length, width, height]
-        heading: yaw angle (rotation around z-axis)
+        rotation: [3, 3] rotation matrix (box_to_world)
 
     Returns:
         corners: [8, 3] array of corner coordinates
@@ -73,15 +92,7 @@ def get_box_corners_3d(center, size, heading):
         [-l / 2, w / 2, -h / 2],
     ])
 
-    cos_h = np.cos(heading)
-    sin_h = np.sin(heading)
-    rot = np.array([
-        [cos_h, -sin_h, 0],
-        [sin_h, cos_h, 0],
-        [0, 0, 1]
-    ])
-
-    corners = (rot @ corners_local.T).T + np.array([x, y, z])
+    corners = (rotation @ corners_local.T).T + np.array([x, y, z])
     return corners
 
 
@@ -360,14 +371,15 @@ def get_boxes_for_frame(
         # Build box with corners
         center = [box['center_x'], box['center_y'], box['center_z']]
         size = [box['length'], box['width'], box['height']]
-        corners = get_box_corners_3d(center, size, box['heading'])
+        rotation = heading_to_rotation_matrix(box['heading'])
+        corners = get_box_corners_3d(center, size, rotation)
 
         result.append({
             'track_id': box['track_id'],
             'class': box['class'],
             'center': center,
             'size': size,
-            'heading': box['heading'],
+            'rotation': rotation,
             'speed': [box['speed_x'], box['speed_y']],
             'corners': corners,
         })

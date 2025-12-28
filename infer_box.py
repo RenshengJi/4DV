@@ -31,10 +31,7 @@ from src.visualization import (
     create_multi_camera_grid,
 )
 
-from src.rendering import (
-    render_gaussians_with_sky,
-    interpolate_transforms as interp_transform_pair
-)
+from src.rendering import render_gaussians_with_sky
 
 import cv2
 
@@ -164,78 +161,6 @@ def visualize_boxes_on_images(
     return images_with_boxes
 
 
-def fill_missing_transforms(
-    frame_transforms: Dict[int, torch.Tensor],
-    all_frames: List[int],
-    device: torch.device
-) -> Dict[int, torch.Tensor]:
-    """Fill missing frame transforms using interpolation."""
-    if not frame_transforms:
-        return {f: torch.eye(4, device=device) for f in all_frames}
-
-    available = sorted(frame_transforms.keys())
-    result = dict(frame_transforms)
-
-    for frame_idx in all_frames:
-        if frame_idx in result:
-            continue
-
-        before = [f for f in available if f < frame_idx]
-        after = [f for f in available if f > frame_idx]
-
-        if before and after:
-            f1, f2 = before[-1], after[0]
-            alpha = (frame_idx - f1) / (f2 - f1)
-            result[frame_idx] = interp_transform_pair(
-                frame_transforms[f1], frame_transforms[f2], alpha, device
-            )
-        elif before:
-            result[frame_idx] = frame_transforms[before[-1]].clone()
-        elif after:
-            result[frame_idx] = frame_transforms[after[0]].clone()
-        else:
-            result[frame_idx] = torch.eye(4, device=device)
-
-    return result
-
-
-def transform_boxes_to_reference_frame(
-    boxes_by_frame: Dict,
-    world_to_ref: torch.Tensor,
-    depth_scale_factor: float,
-    device: torch.device
-) -> Dict:
-    """Transform boxes from world frame to reference camera frame."""
-    transformed = {}
-
-    R = world_to_ref[:3, :3].cpu().numpy()
-    t = world_to_ref[:3, 3].cpu().numpy()
-
-    for frame_idx, boxes in boxes_by_frame.items():
-        transformed[frame_idx] = []
-        for box in boxes:
-            new_box = box.copy()
-
-            center = np.array(box['center'])
-            new_center = R @ center + t
-            new_center *= depth_scale_factor
-            new_box['center'] = new_center.tolist()
-
-            corners = np.array(box['corners'])
-            new_corners = (R @ corners.T).T + t
-            new_corners *= depth_scale_factor
-            new_box['corners'] = new_corners
-
-            yaw_offset = np.arctan2(R[1, 0], R[0, 0])
-            new_box['heading'] = box['heading'] + yaw_offset
-
-            new_box['size'] = [s * depth_scale_factor for s in box['size']]
-
-            transformed[frame_idx].append(new_box)
-
-    return transformed
-
-
 def points_in_box(points: torch.Tensor, box: Dict, device: torch.device, margin: float = 0.0) -> torch.Tensor:
     """Check if points are inside a 3D bounding box."""
     original_shape = points.shape[:-1]
@@ -280,18 +205,11 @@ def compute_box_transform(
     """Compute rigid transform from box_src pose to box_dst pose."""
     src_center = torch.tensor(box_src['center'], dtype=torch.float32, device=device)
     dst_center = torch.tensor(box_dst['center'], dtype=torch.float32, device=device)
-    src_heading = box_src['heading']
-    dst_heading = box_dst['heading']
+    src_rotation = torch.tensor(box_src['rotation'], dtype=torch.float32, device=device)
+    dst_rotation = torch.tensor(box_dst['rotation'], dtype=torch.float32, device=device)
 
-    delta_heading = dst_heading - src_heading
-    cos_h, sin_h = np.cos(delta_heading), np.sin(delta_heading)
-
-    R = torch.tensor([
-        [cos_h, -sin_h, 0],
-        [sin_h, cos_h, 0],
-        [0, 0, 1]
-    ], dtype=torch.float32, device=device)
-
+    # R_delta @ src_rotation = dst_rotation => R_delta = dst_rotation @ src_rotation.T
+    R = dst_rotation @ src_rotation.T
     t = dst_center - R @ src_center
 
     T = torch.eye(4, dtype=torch.float32, device=device)
@@ -450,8 +368,6 @@ def process_with_boxes(
 
             canonical_gaussians = torch.cat(aggregated_list, dim=0) if aggregated_list else frame_gaussians[ref_frame]
 
-            frame_transforms = fill_missing_transforms(frame_transforms, unique_frames, device)
-
             cars.append({
                 'track_id': track_id,
                 'class': track['class'],
@@ -546,13 +462,6 @@ def run_inference_with_boxes(model, dataset, idx, device, cfg, start_frame=None)
         intrinsics = batch['intrinsics']
         extrinsics = batch['extrinsics']
 
-        scene_name = dataset.scene_names[idx]
-        seq2frames = dataset.scene_data[scene_name]
-        camera_id_list = sorted(seq2frames.keys())  # e.g., ["1", "2", "3"]
-        first_camera = camera_id_list[0]
-        frame_id_list = seq2frames[first_camera]
-        start_pos = start_frame if start_frame is not None else 0
-
         depth_scale_factor = views_list[0].get('depth_scale_factor', 1.0)
         if isinstance(depth_scale_factor, torch.Tensor):
             depth_scale_factor = depth_scale_factor.item()
@@ -560,40 +469,14 @@ def run_inference_with_boxes(model, dataset, idx, device, cfg, start_frame=None)
         original_ref_cam_to_world = views_list[0].get('original_ref_cam_to_world')
         if original_ref_cam_to_world is None:
             raise ValueError("original_ref_cam_to_world not found in views_list")
-        world_to_ref = torch.linalg.inv(original_ref_cam_to_world).to(device)
 
-        # Get boxes per (frame_idx, camera_id) with visibility filtering
-        boxes_by_frame_world = {}
-        unique_frame_indices = sorted(set(frame_indices))
-
-        for frame_idx in unique_frame_indices:
-            actual_frame_id = int(frame_id_list[start_pos + frame_idx])
-            # Collect boxes visible from any camera used in this frame
-            frame_boxes = []
-            seen_track_ids = set()
-
-            # Find which cameras are used for this frame
-            cameras_for_frame = set()
-            for i, (f_idx, c_idx) in enumerate(zip(frame_indices, camera_indices)):
-                if f_idx == frame_idx:
-                    cameras_for_frame.add(c_idx)
-
-            # Get boxes visible from each camera
-            for cam_idx in cameras_for_frame:
-                camera_id = camera_id_list[cam_idx]
-                boxes = dataset.get_boxes_for_frame(scene_name, actual_frame_id, camera_id=camera_id)
-                if boxes:
-                    for box in boxes:
-                        if box['track_id'] not in seen_track_ids:
-                            frame_boxes.append(box)
-                            seen_track_ids.add(box['track_id'])
-
-            if frame_boxes:
-                boxes_by_frame_world[frame_idx] = frame_boxes
-
-        boxes_by_frame = transform_boxes_to_reference_frame(
-            boxes_by_frame_world, world_to_ref, depth_scale_factor, device
-        )
+        # Get boxes from views (already loaded and transformed by dataset)
+        boxes_by_frame = {}
+        for view in views_list:
+            frame_idx = view['frame_idx']
+            if 'boxes' in view and view['boxes']:
+                if frame_idx not in boxes_by_frame:
+                    boxes_by_frame[frame_idx] = view['boxes']
 
         preds = model(
             images[:, context_indices],
@@ -682,32 +565,18 @@ def run_inference_with_boxes(model, dataset, idx, device, cfg, start_frame=None)
         gt_depth_vis = visualize_depth(batch['depths'][0, context_indices].cpu().numpy())
 
         # Visualize 3D boxes on GT images
-        # Use original world-coordinate boxes (before transform to reference frame)
-        # Each view uses boxes from its corresponding frame in world coordinates
-        boxes_by_view_world = {}
+        # Boxes are in reference frame (already scaled), extrinsics are also in reference frame
+        boxes_by_view = {}
         for ctx_view_idx, orig_view_idx in enumerate(context_indices.cpu().tolist()):
             frame_idx = frame_indices[orig_view_idx]
-            if frame_idx in boxes_by_frame_world:
-                boxes_by_view_world[ctx_view_idx] = boxes_by_frame_world[frame_idx]
+            if frame_idx in boxes_by_frame:
+                boxes_by_view[ctx_view_idx] = boxes_by_frame[frame_idx]
 
-        # Get intrinsics and extrinsics for context views
-        # Note: extrinsics are cam_to_world, boxes are in world coordinates
         ctx_intrinsics = intrinsics[0, context_indices].cpu().numpy()
         ctx_extrinsics = extrinsics[0, context_indices].cpu().numpy()
 
-        # Scale box corners by depth_scale_factor to match scaled extrinsics
-        boxes_by_view_scaled = {}
-        for view_idx, boxes in boxes_by_view_world.items():
-            scaled_boxes = []
-            for box in boxes:
-                scaled_box = box.copy()
-                corners = np.array(box['corners'])
-                scaled_box['corners'] = corners * depth_scale_factor
-                scaled_boxes.append(scaled_box)
-            boxes_by_view_scaled[view_idx] = scaled_boxes
-
         gt_rgb_with_boxes = visualize_boxes_on_images(
-            gt_rgb, boxes_by_view_scaled, ctx_intrinsics, ctx_extrinsics, H, W
+            gt_rgb, boxes_by_view, ctx_intrinsics, ctx_extrinsics, H, W
         )
 
         gt_vel = batch.get('flowmap')

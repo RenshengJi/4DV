@@ -364,7 +364,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 sampled_sky_token = sampled_sky_token.mean(dim=0, keepdim=True)
                 sky_colors_sampled = self.sky_head(
                     ray_dirs.reshape(num_frames_to_render, H * W, 3),
-                    sampled_sky_token
+                    sampled_sky_token,
+                    chunk_size=4
                 )
                 sky_colors_sampled = sky_colors_sampled.view(num_frames_to_render, H, W, 3).permute(0, 3, 1, 2)
 
@@ -403,7 +404,6 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
 
         This function is specifically for inference when render_target_frames=True.
         It generates sky colors for target frames using the sky_token from context frames.
-        Processes frames in chunks to avoid OOM errors.
 
         Args:
             sky_token (torch.Tensor): Sky token from context frames, shape [B, S_context, 1, embed_dim]
@@ -420,41 +420,27 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
 
         N_target = target_frame_intrinsics.shape[0]
         H, W = image_size
-        device = target_frame_intrinsics.device
 
         # Average sky token across context frames and batch
-        # sky_token shape: [B, S_context, 1, embed_dim] -> [1, embed_dim]
         averaged_sky_token = sky_token.mean(dim=[0, 1, 2], keepdim=True)  # [1, embed_dim]
 
-        # Process in chunks to avoid OOM
-        all_sky_colors = []
+        # Convert W2C to C2W
+        target_c2w = torch.inverse(target_frame_extrinsics)
 
-        for chunk_start in range(0, N_target, chunk_size):
-            chunk_end = min(chunk_start + chunk_size, N_target)
-            chunk_intrinsics = target_frame_intrinsics[chunk_start:chunk_end]
-            chunk_extrinsics = target_frame_extrinsics[chunk_start:chunk_end]
+        # Generate ray directions for all target frames
+        ray_dict = self.plucker_embedder(
+            target_frame_intrinsics,
+            target_c2w,
+            image_size=image_size
+        )
+        ray_dirs = ray_dict["dirs"]  # [N_target, H, W, 3]
 
-            # Convert W2C to C2W for this chunk
-            chunk_c2w = torch.inverse(chunk_extrinsics)
-
-            # Generate ray directions for this chunk
-            ray_dict = self.plucker_embedder(
-                chunk_intrinsics,
-                chunk_c2w,
-                image_size=image_size
-            )
-            ray_dirs = ray_dict["dirs"]  # [chunk_size, H, W, 3]
-
-            # Predict sky colors for this chunk
-            chunk_sky_colors = self.sky_head(
-                ray_dirs.reshape(chunk_end - chunk_start, H * W, 3),
-                averaged_sky_token
-            )
-            chunk_sky_colors = chunk_sky_colors.view(chunk_end - chunk_start, H, W, 3).permute(0, 3, 1, 2)  # [chunk_size, 3, H, W]
-
-            all_sky_colors.append(chunk_sky_colors)
-
-        # Concatenate all chunks
-        target_sky_colors = torch.cat(all_sky_colors, dim=0)  # [N_target, 3, H, W]
+        # Predict sky colors with chunking handled inside sky_head
+        target_sky_colors = self.sky_head(
+            ray_dirs.reshape(N_target, H * W, 3),
+            averaged_sky_token,
+            chunk_size=chunk_size
+        )
+        target_sky_colors = target_sky_colors.view(N_target, H, W, 3).permute(0, 3, 1, 2)
 
         return target_sky_colors

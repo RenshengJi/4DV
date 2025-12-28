@@ -12,14 +12,33 @@ from dataset.utils import depthmap_to_absolute_camera_coordinates
 from src.utils import imread_cv2
 
 
-def get_box_corners_3d(center, size, heading):
+def heading_to_rotation_matrix(heading):
+    """
+    Convert heading angle to 3x3 rotation matrix.
+
+    Args:
+        heading: yaw angle (rotation around z-axis)
+
+    Returns:
+        R: [3, 3] rotation matrix (box_to_world)
+    """
+    cos_h = np.cos(heading)
+    sin_h = np.sin(heading)
+    return np.array([
+        [cos_h, -sin_h, 0],
+        [sin_h, cos_h, 0],
+        [0, 0, 1]
+    ], dtype=np.float32)
+
+
+def get_box_corners_3d(center, size, rotation):
     """
     Compute 8 corners of a 3D bounding box.
 
     Args:
         center: [x, y, z] box center
         size: [length, width, height]
-        heading: yaw angle (rotation around z-axis)
+        rotation: [3, 3] rotation matrix (box_to_world)
 
     Returns:
         corners: [8, 3] array of corner coordinates
@@ -38,16 +57,62 @@ def get_box_corners_3d(center, size, heading):
         [-l / 2, w / 2, -h / 2],
     ])
 
-    cos_h = np.cos(heading)
-    sin_h = np.sin(heading)
-    rot = np.array([
-        [cos_h, -sin_h, 0],
-        [sin_h, cos_h, 0],
-        [0, 0, 1]
-    ])
-
-    corners_world = (rot @ corners_local.T).T + np.array([x, y, z])
+    corners_world = (rotation @ corners_local.T).T + np.array([x, y, z])
     return corners_world
+
+
+def transform_boxes_to_reference_frame(boxes_by_frame, world_to_ref, depth_scale_factor):
+    """
+    Transform boxes from world frame to reference camera frame.
+
+    Args:
+        boxes_by_frame: Dict {frame_idx: [boxes]} with boxes in world coordinates
+        world_to_ref: [4, 4] transformation matrix from world to reference frame
+        depth_scale_factor: Scale factor for depth normalization
+
+    Returns:
+        Dict {frame_idx: [boxes]} with boxes in reference frame
+    """
+    if isinstance(world_to_ref, torch.Tensor):
+        R = world_to_ref[:3, :3].cpu().numpy()
+        t = world_to_ref[:3, 3].cpu().numpy()
+    else:
+        R = world_to_ref[:3, :3]
+        t = world_to_ref[:3, 3]
+
+    # Convert depth_scale_factor to float if it's a tensor
+    if isinstance(depth_scale_factor, torch.Tensor):
+        depth_scale_factor = depth_scale_factor.item()
+
+    transformed = {}
+    for frame_idx, boxes in boxes_by_frame.items():
+        transformed[frame_idx] = []
+        for box in boxes:
+            new_box = box.copy()
+
+            # Transform center
+            center = np.array(box['center'])
+            new_center = R @ center + t
+            new_center *= depth_scale_factor
+            new_box['center'] = new_center.tolist()
+
+            # Transform corners
+            corners = np.array(box['corners'])
+            new_corners = (R @ corners.T).T + t
+            new_corners *= depth_scale_factor
+            new_box['corners'] = new_corners
+
+            # Transform rotation: new_rotation = R @ old_rotation
+            old_rotation = np.array(box['rotation'])
+            new_rotation = R @ old_rotation
+            new_box['rotation'] = new_rotation.astype(np.float32)
+
+            # Scale size
+            new_box['size'] = [s * depth_scale_factor for s in box['size']]
+
+            transformed[frame_idx].append(new_box)
+
+    return transformed
 
 
 class WaymoDataset(BaseDataset):
@@ -253,7 +318,7 @@ class WaymoDataset(BaseDataset):
                 - class: "vehicle", "pedestrian", or "cyclist"
                 - center: [x, y, z] in world coordinates
                 - size: [length, width, height]
-                - heading: yaw angle in world frame
+                - rotation: [3, 3] rotation matrix (box_to_world)
                 - speed: [speed_x, speed_y] in vehicle frame
                 - corners: [8, 3] array of corner coordinates in world frame
         """
@@ -278,16 +343,20 @@ class WaymoDataset(BaseDataset):
                         filtered_boxes.append(box)
             boxes = filtered_boxes
 
-        # Compute corners for each box
+        # Compute rotation matrix and corners for each box
         result = []
         for box in boxes:
             box_copy = box.copy()
             center = [box['center_x'], box['center_y'], box['center_z']]
             size = [box['length'], box['width'], box['height']]
+            rotation = heading_to_rotation_matrix(box['heading'])
             box_copy['center'] = center
             box_copy['size'] = size
+            box_copy['rotation'] = rotation
             box_copy['speed'] = [box['speed_x'], box['speed_y']]
-            box_copy['corners'] = get_box_corners_3d(center, size, box['heading'])
+            box_copy['corners'] = get_box_corners_3d(center, size, rotation)
+            # Remove heading from result (use rotation instead)
+            del box_copy['heading']
             result.append(box_copy)
 
         return result
@@ -693,6 +762,47 @@ class WaymoDataset(BaseDataset):
             view['num_cameras'] = num_cameras
             view['num_total_frames'] = num_total_frames
 
+        # Load and transform boxes if enabled
+        if self.load_boxes:
+            # Get frame_id list and camera_id list for box loading
+            if self.multi_camera_mode:
+                camera_id_list = selected_cameras
+                frame_id_list = seq2frames[camera_id_list[0]]
+            else:
+                camera_id_list = [camera_id]
+                frame_id_list = frame_ids
+
+            # Collect boxes for each unique frame
+            boxes_by_frame_world = {}
+            unique_frame_indices = sorted(set(range(len(all_positions))))
+
+            for frame_idx in unique_frame_indices:
+                actual_frame_id = int(frame_id_list[all_positions[frame_idx]])
+                frame_boxes = []
+                seen_track_ids = set()
+
+                # Get boxes visible from each camera used
+                for cam_idx, cam_id in enumerate(camera_id_list):
+                    boxes = self.get_boxes_for_frame(scene_name, actual_frame_id, camera_id=cam_id)
+                    if boxes:
+                        for box in boxes:
+                            if box['track_id'] not in seen_track_ids:
+                                frame_boxes.append(box)
+                                seen_track_ids.add(box['track_id'])
+
+                if frame_boxes:
+                    boxes_by_frame_world[frame_idx] = frame_boxes
+
+            # Transform boxes to reference frame
+            boxes_by_frame = transform_boxes_to_reference_frame(
+                boxes_by_frame_world, world_to_ref, depth_scale_factor
+            )
+
+            # Add boxes to views
+            for view in views:
+                frame_idx = view['frame_idx']
+                view['boxes'] = boxes_by_frame.get(frame_idx, [])
+
         return views
 
     def get_views_with_start_frame(self, idx, start_frame=0, camera_id=None):
@@ -822,5 +932,46 @@ class WaymoDataset(BaseDataset):
             view['original_ref_cam_to_world'] = original_ref_cam_to_world
             view['num_cameras'] = num_cameras
             view['num_total_frames'] = num_total_frames
+
+        # Load and transform boxes if enabled
+        if self.load_boxes:
+            # Get frame_id list and camera_id list for box loading
+            if self.multi_camera_mode:
+                camera_id_list = selected_cameras
+                frame_id_list = seq2frames[camera_id_list[0]]
+            else:
+                camera_id_list = [cam_id]
+                frame_id_list = frame_ids
+
+            # Collect boxes for each unique frame
+            boxes_by_frame_world = {}
+            unique_frame_indices = sorted(set(range(len(all_positions))))
+
+            for frame_idx in unique_frame_indices:
+                actual_frame_id = int(frame_id_list[all_positions[frame_idx]])
+                frame_boxes = []
+                seen_track_ids = set()
+
+                # Get boxes visible from each camera used
+                for cam_idx, camera_id_for_box in enumerate(camera_id_list):
+                    boxes = self.get_boxes_for_frame(scene_name, actual_frame_id, camera_id=camera_id_for_box)
+                    if boxes:
+                        for box in boxes:
+                            if box['track_id'] not in seen_track_ids:
+                                frame_boxes.append(box)
+                                seen_track_ids.add(box['track_id'])
+
+                if frame_boxes:
+                    boxes_by_frame_world[frame_idx] = frame_boxes
+
+            # Transform boxes to reference frame
+            boxes_by_frame = transform_boxes_to_reference_frame(
+                boxes_by_frame_world, world_to_ref, depth_scale_factor
+            )
+
+            # Add boxes to views
+            for view in views:
+                frame_idx = view['frame_idx']
+                view['boxes'] = boxes_by_frame.get(frame_idx, [])
 
         return views
